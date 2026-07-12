@@ -26,10 +26,12 @@
     "deb.debian.org",
     "cloud.debian.org",
     "security.debian.org",
+    "cloud-images.ubuntu.com",
     "archive.ubuntu.com",
     "security.ubuntu.com",
     "dl.rockylinux.org",
     "repo.almalinux.org",
+    "cloud.centos.org",
     "mirror.stream.centos.org",
     "download.opensuse.org",
     "dl-cdn.alpinelinux.org"
