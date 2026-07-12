@@ -65,6 +65,9 @@ for aid in "${args[@]}"; do
   [ -n "$path" ] || { echo "SKIP $aid -- no golden_path"; skipped=$((skipped + 1)); continue; }
   distro="$(dr_vps_sql "SELECT json_extract(provenance,'\$.distro') FROM images WHERE artifact_id=$qa AND kind='golden';")"; drc=$?
   { [ "$drc" -eq 0 ] && [ -n "$distro" ]; } || { echo "SKIP $aid -- distro unreadable from provenance (fail closed)"; skipped=$((skipped + 1)); continue; }
+  # distro names are recipe identifiers; anything with a newline/space/control/other char is unexpected
+  # (a malformed row) -> fail closed rather than let it perturb the newest lookup.
+  case "$distro" in *[!A-Za-z0-9._+:-]*) echo "SKIP $aid -- distro '$distro' has unexpected characters (fail closed)"; skipped=$((skipped + 1)); continue ;; esac
   # NEWEST guard, FAIL CLOSED: an errored or empty newest lookup must not authorize deletion.
   newest="$(dr_vps_sql "SELECT artifact_id FROM images WHERE json_extract(provenance,'\$.distro')=$(dr_vps_sql_str "$distro") AND kind='golden' ORDER BY created_at DESC LIMIT 1;")"; nrc=$?
   { [ "$nrc" -eq 0 ] && [ -n "$newest" ]; } || { echo "SKIP $aid -- cannot determine newest golden for '$distro' (fail closed)"; skipped=$((skipped + 1)); continue; }
@@ -79,16 +82,20 @@ for aid in "${args[@]}"; do
   rp="$(realpath -- "$path" 2>/dev/null)"
   [ -n "$rp" ] || { echo "SKIP $aid -- golden_path does not resolve: $path"; skipped=$((skipped + 1)); continue; }
   case "$rp/" in "$POOL"/*) ;; *) echo "SKIP $aid -- golden_path escapes the pool dir: $path -> $rp"; skipped=$((skipped + 1)); continue ;; esac
-  # no OTHER image row resolves (by canonical realpath, not raw string) to the same file
+  # no OTHER image row points at the SAME FILE. Compare inode:device (file IDENTITY), so a symlink,
+  # hardlink, or lexically-different path to the same file is caught; a dangling other path stats-fail and
+  # is correctly NOT the same file. Fail closed if the candidate itself cannot be stat'd.
+  cid="$(stat -c '%i:%d' -- "$path" 2>/dev/null)"
+  [ -n "$cid" ] || { echo "SKIP $aid -- cannot stat golden_path (fail closed): $path"; skipped=$((skipped + 1)); continue; }
   others="$(dr_vps_sql "SELECT golden_path FROM images WHERE artifact_id != $qa;")"; orc=$?
   [ "$orc" -eq 0 ] || { echo "SKIP $aid -- shared-path read failed (fail closed)"; skipped=$((skipped + 1)); continue; }
   shared=0
   while IFS= read -r op; do
     [ -n "$op" ] || continue
-    orp="$(realpath -- "$op" 2>/dev/null)" || continue
-    [ "$orp" = "$rp" ] && { shared=1; break; }
+    oid="$(stat -c '%i:%d' -- "$op" 2>/dev/null)" || continue
+    [ "$oid" = "$cid" ] && { shared=1; break; }
   done <<< "$others"
-  [ "$shared" -eq 0 ] || { echo "SKIP $aid -- its file is also referenced by another image row (realpath $rp)"; skipped=$((skipped + 1)); continue; }
+  [ "$shared" -eq 0 ] || { echo "SKIP $aid -- its file is shared with another image row (same inode): $path"; skipped=$((skipped + 1)); continue; }
 
   sz="$(du -B1 -- "$path" 2>/dev/null | cut -f1)"; case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
   if [ "$COMMIT" -ne 1 ]; then
