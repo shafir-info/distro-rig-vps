@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# dr-vps -- CLI entrypoint for the distro-rig-vps local VM test rig (Phase 1).
+# Dispatches verbs to the dr_vps_* library. Exit codes are the authoritative contract
+# (see CONCEPT s9 / src/dr_vps_api.sh). ASCII only.
+set -uo pipefail
+
+# Source the INSTALLED env (under allexport) BEFORE the libs, so an operator running dr-vps on an
+# installed host gets the system paths (/var/lib/distro-rig-vps, ...) instead of the dev default
+# (~/.local/state). The env file's `: "${VAR:=...}"` means an explicit DR_VPS_* in the caller's env
+# still wins (and the test suite -- which has no /etc/distro-rig-vps/env -- is unaffected).
+set -a
+# shellcheck disable=SC1091
+# Skip under the test harness (DR_VPS_TEST_SEAMS=1) so an installed /etc/.../env can't leak system
+# paths into the seam-driven suite (which sets its own DR_VPS_* + DR_VPS_TEST_SEAMS).
+[ "${DR_VPS_TEST_SEAMS:-}" = 1 ] || { [ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env; }
+set +a
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../src/dr_vps_api.sh
+. "$HERE/dr_vps_api.sh"
+for _m in identity store image storage net doctor domain gate remote snapshot; do
+  # shellcheck source=/dev/null
+  . "$HERE/dr_vps_${_m}.sh"
+done
+unset _m
+
+usage() {
+  cat >&2 <<'EOF'
+usage: dr-vps <verb> [args]
+  doctor [--json]                 capability gate (KVM/libvirt/RAM/disk/tools)
+  version                         running VERSION + driver_version + per-build fingerprint (which build is live)
+  build <recipe.json>             build+register a golden (BUILD plane)
+  verify <file> <sha256> [sig]    checksum (+ optional GPG) a binary, fail-closed (18 on mismatch)
+  distros                         list registered goldens (id  distro  built_at)
+  create <name> <distro> [--net N][--ttl H][--mem M][--cpus N][--ssh-key F][--project P]
+  wait <id> [timeout_s]           wait for boot + cloud-init + ssh readiness
+  list                            list VMs (id  state  name  artifact_id)
+  status <id>                     one VM's state (state|generation|artifact_id|egress_gen)
+  inspect <id>                    read-only host facts (state|domain|guest_ip|console); diagnoses broken VMs
+  console <id>                    attach serial console (break-glass)
+  console-dump <id> [bytes]       bounded non-interactive console snapshot
+  exec <id> <cmd>                 run <cmd> INSIDE the guest (gated, bounded by DR_VPS_EXEC_TIMEOUT)
+  exec-detach <id> <cmd>          launch <cmd> detached -> a job id (survives the per-exec cap)
+  exec-status <job>               job state: running|done rc=N|infra-failed|driver-timeout|destroyed|missing
+  exec-output <job>               pull the job's captured stdout (bounded)
+  push <id> <localfile> <remote>  scp a local file into the guest (gated)
+  pull <id> <remote>              read a guest file, bounded (gated)
+  recreate <id>                   drop overlay, re-clone the pinned golden
+  destroy <id>                    stop + undefine + drop overlay (golden untouched)
+  snapshot <vm> [--keep-secrets] [--notes STR] [--profile NAME] [--install-log FILE]   freeze installed state -> a snapshot id
+  use <name> --from-snap <id> [--allow-secret-bearing] [create flags]   create a VM from a snapshot
+  snap-ls                         list snapshots (id  name  parent  secret  validation  created)
+  snap-show <id|name>             render the snapshot's .md
+  snap-rm <id|name>               delete a snapshot (refcount-gated; refused while a VM backs it)
+  snap-rename <id|name> <newname> rename a snapshot (human handle; content id unchanged)
+  snap-fsck [--prune]             snapshot store consistency check; --prune removes orphan bundles (operator)
+Exit: 0 ok . 2 usage . 12 capability . 13 libvirt . 14 not-found . 15 conflict .
+      17 timeout . 18 verify . 19 referenced . 20 quarantined . 24 egress . 25 secret
+EOF
+}
+need() { local n="$1"; shift; [ "$#" -ge "$n" ] || { usage; exit "$DR_VPS_E_USAGE"; }; }
+# EXACT arity for fixed-argv guest verbs: surplus argv must be a usage error, not silently
+# dropped (an unquoted `exec vm echo hello` would otherwise run just `echo` in the guest).
+need_eq() { local n="$1"; shift; [ "$#" -eq "$n" ] || { usage; exit "$DR_VPS_E_USAGE"; }; }
+# S1a: EXACT arity that ALLOWS a trailing `--owner UID` (the watcher appends it). Strip that pair first, then
+# require EXACTLY <n> positionals -- so a mis-quoted (word-split) command is STILL a usage error, never a
+# silent truncation. The verb function re-parses --owner from the full "$@".
+need_eq_owner() { local n="$1" penult=""; shift
+  [ "$#" -ge 2 ] && penult="${*: -2:1}"                       # the second-to-last positional (single word)
+  [ "$penult" = "--owner" ] && set -- "${@:1:$(($#-2))}"      # strip a trailing `--owner UID` pair
+  [ "$#" -eq "$n" ] || { usage; exit "$DR_VPS_E_USAGE"; }
+}
+
+main() {
+  # SECURITY: the create path honors _DR_VPS_CREATE_AID/_KIND ONLY as an INTERNAL seam (set by
+  # dr_vps_domain_use_snapshot). Clear any ambient/injected values from the caller's environment so
+  # `_DR_VPS_CREATE_AID=X dr-vps create ...` cannot override the resolved artifact or bypass the snapshot
+  # secret-bearing gate .
+  unset _DR_VPS_CREATE_AID _DR_VPS_CREATE_KIND
+  local cmd="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$cmd" in
+    doctor)            dr_vps_doctor "$@" ;;
+    version)           need_eq 0 "$@"; dr_vps_version ;;
+    build)             need 1 "$@"; dr_vps_store_init && dr_vps_image_build "$1" ;;
+    verify)            need 2 "$@"; dr_vps_image_verify "$@" ;;
+    distros)           dr_vps_store_init && dr_vps_image_ls ;;
+    create)            need 2 "$@"; dr_vps_store_init && dr_vps_domain_create "$@" ;;
+    wait)              need 1 "$@"; dr_vps_store_init && dr_vps_domain_wait "$@" ;;   # store_init: gate/gaterow read migrated cols post-upgrade
+    exec)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_exec "$@" ;;   # S1a: exact 2 positionals + optional --owner
+    exec-detach)       need 2 "$@"; dr_vps_store_init && dr_vps_exec_detach "$@" ;;   # launch -> job id ([--owner UID]); store_init: gaterow reads migrated cols
+    exec-status)       need 1 "$@"; dr_vps_store_init && dr_vps_exec_status "$@" ;;   # poll (taxonomy-preserving; [--owner UID])
+    exec-output)       need 1 "$@"; dr_vps_store_init && dr_vps_exec_output "$@" ;;   # pull stdout ([--owner UID])
+    push)              need_eq_owner 3 "$@"; dr_vps_store_init && dr_vps_push "$@" ;;   # S1a: exact 3 positionals + optional --owner
+    pull)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_pull "$@" ;;   # S1a: exact 2 positionals + optional --owner
+    console-dump)      need 1 "$@"; dr_vps_store_init && dr_vps_console_dump "$@" ;;
+    gate)              need 2 "$@"; dr_vps_store_init && dr_vps_gate_vm "$1" "$2" ;;   # store_init: run pending schema migrations BEFORE gaterow reads new columns
+    list)              dr_vps_store_init && dr_vps_store_vm_ls ;;
+    status)            need 1 "$@"; dr_vps_store_init && dr_vps_store_vm_get "$1" ;;
+    inspect)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_inspect "$1" ;;
+    console)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_console "$1" ;;
+    recreate)          need 1 "$@"; dr_vps_store_init && dr_vps_domain_recreate "$@" ;;   # S1a: forward "$@" for [--owner UID]
+    destroy)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_destroy "$@" ;;   # S1a: forward "$@" so [--owner UID] reaches the wrapper
+    snapshot)          need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_create "$@" ;;
+    use)               need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_use "$@" ;;
+    snap-ls)           dr_vps_store_init && dr_vps_snapshot_ls "$@" ;;
+    snap-show)         need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_show "$@" ;;
+    snap-rm)           need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_rm "$@" ;;
+    snap-rename)       need 2 "$@"; dr_vps_store_init && dr_vps_snapshot_rename "$@" ;;
+    snap-fsck)         DR_VPS_STORE_LENIENT_INIT=1 dr_vps_store_init && dr_vps_snapshot_fsck "$@" ;;   # diagnose corruption, don't fail-closed on it ; [--prune] removes orphan bundles (operator)
+    ''|-h|--help|help) usage; [ -z "$cmd" ] && exit "$DR_VPS_E_USAGE" || exit 0 ;;
+    *)                 printf 'dr-vps: unknown verb: %s\n' "$cmd" >&2; usage; exit "$DR_VPS_E_USAGE" ;;
+  esac
+}
+main "$@"

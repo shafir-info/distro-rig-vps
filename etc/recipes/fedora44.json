@@ -1,0 +1,8 @@
+{
+  "_comment": "Golden recipe for Fedora 44 Cloud Base. OPERATOR must PIN upstream_sha256 to the current vendor checksum (CHECKSUM file on the mirror) -- the build FAILS CLOSED (18) until it matches. The build (fetch+verify+bake) runs on the BUILD plane with controlled host egress; the resulting golden is digest-pinned and standalone, and test VMs never touch this plane.",
+  "distro": "fedora44",
+  "family": "dnf",
+  "upstream_url": "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
+  "upstream_sha256": "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f",
+  "packages": ["systemd", "tmux", "openssh-server", "cloud-init"]
+}

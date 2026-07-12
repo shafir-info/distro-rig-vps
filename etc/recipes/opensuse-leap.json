@@ -1,0 +1,9 @@
+{
+  "_comment": "openSUSE Leap Minimal-VM (zypper FAMILY). CAVEAT-BEFORE-LIVE: download.opensuse.org is a MirrorBrain REDIRECTOR -- it serves repo METADATA directly but 302-redirects the actual RPM downloads to geo-mirror HOSTS that are NOT download.opensuse.org. Behind the egress fence (squid http_access deny all + CA DNS nameConstraints) those redirect targets are blocked, so `zypper -n install` cannot fetch any RPM even after a successful refresh. The OPERATOR must (1) PIN upstream_sha256; (2) repoint the baseurl below to a SPECIFIC non-redirecting tier-1 mirror that serves RPMs directly; and (3) add THAT mirror host to fleet.json mirror_allowlist (so squid + the CA nameConstraints permit it). $releasever is zypper's release var.",
+  "distro": "opensuse-leap",
+  "family": "zypper",
+  "upstream_url": "https://download.opensuse.org/distribution/leap/15.6/appliances/openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2",
+  "upstream_sha256": "PIN_ME_to_the_vendor_sha256",
+  "repo_content": "[oss-drvps]\nname=openSUSE OSS (drvps pinned)\nbaseurl=https://download.opensuse.org/distribution/leap/$releasever/repo/oss/\nenabled=1\nautorefresh=1\ngpgcheck=1\n",
+  "packages": ["systemd", "openssh", "cloud-init", "tmux"]
+}

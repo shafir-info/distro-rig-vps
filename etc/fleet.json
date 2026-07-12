@@ -1,0 +1,38 @@
+{
+  "_comment": "Fleet/egress inventory for distro-rig-vps. The OPERATOR edits this; nothing here is hardcoded in the code. Phase-1 default profile is 'simulated' = deny-by-default, allow ONLY the local package cache + mock ports. block_* applies to the non-default profiles (proxied-real/open, deferred). IPv6 is blocked by default.",
+  "block_cidrs": [
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "100.64.0.0/10", "169.254.0.0/16", "224.0.0.0/4",
+    "fc00::/7", "fe80::/10"
+  ],
+  "block_ipv6_all": true,
+  "host_ips": ["192.0.2.1"],
+  "fleet_public_ips": [],
+  "simulated_networks": ["simnet"],
+  "simulated_allow": {
+    "cache_cidr": "10.123.0.1/32",
+    "cache_port": 3128,
+    "mock_ports": [8443]
+  },
+  "_comment_ca_parents": "mirror_ca_parents = the EXACT registrable parent domains the cache CA's X.509 nameConstraints permit (squid ssl-bump mints wildcard-mimic leaves like *.fedoraproject.org, so the CA must permit the parent, not the exact mirror host -- DR-3). REQUIRED whenever mirror_allowlist contains any host outside the known default families (fedoraproject.org/debian.org/ubuntu.com/rockylinux.org/almalinux.org/centos.org/opensuse.org/alpinelinux.org): for anything else the installer FAILS CLOSED rather than guess a parent (last-two-labels cannot tell a registrable domain from a public suffix like co.uk/co.kr). Every mirror_allowlist host must be covered by one of these parents (host == parent or host ends .parent) or setup fails closed.",
+  "mirror_ca_parents": [
+    "fedoraproject.org", "debian.org", "ubuntu.com", "rockylinux.org",
+    "almalinux.org", "centos.org", "opensuse.org", "alpinelinux.org"
+  ],
+  "mirror_allowlist": [
+    "mirrors.fedoraproject.org",
+    "download.fedoraproject.org",
+    "dl.fedoraproject.org",
+    "deb.debian.org",
+    "cloud.debian.org",
+    "security.debian.org",
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "dl.rockylinux.org",
+    "repo.almalinux.org",
+    "mirror.stream.centos.org",
+    "download.opensuse.org",
+    "dl-cdn.alpinelinux.org"
+  ],
+  "dns": "no-internal"
+}

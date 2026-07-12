@@ -1,0 +1,2124 @@
+#!/bin/bash -p
+# run_sh snippets are SINGLE-QUOTED ON PURPOSE: their "$1"/"$2"/... are positional params for the inner
+# `bash -c` -- SC2016 ("don't expand in single quotes") is intended here (the injection-safety point).
+# shellcheck disable=SC2016
+#
+# ^ ABSOLUTE interpreter + PRIVILEGED MODE (-p): this runs as ROOT. `env bash` would resolve the
+# interpreter via the INHERITED PATH; and Bash startup would source an inherited $BASH_ENV and import
+# exported BASH_FUNC_* functions BEFORE any guard -- all root-exec seams. -p makes Bash ignore BASH_ENV/
+# ENV and not import env functions; the PATH pin below fixes tool resolution.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset BASH_ENV ENV CDPATH
+# RE-EXEC ONCE under a SCRUBBED environment (only when EXECUTED, not sourced): -p protects THIS process,
+# but CHILD shells (run_sh's bash -c, the `dr-vps doctor` env-bash) would still inherit + import an
+# attacker BASH_FUNC_* from the environment (those %%-named entries cannot be unset normally). `env -i`
+# wipes the environment entirely; we re-pass ONLY PATH/HOME/TERM + the DR_* config/seam vars (which
+# validate_env + the seam-drop then vet). DRVPS_REEXEC guards against a re-exec loop.
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ -z "${DRVPS_REEXEC:-}" ]; then
+  _keep=(DRVPS_REEXEC=1 "PATH=$PATH" "HOME=${HOME:-/root}" "TERM=${TERM:-dumb}")
+  # Parse the environment NUL-delimited (/proc/self/environ), NOT line-wise: `env` output is newline-
+  # delimited, so a value containing newlines (X=$'foo\nDR_NFT=/tmp/evil') would otherwise be split into
+  # FAKE entries and smuggle an allowed var. Each NUL record is one real entry; split on the FIRST '='
+  # (env NAMEs cannot contain '=' or newline), keep only strict DR_* identifier names, re-pass the value
+  # as a SINGLE env arg.
+  while IFS= read -r -d '' _e; do
+    _n="${_e%%=*}"
+    case "$_n" in
+      DR_VPS_[A-Z_]*|DR_NFT|DR_VIRSH|DR_QEMU_IMG|DR_XMLLINT|DR_SSH|DR_CLOUDLOCALDS|DR_TIMEOUT|DR_SQLITE)
+        _keep+=("$_n=${_e#*=}") ;;
+    esac
+  done < /proc/self/environ
+  exec env -i "${_keep[@]}" /bin/bash -p "$0" "$@"
+fi
+# dr-vps-setup -- privileged one-time installer for distro-rig-vps (CONCEPT s7).
+# Idempotent, re-entrant, host-distro-aware. The OPERATOR runs this ONCE with sudo; the
+# rig then runs unprivileged-of-sudo as the drvps service account. The agent never sudos
+# -- it may run `--dry-run` (no changes) to preview. ASCII only.
+#
+#   sudo /.../bin/dr-vps-setup [--dry-run] [--yes] [--uninstall] [--reapply-egress]
+#                              [--force-squid] [--gate-selftest <distro>]
+#
+# --dry-run : print every action, change nothing (no root needed).
+# --yes     : non-interactive; required to actually CREATE the service user.
+# --uninstall: remove the user/network/rules/state on request.
+# --force-squid: take over an existing FOREIGN /etc/squid/squid.conf (else the coexistence guard refuses).
+# --gate-selftest <distro>: boot a throwaway probe VM from that golden, run the REAL guest-exec gate, and
+#   if it refuses, name the unrecognized libvirt/qemu element (for a human to CURATE -- never auto-allowed).
+set -uo pipefail
+
+# -P / pwd -P: resolve the install path PHYSICALLY (follow symlinks NOW). The physical path is what is
+# persisted into the env file + systemd unit ExecStart; a LOGICAL (symlinked) path would let an attacker
+# who owns a symlink component SWAP it after install -> root then execs code from the swapped target.
+HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SRC="$(cd -P "$HERE/../src" && pwd -P)"
+# The install/checkout path ($HERE/$SRC and $root below) is interpolated into ROOT contexts: `bash -c`
+# strings (step_nft/reapply), the generated /etc/distro-rig-vps/env, and systemd unit ExecStart lines.
+# A metacharacter-bearing checkout path (e.g. '/tmp/x; touch /m #') would inject ROOT commands BEFORE
+# any later guard. Require the install path to be an absolute, shell-safe charset here, before ANY use.
+case "$HERE" in /*) ;; *) echo "[setup] FATAL: install path is not absolute: $HERE" >&2; exit 2;; esac
+case "$HERE" in *[!A-Za-z0-9_/.-]*) echo "[setup] FATAL: install path has unsafe characters -- deploy the checkout under a plain path (e.g. /opt/distro-rig-vps): $HERE" >&2; exit 2;; esac
+# PREFLIGHT (root only): we are about to SOURCE shell libraries from $SRC/$HERE AS ROOT, BEFORE the
+# later _assert_install_tree_safe (which guards the UNIT writes) can run. A root-run installer pointed
+# at an attacker-controlled tree would otherwise exec it here. So, when root, assert $SRC + $HERE + every
+# ancestor up to / are root-owned + free of group/other write BEFORE the first source. (Non-root
+# dry-run/tests skip this -- no root execution, no escalation; the dev checkout is not root-owned.)
+if [ "$(id -u)" = 0 ]; then
+  for _d in "$SRC" "$HERE"; do
+    if [ -n "$(find "$_d" \( ! -uid 0 -o -perm /022 \) -print -quit 2>/dev/null)" ]; then
+      echo "[setup] FATAL: $_d is not root-owned + free of group/other write -- refusing to source it AS ROOT (deploy under /opt root:root)" >&2; exit 1
+    fi
+  done
+  _pp="$SRC"
+  while :; do
+    if [ "$(stat -c '%u' "$_pp" 2>/dev/null)" != 0 ] || [ -n "$(find "$_pp" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+      echo "[setup] FATAL: ancestor '$_pp' of the source tree is not root-owned + non-writable -- refusing to source as root" >&2; exit 1
+    fi
+    [ "$_pp" = / ] && break
+    _pp=$(dirname "$_pp")
+  done
+fi
+# The ROOT installer path EXECUTES external tool binaries through the DR_* seams: DR_NFT (argv[0] of
+# dr_vps_net_apply), and DR_VIRSH/DR_QEMU_IMG/DR_XMLLINT/... via `dr-vps doctor`. An inherited
+# DR_NFT=/tmp/evil runs AS ROOT -- charset validation can't stop it (a charset-safe attacker PATH still
+# execs). DROP the inherited tool-binary seams so api.sh installs its TRUSTED defaults (bare names via
+# the root PATH). UNCONDITIONALLY when ROOT (id -u == 0) -- a real install must NEVER honor an inherited
+# (or smuggled) DR_VPS_TEST_SEAMS=1 to keep an attacker tool path; only a NON-root test run keeps seams.
+if [ "$(id -u)" = 0 ] || [ "${DR_VPS_TEST_SEAMS:-}" != 1 ]; then
+  # DR_LIBVIRT_URI is ALSO a root-exec seam, not harmless config: a `qemu+ext:///system?command=/path`
+  # URI makes `virsh -c "$DR_LIBVIRT_URI"` (via `dr-vps doctor`) launch an arbitrary command AS ROOT.
+  # Drop it too so api.sh installs the trusted qemu:///system default.
+  unset DR_NFT DR_VIRSH DR_QEMU_IMG DR_XMLLINT DR_SSH DR_CLOUDLOCALDS DR_TIMEOUT DR_SQLITE DR_LIBVIRT_URI
+fi
+# Capture whether the operator EXPLICITLY chose the console-log dir BEFORE api.sh applies its default, so
+# the apt-family relocation in detect_host only fires when the operator did not pick a path of their own.
+_DR_VPS_CONSOLE_DIR_OPERATOR="${DR_VPS_CONSOLE_LOG_DIR:-}"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../src/dr_vps_api.sh
+. "$SRC/dr_vps_api.sh"
+
+DRY_RUN=0; ASSUME_YES=0; UNINSTALL=0; REAPPLY=0; GATE_SELFTEST=""; FORCE_SQUID=0; ADOPT_SIMNET=0
+# Host-detection state (filled by detect_host BEFORE any step): package family, the libvirt control-plane
+# unit (modular hosts ship virtqemud, not libvirtd.service), and whether SELinux userspace is active.
+PM=""; LIBVIRT_UNIT=libvirtd.service; SELINUX_ON=0
+_next_is_val=""
+for a in "$@"; do
+  if [ -n "$_next_is_val" ]; then GATE_SELFTEST="$a"; _next_is_val=""; continue; fi
+  case "$a" in
+  --dry-run) DRY_RUN=1;; --yes) ASSUME_YES=1;; --uninstall) UNINSTALL=1;;
+  --reapply-egress) REAPPLY=1;;
+  --force-squid) FORCE_SQUID=1;;              # override the foreign-squid.conf coexistence guard (B3)
+  --adopt-simnet) ADOPT_SIMNET=1;;            # take over an UNMARKED pre-existing simnet/drvps0 net (B4)
+  --gate-selftest) _next_is_val=1;;           # <artifact>: boot a probe VM + run the gate self-test (B7)
+  --gate-selftest=*) GATE_SELFTEST="${a#*=}";;
+  -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  *) printf 'unknown flag: %s\n' "$a" >&2; exit 2;;
+esac; done
+[ -n "$_next_is_val" ] && { echo "--gate-selftest needs an <artifact-id> value" >&2; exit 2; }
+
+: "${DR_VPS_SYS_STATE:=/var/lib/distro-rig-vps}"   # system pool/seed live here (drvps:<qemu-group>, 0750)
+# The agent spool lives in its OWN parent, NOT under the qemu-private state tree: the agent is only in
+# drvpsctl (not the qemu group), and Unix traversal needs +x on EVERY parent -- a spool buried under
+# /var/lib/distro-rig-vps (0750 :qemu) would be unreachable by the agent. /var/spool/<name> (drvps:drvpsctl)
+# is traversable by drvpsctl while pool/seed/DB stay qemu-private.
+: "${DR_VPS_SPOOL_BASE:=/var/spool/distro-rig-vps}"
+: "${DR_VPS_NET_NAME:=simnet}"
+: "${DR_VPS_CTL_GROUP:=drvpsctl}"                  # Phase-2: agent + drvps share this (spool)
+# DETECT host-distro identities instead of assuming: the group qemu:///system runs as (Fedora:
+# qemu; Debian/Ubuntu: libvirt-qemu) and the squid runtime user (Fedora: squid; Debian: proxy).
+_qemu_grp() { local g; for g in qemu libvirt-qemu kvm; do getent group "$g" >/dev/null 2>&1 && { echo "$g"; return; }; done; echo qemu; }
+_squid_usr() { local u; for u in squid proxy; do getent passwd "$u" >/dev/null 2>&1 && { echo "$u"; return; }; done; echo squid; }
+# Registrable parent domain = the last two dot-labels. Only a HEURISTIC (see _drvps_ca_parents for why
+# it is guarded); NOT trusted for multi-label public suffixes.
+_drvps_parent_domain() {  # <fqdn> -> last two dot-labels
+  printf '%s' "$1" | awk -F. '{ if (NF>=2) printf "%s.%s", $(NF-1), $NF; else printf "%s", $0 }'
+}
+# The cache-CA permitted PARENT domains. Squid ssl-bump mints a leaf mimicking the origin's WILDCARD SAN
+# (*.fedoraproject.org); a permitted;DNS:dl.fedoraproject.org subtree does NOT contain it -> OpenSSL
+# "permitted subtree violation (47)" and every proxied HTTPS fetch fails (DR-3). So the CA must permit the
+# PARENT domain. SOURCE, in preference order (explicit + canonical + fail-closed):
+#   1. fleet.mirror_ca_parents (explicit operator-controlled list) -- the exact, safe CA boundary; else
+#   2. derived last-two-labels of mirror_allowlist (the common <sld>.<tld> case).
+# FAIL CLOSED if any parent is a multi-label PUBLIC SUFFIX (co.uk, ...): last-two-labels would make the CA
+# valid for the WHOLE suffix (a leaked-key disaster) -- the operator must then set mirror_ca_parents. The
+# output is sort -u (canonical), so the CA-regen drift hash is order-insensitive (no spurious rotation).
+# Known default mirror families -- the ONLY registrable domains we will AUTO-DERIVE (last-two-labels
+# cannot tell debian.org from a public suffix like co.uk/co.kr; a hard-coded PSL denylist is always
+# incomplete). Any mirror outside this set REQUIRES an explicit fleet.mirror_ca_parents.
+_DRVPS_KNOWN_CA_PARENTS=" fedoraproject.org debian.org ubuntu.com rockylinux.org almalinux.org centos.org opensuse.org alpinelinux.org "
+_drvps_ca_parents() {  # <fleet.json> -> space-separated canonical parents; return 2 = fail-closed
+  local fleet="$1" parents hosts h p d covered
+  hosts=$(jq -r '.mirror_allowlist[]?' "$fleet" 2>/dev/null | sed '/^$/d')
+  parents=$(jq -r '.mirror_ca_parents[]? // empty' "$fleet" 2>/dev/null)
+  if [ -n "$parents" ]; then
+    parents=$(printf '%s\n' "$parents" | sort -u | sed '/^$/d' | tr '\n' ' ')
+  else
+    # DERIVE only for KNOWN families; fail closed on anything else (no unsafe last-two-labels guessing).
+    local derived=""
+    for h in $hosts; do
+      d=$(_drvps_parent_domain "$h")
+      case "$_DRVPS_KNOWN_CA_PARENTS" in *" $d "*) derived="${derived:+$derived }$d";;
+        *) echo "[setup] FATAL: no safe auto cache-CA parent for mirror '$h' (registrable domain '$d' is not a known default family). Set fleet.mirror_ca_parents explicitly." >&2; return 2;; esac
+    done
+    # shellcheck disable=SC2086
+    parents=$(printf '%s\n' $derived | sort -u | sed '/^$/d' | tr '\n' ' ')
+  fi
+  [ -n "${parents// /}" ] || { echo "[setup] FATAL: no cache-CA parents (set fleet.mirror_ca_parents or a known mirror_allowlist)" >&2; return 2; }
+  for p in $parents; do
+    case "$p" in *.*) ;; *) echo "[setup] FATAL: cache-CA parent '$p' is not a domain (needs a dot)" >&2; return 2;; esac
+  done
+  # COVERAGE: every mirror host MUST be covered by some parent (host == parent OR host ends
+  # .parent), else that mirror's bumped cert violates the CA constraint and DR-3 recurs for it.
+  for h in $hosts; do
+    covered=0
+    for p in $parents; do case "$h" in "$p"|*".$p") covered=1; break;; esac; done
+    [ "$covered" = 1 ] || { echo "[setup] FATAL: mirror '$h' is not covered by any cache-CA parent [$parents] -- add its registrable domain to fleet.mirror_ca_parents." >&2; return 2; }
+  done
+  printf '%s' "$parents"
+}
+# Build the OpenSSL nameConstraints value from the (already-canonical) permitted PARENT domains: EXCLUDE
+# every IP-address SAN (ADDRESS/MASK form -- CIDR is rejected by OpenSSL) + PERMIT each parent. Pure
+# string builder so it is unit-testable (cli.bats runs real `openssl req`/`verify` against the output).
+_drvps_ca_nc() {  # <space-separated parent domains> -> nameConstraints value
+  local nc="excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0" d
+  for d in $1; do nc="${nc:+$nc,}permitted;DNS:$d"; done
+  printf '%s' "$nc"
+}
+
+# VALIDATE every privileged env-overridable value. run() is now argv-based (values are literal args,
+# never eval'd) so this is DEFENSE-IN-DEPTH, not the sole barrier -- but values still flow into config
+# FILE content (squid.conf/units) and the env file, so constrain paths to absolute + safe charset and
+# names to a safe charset, so no override can carry ';', '$', backticks, spaces, quotes, newlines, etc.
+# Fail (exit 2) on any unsafe value.
+_safe_path() {  # <value> <label>
+  case "$1" in /*) ;; *) echo "[setup] FATAL: $2 must be an absolute path (got: $1)" >&2; exit 2;; esac
+  case "$1" in *[!A-Za-z0-9_/.-]*) echo "[setup] FATAL: $2 has unsafe characters (got: $1)" >&2; exit 2;; esac
+  # Reject '.' and '..' path components BEFORE any lexical canonicalization: `realpath -ms` (used by
+  # _not_system_root + _assert_ancestors_root) collapses `sym/..` TEXTUALLY, which would hide a symlink
+  # component from the per-component -L check and let a later `rm -rf`/chown resolve out-of-tree via the
+  # kernel. A legitimate rig path never contains '.'/'..'. (The charset above already forbids most tricks;
+  # this closes the dot-dot-with-symlink lexical-vs-kernel divergence.)
+  case "/$1/" in *"/../"*|*"/./"*) echo "[setup] FATAL: $2 must not contain a '.' or '..' path component (got: $1)" >&2; exit 2;; esac
+}
+_safe_name() {  # <value> <label>  (user/group/net name)
+  case "$1" in ''|*[!A-Za-z0-9_.-]*|-*) echo "[setup] FATAL: $2 is empty or has unsafe characters (got: $1)" >&2; exit 2;; esac
+}
+# SEMANTIC bound (metachar-free is NOT enough): a state/spool path we chown/chmod/rm must be a
+# PROJECT-OWNED path, never a shared system directory NOR a non-rig service dir (DR_VPS_SYS_STATE=/etc
+# would chown+rm /etc; /var/lib/libvirt would chown+rm libvirt's own state).
+_not_system_root() {  # <path> <label>
+  # realpath -ms = lexical canonical (-s: do NOT follow symlinks; -m: allow missing). readlink -m
+  # FOLLOWS symlink components, so a path like /tmp/race/link/etc (link -> /opt/distro-rig-vps) would
+  # resolve to a safe-looking target, pass the namespace rule, then be swapped after validation. We must
+  # judge the LITERAL supplied path.
+  local r; r=$(realpath -ms "$1")
+  case "$r" in
+    /|/etc|/var|/var/lib|/var/spool|/var/run|/usr|/usr/lib|/usr/libexec|/usr/local|/opt|/home|/boot|/bin|/sbin|/lib|/lib64|/root|/dev|/proc|/sys|/run|/tmp|/mnt|/srv)
+      echo "[setup] FATAL: $2 ($r) is a shared system directory -- use a project-owned subdirectory (e.g. /var/lib/distro-rig-vps)" >&2; exit 2;;
+    /etc/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/boot/*|/dev/*|/proc/*|/sys/*|/root/*)
+      echo "[setup] FATAL: $2 ($r) is under a system directory the rig must not own/delete" >&2; exit 2;;
+  esac
+  case "$r" in /*/*) ;; *) echo "[setup] FATAL: $2 ($r) is a top-level directory -- use a project subdir" >&2; exit 2;; esac
+  # POSITIVE: the path MUST be in the rig's own namespace (a 'distro-rig-vps' path component). This is
+  # what stops a NON-rig service dir like /var/lib/libvirt or /var/spool/squid (which pass the denylist
+  # above) from being chowned + uninstall-deleted. The installer only ever owns a distro-rig-vps tree.
+  case "$r" in
+    */distro-rig-vps|*/distro-rig-vps/*) ;;
+    *) echo "[setup] FATAL: $2 ($r) is not in the rig namespace -- it must be a distro-rig-vps-owned path (e.g. /var/lib/distro-rig-vps); refusing to chown/delete a non-project directory" >&2; exit 2;;
+  esac
+}
+# TOCTOU/symlink defense for an env-selected path the ROOT installer CREATES / CHOWNS / DELETES
+# (DR_VPS_SYS_STATE, DR_VPS_SPOOL_BASE, DR_VPS_NET_STATE). Namespace+charset validation is not enough:
+# DR_VPS_SYS_STATE=/home/alice/distro-rig-vps/etc passes, then alice swaps a writable ancestor to a
+# symlink -> root's `install -d`/`rm -rf` resolves to /etc. Require EVERY existing component to be
+# root-owned, non-group/other-writable, and NOT a symlink. A non-root-writable ancestor cannot be
+# modified by an attacker, so this single check is RACE-FREE (no swap is possible after it passes).
+_assert_ancestors_root() {  # <path> <label>
+  local p cur="" c above=1; local -a comps
+  p=$(realpath -ms "$1")                      # LEXICAL canonical (-s: NO symlink follow; -m: allow missing)
+  IFS=/ read -ra comps <<<"$p"
+  for c in "${comps[@]}"; do
+    [ -n "$c" ] || continue
+    cur="$cur/$c"
+    # The 'distro-rig-vps' namespace component AND everything below it are the rig's own tree, created
+    # `-o drvps` (drvps:qemu-owned) -- so from HERE DOWN skip the root-ownership check. Set this BEFORE
+    # the checks so the namespace component itself is not wrongly ownership-checked.
+    [ "$c" = distro-rig-vps ] && above=0
+    # A SYMLINK at ANY component -- ABOVE *or* BELOW the rig namespace -- is a swap risk (root fs ops
+    # follow it out of tree). drvps owns the rig subtree and could plant a symlink at a child (pool/seed/
+    # requests/...), so reject symlinks everywhere, not just on the outer ancestors.
+    if [ -L "$cur" ]; then
+      echo "[setup] FATAL: $2 component '$cur' is a SYMLINK -- refusing (symlink-swap of a root path)" >&2; exit 2
+    fi
+    # OWNERSHIP: only ancestors ABOVE the namespace must be a trusted root-owned chain (an attacker there
+    # could swap the whole subtree). The rig subtree is legitimately drvps-owned.
+    if [ "$above" = 1 ] && [ -e "$cur" ]; then
+      # Ancestors ABOVE the rig namespace must be root-owned AND free of group/other write (find -perm
+      # /022): a non-root-writable ancestor cannot be swapped by an attacker, so the check is race-free.
+      # This stays STRICT on both families -- Debian's group-writable root:syslog /var/log is NOT used as
+      # a console-log ancestor (the apt family defaults the console-log dir under a root:root ancestor,
+      # /var/lib/distro-rig-vps/console -- see detect_host), so no relaxation is needed here.
+      { [ "$(stat -c '%u' "$cur" 2>/dev/null)" = 0 ] && [ -z "$(find "$cur" -maxdepth 0 -perm /022 2>/dev/null)" ]; } \
+        || { echo "[setup] FATAL: $2 ancestor '$cur' is not root-owned + non-group/other-writable -- refusing (a writable ancestor enables a symlink-swap of this root path)" >&2; exit 2; }
+    fi
+  done
+}
+# RACE-FREE create/own for a path UNDER a SERVICE-OWNED (drvps) dir. Path-based guard-then-chown is
+# racy: a RUNNING drvps can swap a checked component to a symlink between the check and the chown/chmod.
+# The only race-free way is FD-based: walk every component with openat(O_NOFOLLOW) (a symlink -> ELOOP ->
+# abort), then fchown/fchmod the resulting FD (which names the real inode, not a path). Bash can't do
+# this; use python3 (a dep; resolved via the pinned PATH). kind=dir creates a dir; kind=file creates/reuses
+# a regular file (O_NOFOLLOW|O_CREAT, no O_EXCL) -- used for audit.log + the ssh keyfiles after keygen.
+_fs_guard_py() {  # <dir|file> <path> <owner> <group> <octal-mode>
+  python3 - "$@" <<'PY'
+import os, sys, pwd, grp, stat
+kind, path, owner, group, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5], 8)
+uid = pwd.getpwnam(owner).pw_uid; gid = grp.getgrnam(group).gr_gid
+parts = [p for p in path.split('/') if p]
+if not parts: sys.exit("fs-guard: empty path")
+ancestors, leaf = parts[:-1], parts[-1]
+dirfd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for name in ancestors:                                   # every ancestor dir, NO symlink follow
+        try:
+            nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except OSError as e:
+            sys.exit("fs-guard: unsafe ancestor '%s' (%s)" % (name, e.strerror))
+        os.close(dirfd); dirfd = nfd
+    if kind == 'dir':
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except FileNotFoundError:
+            os.mkdir(leaf, mode, dir_fd=dirfd)
+            fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except OSError as e:
+            sys.exit("fs-guard: '%s' is a symlink/non-dir (%s)" % (leaf, e.strerror))
+    elif kind == 'putfile':                                  # create FRESH + write content from a root-owned src
+        src = sys.argv[6]
+        with open(src, 'rb') as s: data = s.read()
+        try:
+            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dirfd)
+        except OSError as e:                                 # EEXIST (a planted file/symlink) or ELOOP -> abort
+            sys.exit("fs-guard: '%s' already exists / is a symlink (%s)" % (leaf, e.strerror))
+        ok = False
+        try:
+            mv = memoryview(data); total = 0        # write-all: a single os.write may short-write;
+            while total < len(mv):                   # a truncated SSH key would install "successfully" then
+                n = os.write(fd, mv[total:])         # break every guest ssh (wait/exec/push/pull auth fails)
+                if n <= 0:
+                    raise OSError("short write to '%s'" % leaf)
+                total += n
+            os.fsync(fd); ok = True
+        finally:
+            os.close(fd)
+            if not ok:                               # never leave a partial/truncated key behind
+                try: os.unlink(leaf, dir_fd=dirfd)
+                except OSError: pass
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)   # reopen the same name no-follow to set owner/mode
+    else:                                                    # file (create/reuse empty)
+        try:                                                 # O_NONBLOCK: a planted FIFO must not BLOCK the open
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CREAT | os.O_NONBLOCK, mode, dir_fd=dirfd)
+        except OSError as e:
+            sys.exit("fs-guard: '%s' is a symlink (%s)" % (leaf, e.strerror))
+    # TYPE ASSERT: O_NOFOLLOW blocks symlinks but NOT other non-regular leaves. The
+    # unprivileged service user could pre-create audit.log / a keyfile AS A DIRECTORY (or a fifo/device);
+    # without this, root would fchown/fchmod it and proceed with a broken path. Require the exact kind.
+    st = os.fstat(fd)
+    if kind == 'dir':
+        if not stat.S_ISDIR(st.st_mode):
+            os.close(fd); sys.exit("fs-guard: '%s' exists but is not a directory" % leaf)
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd); sys.exit("fs-guard: '%s' exists but is not a regular file" % leaf)
+    try:
+        os.fchown(fd, uid, gid); os.fchmod(fd, mode)         # by FD -> the real inode, race-free
+    finally:
+        os.close(fd)
+finally:
+    os.close(dirfd)
+PY
+}
+# Symlink-safe recursive delete -- the destructive counterpart of the fd-based create helper above, for
+# the drvps-owned rig subtree in do_uninstall. A plain path-based `rm -rf` there is a TOCTOU: the rig
+# subtree is drvps-owned + MUTABLE, so a compromised drvps could swap an intermediate component to a
+# symlink between validate_env and the delete, making rm follow it OUT of tree (as root). This walks every
+# ancestor + child fd-relative with O_NOFOLLOW (a symlink component -> ELOOP -> refused on an ancestor, or
+# unlinked-as-a-plain-entry for a child -- NEVER followed). Idempotent (an absent target is success), and
+# refuses a shallow (<2-component) path as a blast-radius backstop. Uses python3 (a hard drvps dep).
+_fs_rm_rf_safe() {  # <absolute-path>
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] safe-rm -rf %s (fd-relative, O_NOFOLLOW)\n' "$1"; return 0; fi
+  python3 - "$1" <<'PYRM'
+import os, sys, stat
+path = sys.argv[1]
+# A legit rig tree is shallow (pool/seed/snapshots/tmp + per-VM overlay files); a deeper tree is
+# corruption or an attacker padding depth to DoS the delete. Cap depth -> refuse (FAIL CLOSED), never
+# a RecursionError, and hold at most MAX_DEPTH directory FDs. Traversal is ITERATIVE + streaming (scandir).
+MAX_DEPTH = 128
+OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+parts = [p for p in path.split('/') if p]
+if len(parts) < 2:
+    sys.exit("fs-rm: refusing a shallow path (blast-radius guard): %s" % path)
+ancestors, leaf = parts[:-1], parts[-1]
+dirfd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+stack = []                                                   # [parent_fd, name, fd, scandir_iter] per level
+try:
+    for name in ancestors:                                   # walk ancestors, NO symlink follow
+        try:
+            nfd = os.open(name, OPEN, dir_fd=dirfd)
+        except FileNotFoundError:
+            sys.exit(0)                                      # an absent ancestor -> target already gone
+        except OSError as e:
+            sys.exit("fs-rm: unsafe ancestor '%s' (%s)" % (name, e.strerror))
+        os.close(dirfd); dirfd = nfd
+    try:
+        st = os.lstat(leaf, dir_fd=dirfd)                    # NO follow
+    except FileNotFoundError:
+        sys.exit(0)                                          # already gone (idempotent)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(leaf, dir_fd=dirfd)                        # a file OR a symlink -> unlink the entry, no follow
+        sys.exit(0)
+    try:
+        rootfd = os.open(leaf, OPEN, dir_fd=dirfd)
+    except OSError:
+        os.unlink(leaf, dir_fd=dirfd); sys.exit(0)           # raced to a non-dir/symlink -> unlink, no follow
+    stack.append([dirfd, leaf, rootfd, os.scandir(rootfd)])
+    while stack:
+        parent_fd, name, fd, scan = stack[-1]
+        descended = False
+        for entry in scan:                                   # streaming: one entry at a time
+            if entry.is_dir(follow_symlinks=False):          # a real subdir (NOT a symlink-to-dir)
+                if len(stack) >= MAX_DEPTH:
+                    sys.exit("fs-rm: tree deeper than %d levels -- refusing (corruption/attack)" % MAX_DEPTH)
+                try:
+                    cfd = os.open(entry.name, OPEN, dir_fd=fd)
+                except OSError:
+                    os.unlink(entry.name, dir_fd=fd); continue   # raced to non-dir/symlink -> unlink, no follow
+                stack.append([fd, entry.name, cfd, os.scandir(cfd)])
+                descended = True
+                break                                        # resume this dir's scan after the child is gone
+            else:
+                os.unlink(entry.name, dir_fd=fd)             # file OR symlink -> unlink the entry, no follow
+        if not descended:                                    # dir now empty -> close + rmdir via its parent
+            scan.close()
+            os.close(fd)
+            os.rmdir(name, dir_fd=parent_fd)
+            stack.pop()
+    sys.exit(0)
+except OSError as e:
+    sys.exit("fs-rm: %s (%s)" % (path, e.strerror))
+finally:
+    try:
+        os.close(dirfd)
+    except OSError:
+        pass
+    for _ent in stack:                                       # close anything still open on abnormal exit
+        try:
+            _ent[3].close()
+        except Exception:
+            pass
+        try:
+            os.close(_ent[2])
+        except OSError:
+            pass
+PYRM
+}
+_safe_mkdir_owned() {  # <dir> <owner> <group> <mode>  -- fd-based, race-free
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] safe-mkdir %s (owner %s:%s mode %s)\n' "$1" "$2" "$3" "$4"; return 0; fi
+  _fs_guard_py dir "$1" "$2" "$3" "$4" || { echo "[setup] safe-mkdir refused/failed (symlink component?): $1" >&2; exit 1; }
+}
+_safe_file_owned() {  # <file> <owner> <group> <mode>  -- fd-based, race-free
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] safe-file %s (owner %s:%s mode %s)\n' "$1" "$2" "$3" "$4"; return 0; fi
+  _fs_guard_py file "$1" "$2" "$3" "$4" || { echo "[setup] safe-file refused/failed (symlink component?): $1" >&2; exit 1; }
+}
+# Install file CONTENT from a root-owned <src> into <dest> race-free: O_CREAT|O_EXCL|O_NOFOLLOW (fails if
+# dest already exists as a file OR a planted symlink), write, fchown/fchmod by fd. Used to publish ssh
+# keys generated in a root-owned temp into the service-owned ~drvps/.ssh (root ssh-keygen itself does NOT
+# use O_NOFOLLOW for the .pub file, so it must never write directly into a service-owned dir).
+_safe_put_file() {  # <dest> <owner> <group> <mode> <src>
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] safe-put %s (owner %s:%s mode %s)\n' "$1" "$2" "$3" "$4"; return 0; fi
+  _fs_guard_py putfile "$1" "$2" "$3" "$4" "$5" || { echo "[setup] safe-put refused/failed (dest exists/symlink?): $1" >&2; exit 1; }
+}
+# Refuse to write/enable any ROOT systemd unit that execs shell libs from an unsafe install tree. The
+# egress oneshot runs `. $root/src/...` AS ROOT, so $root/src + $root/bin must be root-owned + free of
+# group/other write, AND $root + EVERY ancestor up to / must be root-owned + non-group/other-writable
+# (a writable parent could RENAME/REPLACE the tree after the check -> root runs swapped code). MUST run
+# BEFORE any unit file is written (else --reapply-egress from a writable checkout leaves poisoned units
+# on disk even though it aborts). Deploy the checkout under /opt (root:root, 0755).
+_assert_install_tree_safe() {  # <root>
+  local root="$1" d _p
+  # etc/ is here too: etc/fleet.json is read AS ROOT to build the squid mirror allowlist + the
+  # cache-CA nameConstraints -- a group/other-writable etc/ would let a non-root user feed root malicious config.
+  # Only check etc/ if present (some deploys may omit it; step_env then fails on the missing fleet.json).
+  for d in "$root/src" "$root/bin" "$root/etc"; do
+    [ -e "$d" ] || continue
+    if [ -n "$(find "$d" \( ! -uid 0 -o -perm /022 \) -print -quit 2>/dev/null)" ]; then
+      echo "[setup] FATAL: $d is not root-owned + free of group/other write -- refusing (root reads/execs it; deploy the tree under /opt as root:root, 0755/0644)" >&2; exit 1
+    fi
+  done
+  _p=$(readlink -f "$root")
+  while :; do
+    if [ "$(stat -c '%u' "$_p" 2>/dev/null)" != 0 ] || [ -n "$(find "$_p" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+      echo "[setup] FATAL: install-root ancestor '$_p' is not root-owned + free of group/other write -- a non-root user could swap the tree under the root unit. Deploy the checkout under /opt (root:root, 0755)." >&2; exit 1
+    fi
+    [ "$_p" = / ] && break
+    _p=$(dirname "$_p")
+  done
+}
+# strict dotted-quad IPv4: exactly 4 octets, each 0-255, no leading zeros (octal ambiguity). Used for
+# DR_VPS_BRIDGE_IP, which is interpolated into root-written config (net XML, env file) -- validate hard.
+_ipv4_ok() {
+  local IFS=. o n=0
+  # shellcheck disable=SC2086  # deliberate: split $1 on dots via IFS
+  set -- $1
+  [ "$#" -eq 4 ] || return 1
+  for o in "$@"; do
+    case "$o" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+    [ "$o" -le 255 ] || return 1
+    n=$((n+1))
+  done
+  [ "$n" -eq 4 ]
+}
+validate_env() {
+  _safe_path "$DR_VPS_SYS_STATE"                      DR_VPS_SYS_STATE
+  _safe_path "${DR_VPS_SPOOL_BASE:-/var/spool/distro-rig-vps}" DR_VPS_SPOOL_BASE
+  _not_system_root "$DR_VPS_SYS_STATE"                DR_VPS_SYS_STATE
+  _not_system_root "${DR_VPS_SPOOL_BASE:-/var/spool/distro-rig-vps}" DR_VPS_SPOOL_BASE
+  _assert_ancestors_root "$DR_VPS_SYS_STATE"          DR_VPS_SYS_STATE
+  _assert_ancestors_root "${DR_VPS_SPOOL_BASE:-/var/spool/distro-rig-vps}" DR_VPS_SPOOL_BASE
+  _safe_name "$DR_VPS_NET_NAME"                       DR_VPS_NET_NAME
+  # The runtime supports ONLY the 'simnet' profile: the fleet allowlist, the create/recreate net
+  # default, the nft egress fence (bridge drvps0), and net_create_guard are ALL keyed to it. A custom
+  # DR_VPS_NET_NAME would install a libvirt net the runtime then REFUSES (and uninstall must never tear
+  # down a pre-existing net). Require 'simnet' -- one source of truth, no install-vs-runtime drift.
+  [ "$DR_VPS_NET_NAME" = simnet ] || { echo "[setup] FATAL: DR_VPS_NET_NAME must be 'simnet' (the only runtime-supported egress profile) -- got '$DR_VPS_NET_NAME'" >&2; exit 2; }
+  _safe_name "$DR_VPS_CTL_GROUP"                      DR_VPS_CTL_GROUP
+  _safe_name "$DR_VPS_SERVICE_USER"                   DR_VPS_SERVICE_USER
+  # the watcher/reaper units run As this user -- it must NOT be root/UID 0 (core model: never root).
+  case "$DR_VPS_SERVICE_USER" in root) echo "[setup] FATAL: DR_VPS_SERVICE_USER must not be root (the watcher runs unprivileged)" >&2; exit 2;; esac
+  [ "$(id -u "$DR_VPS_SERVICE_USER" 2>/dev/null || echo 1)" != 0 ] || { echo "[setup] FATAL: DR_VPS_SERVICE_USER resolves to UID 0 -- refusing" >&2; exit 2; }
+  # ---- the rig bridge / guest-subnet knob: ONE source for every lockstep endpoint ---------------------
+  # DR_VPS_BRIDGE_IP (default = the historical literal 10.123.0.1) drives: the simnet XML ip + dhcp range
+  # (_dr_vps_net_xml), the squid bind ip + source ACL pins below, the persisted DR_VPS_GUEST_PROXY line
+  # (step_env), and the fleet cache_cidr lockstep guard (step_env). Contract: it is the .1 of its /24 --
+  # every derived value assumes that shape. Override it ONLY for a subnet-colliding host (e.g. a nested
+  # rig guest that itself sits on 10.123.0.0/24) and give fleet.json a matching cache_cidr.
+  : "${DR_VPS_BRIDGE_IP:=10.123.0.1}"
+  _ipv4_ok "$DR_VPS_BRIDGE_IP" || { echo "[setup] FATAL: DR_VPS_BRIDGE_IP is not a strict dotted-quad IPv4 (got: ${DR_VPS_BRIDGE_IP})" >&2; exit 2; }
+  case "$DR_VPS_BRIDGE_IP" in 0.0.0.0|255.255.255.255) echo "[setup] FATAL: DR_VPS_BRIDGE_IP must be a host bridge IP, not a wildcard/broadcast (got: ${DR_VPS_BRIDGE_IP})" >&2; exit 2;; esac
+  case "$DR_VPS_BRIDGE_IP" in *.1) ;; *) echo "[setup] FATAL: DR_VPS_BRIDGE_IP must be the .1 of its /24 (got: ${DR_VPS_BRIDGE_IP}) -- the dhcp range, proxy pins and cache_cidr all derive from that shape" >&2; exit 2;; esac
+  # RFC1918-ONLY: the rig bridge is a HOST-PRIVATE isolated network; a
+  # public / CGNAT / multicast / reserved bridge address would put squid's bind + source ACL on a
+  # routable range. The knob exists only to renumber a nested rig off a colliding PRIVATE subnet.
+  case "$DR_VPS_BRIDGE_IP" in
+    10.*) ;;
+    192.168.*) ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+    *) echo "[setup] FATAL: DR_VPS_BRIDGE_IP must be RFC1918 private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) -- got '${DR_VPS_BRIDGE_IP}'; the rig bridge is host-private, never a routable/public address" >&2; exit 2;;
+  esac
+  DR_VPS_NET24="${DR_VPS_BRIDGE_IP%.1}"
+  : "${DR_VPS_PROXY_IP:=$DR_VPS_BRIDGE_IP}"
+  : "${DR_VPS_PROXY_SRC:=${DR_VPS_NET24}.0/24}"
+  case "$DR_VPS_PROXY_IP"  in ''|*[!0-9.]*)      echo "[setup] FATAL: DR_VPS_PROXY_IP not an IPv4 (got: ${DR_VPS_PROXY_IP})" >&2; exit 2;; esac
+  case "$DR_VPS_PROXY_SRC" in ''|*[!0-9./]*)  echo "[setup] FATAL: DR_VPS_PROXY_SRC not an IPv4 CIDR (got: ${DR_VPS_PROXY_SRC})" >&2; exit 2;; esac
+  # SEMANTIC bounds for the proxy boundary (char-class is not enough): the squid bind IP must not be the
+  # WILDCARD (0.0.0.0 -> listens on every interface) and the source ACL must not be ALL-sources
+  # (0.0.0.0/0 or any /0 -> any host, not just the guest subnet). Both would break the "guest subnet
+  # only" confinement the rest of the design assumes.
+  case "$DR_VPS_PROXY_IP"  in 0.0.0.0|255.255.255.255) echo "[setup] FATAL: DR_VPS_PROXY_IP must be the bridge IP, not a wildcard/broadcast (got: ${DR_VPS_PROXY_IP})" >&2; exit 2;; esac
+  case "$DR_VPS_PROXY_SRC" in 0.0.0.0|0.0.0.0/*|*/0) echo "[setup] FATAL: DR_VPS_PROXY_SRC must be the guest subnet, not all-sources (got: ${DR_VPS_PROXY_SRC})" >&2; exit 2;; esac
+  # CONSISTENCY: the squid bind IP + source ACL are NOT independently configurable. The guest
+  # proxy URL, the libvirt bridge IP (net-define below), and the nft-allowed fleet cache_cidr ALL key to
+  # the same endpoint. A DR_VPS_PROXY_IP/SRC that diverges makes squid bind an address the guests can't
+  # reach -> setup "succeeds" but the egress/package path is dead. Pin both to the DERIVED bridge values
+  # (DR_VPS_BRIDGE_IP is the single source; the old hard literals moved into its default).
+  [ "$DR_VPS_PROXY_IP" = "$DR_VPS_BRIDGE_IP" ] \
+    || { echo "[setup] FATAL: DR_VPS_PROXY_IP must equal the bridge/guest-proxy IP ${DR_VPS_BRIDGE_IP} (got: ${DR_VPS_PROXY_IP}) -- guests reach the cache only there" >&2; exit 2; }
+  [ "$DR_VPS_PROXY_SRC" = "${DR_VPS_NET24}.0/24" ] \
+    || { echo "[setup] FATAL: DR_VPS_PROXY_SRC must equal the guest subnet ${DR_VPS_NET24}.0/24 (got: ${DR_VPS_PROXY_SRC})" >&2; exit 2; }
+  # NUMERIC overrides interpolated VERBATIM into root-written config -- squid.conf (cache_dir size /
+  # maximum_object_size) and the egress timer unit (OnUnitActiveSec). A multiline/non-digit value would
+  # INJECT extra squid ACLs or systemd directives. Require strict positive integers.
+  case "${DR_VPS_CACHE_MB:-8192}"          in ''|*[!0-9]*) echo "[setup] FATAL: DR_VPS_CACHE_MB must be a positive integer (MB)" >&2; exit 2;; esac
+  case "${DR_VPS_CACHE_MAXOBJ_MB:-2048}"   in ''|*[!0-9]*) echo "[setup] FATAL: DR_VPS_CACHE_MAXOBJ_MB must be a positive integer (MB)" >&2; exit 2;; esac
+  case "${DR_VPS_EGRESS_REAPPLY_SEC:-120}" in ''|*[!0-9]*) echo "[setup] FATAL: DR_VPS_EGRESS_REAPPLY_SEC must be a positive integer (seconds)" >&2; exit 2;; esac
+  # the fleet path is read by jq (root) -- keep it a safe absolute path too.
+  _safe_path "${DR_VPS_FLEET_JSON:-/etc/distro-rig-vps/fleet.json}" DR_VPS_FLEET_JSON
+  # DR_VPS_NET_STATE is the nft marker file that the ROOT egress apply WRITES + chmod 0644. It is
+  # env-overridable (api.sh default), so a hostile installer env could redirect that root write/chmod
+  # to an arbitrary path (e.g. /etc/cron.d/x). Constrain it to a safe rig-namespace path.
+  _safe_path "$DR_VPS_NET_STATE"      DR_VPS_NET_STATE
+  # The nft marker is written path-based by dr_vps_net_apply (mkdir -p + redirect + chmod). Confine it to
+  # /run/ (root-owned tmpfs, non-drvps-writable) so no service user can plant a symlink at it -- rather
+  # than the general rig namespace (a drvps-owned rig subtree WOULD be swappable).
+  case "$(realpath -ms "$DR_VPS_NET_STATE")" in
+    /run/*) ;;
+    *) echo "[setup] FATAL: DR_VPS_NET_STATE must be under /run (root-owned tmpfs); got '$DR_VPS_NET_STATE'" >&2; exit 2;;
+  esac
+  _assert_ancestors_root "$DR_VPS_NET_STATE" DR_VPS_NET_STATE
+  # DR_NFT is the nft binary the ROOT egress apply execs as argv[0] (dr_vps_net_apply, via step_nft).
+  # An inherited env could point it at an arbitrary binary; constrain to a safe charset (a bare command
+  # name like 'nft' or an absolute path), never metacharacters.
+  case "${DR_NFT:-nft}" in *[!A-Za-z0-9_/.-]*) echo "[setup] FATAL: DR_NFT has unsafe characters (got: ${DR_NFT})" >&2; exit 2;; esac
+  # Observability console-log dir: the ROOT installer CREATES/CHOWNS/labels it -- SAME path-safety as
+  # DR_VPS_SYS_STATE (absolute + safe charset + rig-namespace + root-owned ancestors, symlink-swap proof).
+  # On the apt family detect_host relocates the DEFAULT under /var/lib (root:root ancestor) so this strict
+  # ancestor check passes without any group-writable-ancestor exception (Debian's /var/log is root:syslog).
+  _safe_path             "$DR_VPS_CONSOLE_LOG_DIR" DR_VPS_CONSOLE_LOG_DIR
+  _not_system_root       "$DR_VPS_CONSOLE_LOG_DIR" DR_VPS_CONSOLE_LOG_DIR
+  _assert_ancestors_root "$DR_VPS_CONSOLE_LOG_DIR" DR_VPS_CONSOLE_LOG_DIR
+  # The console dir must be a DIRECT child of a 'distro-rig-vps' namespace dir (i.e. exactly
+  # `.../distro-rig-vps/<leaf>`). step_console CREATES/CHOWNS the dir's PARENT and uninstall rmdir's it, so
+  # the parent must BE the rig namespace dir (drvps-owned, with root-owned ancestors) -- NOT a system dir
+  # (a bare `.../distro-rig-vps` leaf would make the parent /var/lib or /srv/app and chown/rmdir it) and NOT
+  # a deeper `.../distro-rig-vps/a/b/console` (whose intermediate 'a' is drvps-swappable, so a path-based
+  # rmdir of the parent could follow a planted symlink). The default `.../distro-rig-vps/console` matches.
+  case "$DR_VPS_CONSOLE_LOG_DIR" in
+    */distro-rig-vps/*/*) echo "[setup] FATAL: DR_VPS_CONSOLE_LOG_DIR must be a DIRECT child of a distro-rig-vps namespace dir (.../distro-rig-vps/<leaf>), not nested deeper: $DR_VPS_CONSOLE_LOG_DIR" >&2; exit 2;;
+    */distro-rig-vps/?*) : ;;
+    *) echo "[setup] FATAL: DR_VPS_CONSOLE_LOG_DIR must be under a distro-rig-vps namespace dir (.../distro-rig-vps/<leaf>): $DR_VPS_CONSOLE_LOG_DIR" >&2; exit 2;;
+  esac
+  # The console log is PERSISTENT (console-dump reads boot output across reboots) so it must NOT live on the
+  # /run tmpfs -- which is ALSO the ROOT-ONLY home of the nft egress marker DR_VPS_NET_STATE (validate_env
+  # constrains that under /run). A console dir there (e.g. /run/distro-rig-vps/console) would make
+  # step_console chown the root-only /run namespace to drvps, reopening a path-based root-marker
+  # symlink-follow. Reject /run canonically (_safe_path already forbids '.'/'..', so realpath -ms is stable).
+  case "$(realpath -ms "$DR_VPS_CONSOLE_LOG_DIR")" in
+    /run|/run/*) echo "[setup] FATAL: DR_VPS_CONSOLE_LOG_DIR must be a PERSISTENT path, not under /run (tmpfs, reserved for the root-owned nft marker namespace): $DR_VPS_CONSOLE_LOG_DIR" >&2; exit 2;;
+  esac
+  # virtlogd rotation bounds interpolated into /etc/libvirt/virtlogd.conf: strict integers. max_size=0
+  # DISABLES rotation in virtlogd (unbounded) -> reject 0; the doctor/admission gate also refuses unbounded.
+  case "$DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE"    in ''|0|*[!0-9]*|0?*) echo "[setup] FATAL: DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE must be a positive integer (bytes, nonzero)" >&2; exit 2;; esac
+  case "$DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS" in ''|*[!0-9]*|0?*)   echo "[setup] FATAL: DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS must be a non-negative integer" >&2; exit 2;; esac
+  # UPPER-bound them (matches the runtime admission overflow guard): max 4 GiB/log, 1024 backups.
+  [ "$DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE" -le 4294967296 ] || { echo "[setup] FATAL: DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE too large (max 4294967296 = 4 GiB) -- overflow guard" >&2; exit 2; }
+  [ "$DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS" -le 1024 ] || { echo "[setup] FATAL: DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS too large (max 1024)" >&2; exit 2; }
+  # These 3 knobs are PERSISTED into the ROOT-sourced /etc/distro-rig-vps/env
+  # (step_env). An unvalidated override -- e.g. DR_VPS_CONSOLE_MAX_VMS='$(cmd)' -- would inject a ROOT command
+  # (or crash the watcher's int() parse) when api.sh sources that file. Strict integers + the runtime bounds.
+  case "$DR_VPS_CONSOLE_TAIL_MAX_BYTES" in ''|0|*[!0-9]*|0?*) echo "[setup] FATAL: DR_VPS_CONSOLE_TAIL_MAX_BYTES must be a positive integer (bytes, nonzero)" >&2; exit 2;; esac
+  [ "$DR_VPS_CONSOLE_TAIL_MAX_BYTES" -le 4194304 ] || { echo "[setup] FATAL: DR_VPS_CONSOLE_TAIL_MAX_BYTES too large (max 4194304 = 4 MiB)" >&2; exit 2; }
+  case "$DR_VPS_CONSOLE_MAX_VMS" in ''|*[!0-9]*|0?*) echo "[setup] FATAL: DR_VPS_CONSOLE_MAX_VMS must be a non-negative integer" >&2; exit 2;; esac
+  [ "$DR_VPS_CONSOLE_MAX_VMS" -le 1048576 ] || { echo "[setup] FATAL: DR_VPS_CONSOLE_MAX_VMS too large (max 1048576)" >&2; exit 2; }
+  case "$DR_VPS_CONSOLE_RESERVE_MARGIN" in ''|*[!0-9]*|0?*) echo "[setup] FATAL: DR_VPS_CONSOLE_RESERVE_MARGIN must be a non-negative integer" >&2; exit 2;; esac
+  [ "$DR_VPS_CONSOLE_RESERVE_MARGIN" -le 1125899906842624 ] || { echo "[setup] FATAL: DR_VPS_CONSOLE_RESERVE_MARGIN too large (max 1125899906842624 = 2^50)" >&2; exit 2; }
+}
+say()  { printf '[setup] %s\n' "$*"; }
+# run: execute the command as an ARGV vector -- NO eval. Interpolated values (paths/users/groups) are
+# passed as separate literal arguments, so they can never be word-split, glob-expanded, or parsed as
+# shell syntax. This is the STRUCTURAL defense against command injection (validate_env + the install-
+# path charset check are belt-and-braces on top). FAIL-CLOSED: a real step that fails aborts.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] %s\n' "$*"; return 0; fi
+  "$@" || { printf '[setup] STEP FAILED (fail-closed): %s\n' "$*" >&2; exit 1; }
+}
+# run_sh: for the FEW steps that genuinely need shell features (pipes/redirects/loops/multi-command).
+# The SNIPPET is a TRUSTED LITERAL -- NEVER interpolate a value into it. Pass values as positional args
+# and reference them QUOTED ("$1","$2",...) inside the snippet, so a value can never become shell code.
+run_sh() {  # <snippet-literal> [args...]
+  local snippet="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] sh: %s%s\n' "$snippet" "${*:+ -- $*}"; return 0; fi
+  bash -c "$snippet" run_sh "$@" || { printf '[setup] STEP FAILED (fail-closed): %s\n' "$snippet" >&2; exit 1; }
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+need_root() { [ "$DRY_RUN" -eq 1 ] || [ "$(id -u)" = 0 ] || { echo "must run as root (or --dry-run)" >&2; exit 12; }; }
+
+# ---- shared bounded-poll for post-mutation verify reads (verify-class hardening, TODO "AUDIT THE VERIFY
+# CLASS") -------------------------------------------------------------------------------------------------
+# A read-once postcondition that IMMEDIATELY follows a socket-activated libvirt/systemd mutation can race the
+# daemon reflecting the change (the net-autostart false-negative on fc44 was one instance of the CLASS). This
+# is the single primitive every such read routes through: poll PREDICATE (a command + args) until it succeeds
+# or the try budget is spent. Returns 0 on success, 1 on timeout. It is NEVER unbounded -- a fixed <max_tries>
+# means a condition that will never become true (the negative-assertion trap) still terminates so the caller
+# can fail closed with a diagnostic, instead of hanging the installer. Usage:
+#   _dr_vps_verify_poll <max_tries> <sleep_s> <label> <predicate-cmd> [args...]
+_dr_vps_verify_poll() {
+  local tries="$1" nap="$2" label="$3" pred="$4"; shift 4
+  local per="${DR_VPS_VERIFY_PRED_TIMEOUT:-5}" i=0 use_to=0
+  have timeout && use_to=1
+  # BOUND EACH INVOCATION, not just the retry count: a wedged virsh/ss would otherwise hang the poll
+  # forever despite the try budget. Predicates are shell fns -> export so the `timeout` subshell can call them.
+  # CONSTRAINT: a predicate MUST be self-contained -- use only its ARGS + external commands (a non-exported
+  # caller local is NOT visible inside the timeout subshell). The _vp_* predicates take their target as $1.
+  declare -F "$pred" >/dev/null 2>&1 && export -f "$pred" 2>/dev/null || true
+  while [ "$i" -lt "$tries" ]; do
+    if [ "$use_to" = 1 ]; then timeout "$per" bash -c '"$@"' _ "$pred" "$@" && return 0
+    else "$pred" "$@" && return 0; fi     # timeout absent -> best-effort direct call
+    i=$((i+1)); sleep "$nap"
+  done
+  echo "[setup] verify-poll TIMEOUT (${tries}x${nap}s, per-try ${per}s) waiting for: ${label}" >&2
+  return 1
+}
+# predicates for the swept reads (small named fns so the poll takes an argv command, never an eval string).
+# CAPTURE-then-match via a here-string, NOT `producer | grep -q` (pipefail hazard):
+# under `set -o pipefail` a `| grep -q` returns 141 when grep matches early and SIGPIPEs the producer,
+# which the poll would misread as "not yet ready" and time out on an already-good state. A here-string is
+# not a pipeline, so the status is grep's alone. Also self-contained (no cross-fn helper) for the poll's
+# `timeout bash -c` subprocess.
+_vp_net_active()    { local o; o=$(LC_ALL=C virsh net-list --name 2>/dev/null) || return 1; grep -qx "$1" <<<"$o"; }
+_vp_net_autostart() { local o; o=$(LC_ALL=C virsh net-info "$1" 2>/dev/null) || return 1; grep -qi 'autostart:[[:space:]]*yes' <<<"$o"; }
+_vp_squid_bound()   { local o; o=$(ss -ltn 2>/dev/null) || return 1; grep -qE "(^|[[:space:]])${1//./\\.}:3128([[:space:]]|\$)" <<<"$o"; }
+
+# DETECT the package family from /etc/os-release ID/ID_LIKE, NOT mere command existence: a Debian host
+# with `dnf` installed for RPM tooling (or a mixed rescue env) must still get the apt package set. Only
+# if os-release is ambiguous/absent do we fall back to command existence, and if BOTH managers exist we
+# cannot tell the native family -> 'unknown' (step_deps/step_preflight fail closed) rather than guess.
+# DR_VPS_OSRELEASE is a TEST seam (defaults to the real file); reading it never runs host code.
+# Read one os-release KEY as DATA (quotes stripped). NEVER `.`/source os-release: DR_VPS_OSRELEASE is
+# env-overridable, so a crafted ID_LIKE="$(cmd)" would EXECUTE cmd AS ROOT during detection.
+# grep the exact KEY= line + strip surrounding quotes -- no shell evaluation of the value at all.
+_osrelease_val() {  # <file> <KEY>
+  local v
+  v=$(grep -E "^${2}=" "$1" 2>/dev/null | tail -1); v=${v#*=}
+  v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+  printf '%s' "$v"
+}
+detect_pm() {
+  local osr="${DR_VPS_OSRELEASE:-/etc/os-release}" id="" like=""
+  if [ -r "$osr" ]; then
+    id=$(_osrelease_val "$osr" ID)                            # parsed as DATA, never sourced
+    like=$(_osrelease_val "$osr" ID_LIKE)
+  fi
+  case " $id $like " in
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) echo dnf; return;;
+    *" debian "*|*" ubuntu "*) echo apt; return;;
+  esac
+  if have dnf && have apt-get; then echo unknown; return; fi
+  if have dnf; then echo dnf; elif have apt-get; then echo apt; else echo unknown; fi
+}
+# DETECT the libvirt control-plane unit: a modern host may ship the MODULAR daemons (virtqemud) with no
+# monolithic libvirtd.service. Order/enable against whichever EXISTS so unit After=/Wants= key to a real
+# unit. Defaults to libvirtd.service (both Fedora + Debian still ship it today -> live behavior unchanged).
+_libvirt_unit() {
+  local u
+  for u in libvirtd.service virtqemud.service; do
+    systemctl cat "$u" >/dev/null 2>&1 && { printf '%s' "$u"; return; }
+  done
+  printf 'libvirtd.service'
+}
+# SELinux userspace active (enforcing OR permissive) -> relabels are meaningful. `selinuxenabled` returns
+# 0 for enforcing/permissive, nonzero for disabled/absent. restorecon in permissive is harmless.
+_selinux_on() { command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; }
+# A distinctive libvirt-network OWNERSHIP marker: embedded as <metadata> in our net XML + matched by
+# _net_is_ours. Lets install/uninstall/collision distinguish OUR net from a foreign net that merely
+# shares the name 'simnet' or bridge 'drvps0'.
+DR_VPS_NET_MARKER='distro-rig-vps:net-owner:v1'
+# Pipe-free exact-line membership: `printf | grep -qx` under `set -o pipefail`
+# returns 141 when grep matches early and SIGPIPEs the producer -- turning a match into a "failure". So
+# every net-name-in-list / marker-in-xml test here uses a bash string match, never a `| grep` pipeline.
+_lines_has() {  # <newline-list> <exact-line>  -> 0 if present
+  case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) return 0;; *) return 1;; esac
+}
+_net_is_ours() {  # <net-name> -> 0 iff the live net STRUCTURALLY carries our ownership marker
+  # STRUCTURAL: the marker must be the <drvps:owner> element (namespace =
+  # DR_VPS_NET_MARKER) that is a DIRECT child of <network><metadata>, with text 'drvps'. A substring
+  # scan accepted the marker planted anywhere (e.g. <description>...marker...</description>), which
+  # could make setup/uninstall DESTROY a foreign net that merely mentioned it.
+  local _x; _x=$(LC_ALL=C virsh net-dumpxml "$1" 2>/dev/null) || return 1
+  python3 - "$DR_VPS_NET_MARKER" "$_x" <<'PYOWN' 2>/dev/null
+import sys, xml.etree.ElementTree as ET
+marker = sys.argv[1]
+try: root = ET.fromstring(sys.argv[2])
+except Exception: sys.exit(1)
+if root.tag != 'network': sys.exit(1)
+md = root.find('metadata')
+if md is None: sys.exit(1)
+o = md.find('{%s}owner' % marker)
+sys.exit(0 if (o is not None and (o.text or '').strip() == 'drvps') else 1)
+PYOWN
+}
+# The net's <bridge name=...> (empty if none/unreadable/not-a-network). Structural.
+_net_bridge() {  # <net-name>
+  local _x; _x=$(LC_ALL=C virsh net-dumpxml "$1" 2>/dev/null) || return 0
+  python3 - "$_x" <<'PYBR' 2>/dev/null
+import sys, xml.etree.ElementTree as ET
+try: root = ET.fromstring(sys.argv[1])
+except Exception: sys.exit(0)
+if root.tag == 'network':
+    br = root.find('bridge')
+    if br is not None and br.get('name'): print(br.get('name'))
+PYBR
+}
+# 0 iff OUR marked net is defined, ACTIVE, AND actually on bridge drvps0 (block 1
+# exempts an existing drvps0 link as "ours" via this -- but a marked net on a DIFFERENT bridge is NOT
+# proof that a foreign drvps0 belongs to us). Pipe-free, rc-checked.
+_own_net_active() {
+  have virsh || return 1
+  _net_is_ours "$DR_VPS_NET_NAME" || return 1
+  [ "$(_net_bridge "$DR_VPS_NET_NAME")" = drvps0 ] || return 1
+  local _nl _nrc; _nl=$(LC_ALL=C virsh net-list --name 2>/dev/null); _nrc=$?
+  [ "$_nrc" -eq 0 ] || return 1
+  _lines_has "$_nl" "$DR_VPS_NET_NAME"
+}
+# The rig-owned guest subnet, DERIVED from DR_VPS_BRIDGE_IP (default = the historical 10.123.0.0/24).
+# Callable BEFORE validate_env (the collision preflight runs first): falls back NET24 -> BRIDGE_IP ->
+# the stock default. Found LIVE (nested guest 2026-07-12): a literal here made the preflight FATAL on
+# the guest's own outer-rig uplink even with the bridge renumbered.
+_rig_subnet() { local bip="${DR_VPS_BRIDGE_IP:-10.123.0.1}"; printf '%s.0/24' "${DR_VPS_NET24:-${bip%.1}}"; }
+# REAL IPv4 CIDR overlap against the rig subnet: 10.123.1.1/16 and 10.123.0.254/24 both
+# overlap the stock subnet but do NOT string-match its bridge ip. Uses python3 (a dep). Arg is
+# 'addr/prefix' or 'addr/dotted-netmask'; the rig subnet is passed in (derived, never a literal).
+_cidr_overlaps_rig() {  # <addr/mask>   (distinct heredoc tag so the gate.bats PY-extractor only grabs _fs_guard_py)
+  python3 - "$1" "$(_rig_subnet)" <<'PYCIDR' 2>/dev/null
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+    sys.exit(0 if net.overlaps(ipaddress.ip_network(sys.argv[2])) else 1)
+except Exception:
+    sys.exit(2)
+PYCIDR
+}
+# CIDR CONTAINED WITHIN the rig subnet: the own-bridge kernel-route exemption must
+# bound the DESTINATION too -- 'dev drvps0 + proto kernel + src==bridge-ip' alone also matches the kernel
+# route of a WIDENED live prefix (e.g. 10.200.0.0/16 after address drift), which must stay overlap-checked.
+# rc 0 = within (exempt), 1 = not within, 2 = parse error -> caller falls through to the overlap check.
+_cidr_within_rig() {  # <addr[/mask]>  (distinct heredoc tag PYWITHIN -- the gate.bats extractor is unaffected)
+  python3 - "$1" "$(_rig_subnet)" <<'PYWITHIN' 2>/dev/null
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+    rig = ipaddress.ip_network(sys.argv[2])
+    sys.exit(0 if (net.version == rig.version and net.subnet_of(rig)) else 1)
+except Exception:
+    sys.exit(2)
+PYWITHIN
+}
+# Scan every DEFINED libvirt network (excluding our own MARKED net) for a bridge-drvps0 reuse or a subnet
+# that OVERLAPS the rig subnet (_rig_subnet); echo the first collision description (or nothing). Shared by the preflight
+# and the post-libvirt strict recheck.
+# STRUCTURAL foreign-net collision test: parse the net XML and decide from its
+# DIRECT <bridge>/<ip> children -- NOT a doc-wide substring/lexical scan, which false-collided on a
+# <description> mentioning drvps0 or a namespaced <ip> in metadata (fail-closed over-refuse that pressures
+# an operator toward DR_VPS_FORCE_COLLISION=1). Prints "bridge" if it uses drvps0, "overlap <cidr>" if a
+# direct IPv4 <ip> overlaps the rig subnet, nothing otherwise; exit 2 on parse error (caller refuses).
+_dr_vps_net_collides() {  # <xml> <rig-subnet>
+  # XML via a TEMP FILE, not argv (a >~128KB foreign net XML exceeds MAX_ARG_STRLEN,
+  # python fails E2BIG rc 126, and the caller -- refusing only on rc 2 -- read that as "no collision" =
+  # FAIL OPEN). A file path is tiny; python reads the file. The CALLER now refuses on ANY nonzero rc.
+  local _t _rc _ti _tt; _t=$(mktemp 2>/dev/null) || return 2
+  # Hygiene: INT/TERM mid-scan must not leak the XML temp file; exit nonzero so a
+  # killed scan is FAIL-CLOSED (never read as "no collision"). The PRIOR traps are captured and RESTORED
+  # on every normal return (`trap - INT TERM` reset a direct-source caller's own
+  # cleanup to the DEFAULT disposition). The signal path exits 130 without chaining by design -- the
+  # production caller runs this helper inside a $() subshell, so its traps are out of reach there.
+  _ti=$(trap -p INT); _tt=$(trap -p TERM)
+  trap 'rm -f "$_t"; exit 130' INT TERM
+  printf '%s' "$1" > "$_t" 2>/dev/null || { rm -f "$_t"; eval "${_ti:-trap - INT}"; eval "${_tt:-trap - TERM}"; return 2; }
+  python3 - "$_t" "$2" <<'PYCOLL' 2>/dev/null
+import sys, ipaddress, xml.etree.ElementTree as ET
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(2)
+if root.tag != 'network':
+    sys.exit(0)
+br = root.find('bridge')
+if br is not None and br.get('name') == 'drvps0':
+    print('bridge'); sys.exit(0)
+try:
+    rig = ipaddress.ip_network(sys.argv[2])
+except Exception:
+    sys.exit(2)
+for ip in root.findall('ip'):
+    fam = ip.get('family')
+    if fam and fam != 'ipv4':
+        continue
+    a = ip.get('address')
+    if not a or ':' in a:
+        continue
+    m = ip.get('netmask') or ip.get('prefix')
+    try:
+        net = ipaddress.ip_network('%s/%s' % (a, m), strict=False) if m else ipaddress.ip_network(a + '/32')
+    except Exception:
+        continue
+    if net.overlaps(rig):
+        print('overlap %s' % net); sys.exit(0)
+sys.exit(0)
+PYCOLL
+  _rc=$?
+  rm -f "$_t"
+  eval "${_ti:-trap - INT}"; eval "${_tt:-trap - TERM}"
+  return "$_rc"
+}
+_scan_libvirt_nets() {
+  local n xml names nrc _cx _crc rig; rig=$(_rig_subnet)
+  # FAIL CLOSED: capture the net-list rc (an unchecked process-substitution call
+  # collapsed a libvirt read error into "no collision"), and refuse a LISTED net whose XML cannot be
+  # read (do NOT silently `|| continue` past it -- we cannot then prove it does not own drvps0/overlap).
+  names=$(LC_ALL=C virsh net-list --all --name 2>/dev/null); nrc=$?
+  [ "$nrc" -eq 0 ] || { printf "cannot read 'virsh net-list' (rc=%s) -- refusing to verify libvirt-net collision" "$nrc"; return; }
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    { [ "$n" = "$DR_VPS_NET_NAME" ] && _net_is_ours "$n"; } && continue      # skip ONLY our own marked net
+    xml=$(LC_ALL=C virsh net-dumpxml "$n" 2>/dev/null) || { printf "cannot read XML for libvirt network '%s' -- refusing (cannot prove it does not reuse drvps0 / overlap the rig subnet)" "$n"; return; }
+    _cx=$(_dr_vps_net_collides "$xml" "$rig"); _crc=$?
+    # refuse on ANY nonzero (not only rc 2 -- an E2BIG/exec failure must FAIL CLOSED,
+    # never read as "no collision").
+    [ "$_crc" -eq 0 ] || { printf "cannot evaluate libvirt network '%s' for a drvps0/subnet collision (helper rc=%s) -- refusing" "$n" "$_crc"; return; }
+    case "$_cx" in
+      bridge)   printf "another libvirt network ('%s') already uses bridge drvps0" "$n"; return;;
+      overlap*) printf "another libvirt network ('%s') subnet %s overlaps the rig subnet %s" "$n" "${_cx#overlap }" "$rig"; return;;
+    esac
+  done <<< "$names"
+}
+# STRICT libvirt collision recheck AFTER libvirt is enabled: the early preflight may have run
+# while libvirt was down (its net scan silently skipped). Now REQUIRE net-list to be readable + fail
+# closed on any collision BEFORE we define/reconcile the rig net.
+_collision_libvirt_strict() {
+  local hit
+  LC_ALL=C virsh net-list --all --name >/dev/null 2>&1 || { echo "[setup] FATAL (libvirt collision): cannot read 'virsh net-list' after enabling $LIBVIRT_UNIT -- refusing to define the rig net blind to existing networks" >&2; exit 1; }
+  hit=$(_scan_libvirt_nets)
+  if [ -n "$hit" ]; then
+    echo "[setup] FATAL (libvirt collision): $hit -- the rig owns bridge drvps0 + subnet $(_rig_subnet). Remove/rename the conflicting network, or set DR_VPS_FORCE_COLLISION=1 to proceed at your own risk." >&2
+    [ "${DR_VPS_FORCE_COLLISION:-0}" = 1 ] || exit 1
+    echo "[setup] WARNING (libvirt collision): DR_VPS_FORCE_COLLISION=1 -- proceeding despite the collision" >&2
+  fi
+}
+# 0 iff the net XML is our FULL correct shape, all as DIRECT children of <network> (# dns/bridge substring checks matched text anywhere, e.g. a <description> with "dns enable='no'" while
+# the real <dns enable='yes'/> and a foreign <bridge>): bridge name == drvps0, <dns enable='no'>, NO
+# <forward>, exactly one IPv4 <ip> == DR_VPS_BRIDGE_IP /24 that CONTAINS a <dhcp>. Returns 2 on parse error.
+# This is the SINGLE shape validator (the older /24-tuple-only helper is folded into it:
+# reapply used the weaker tuple check and passed foreign-bridge/forward drift). TREE-parse semantics kept
+# from the tree-parse rule: only DIRECT <ip> children count -- metadata-planted / namespaced look-alikes are invisible.
+_dr_vps_net_shape_ok() {  # <xml>
+  python3 - "$DR_VPS_BRIDGE_IP" "$1" <<'PYSHAPE' 2>/dev/null
+import sys, xml.etree.ElementTree as ET
+bridge = sys.argv[1]
+try:
+    root = ET.fromstring(sys.argv[2])
+except Exception:
+    sys.exit(2)
+if root.tag != 'network':
+    sys.exit(1)
+br = root.find('bridge')
+if br is None or br.get('name') != 'drvps0':
+    sys.exit(1)
+dns = root.find('dns')
+if dns is None or dns.get('enable') != 'no':
+    sys.exit(1)
+if root.find('forward') is not None:
+    sys.exit(1)
+v4 = []
+for ip in root.findall('ip'):
+    fam = ip.get('family')
+    if fam and fam != 'ipv4':
+        continue
+    a = ip.get('address')
+    if not a or ':' in a:
+        continue
+    v4.append(ip)
+if len(v4) != 1:
+    sys.exit(1)
+ip = v4[0]
+if ip.get('address') != bridge:
+    sys.exit(1)
+if (ip.get('netmask') or ip.get('prefix') or '') not in ('255.255.255.0', '24'):
+    sys.exit(1)
+if ip.find('dhcp') is None:
+    sys.exit(1)
+sys.exit(0)
+PYSHAPE
+}
+# Live drvps0 address postcondition (shared by the install preflight and the reapply light path): an owned ACTIVE
+# net must CARRY the expected live <bip>/24 -- the overlap scans only see PRESENT addresses, and with
+# ip_nonlocal_bind=1 (step_proxy) squid can bind a MISSING address, so the bind-poll cannot be trusted to
+# catch this. Prints the failure description (or nothing) -- caller refuses on non-empty output (same
+# contract as _scan_libvirt_nets). Probe rc!=0 is refused fail-closed like every other probe error.
+_live_bridge_addr_missing() {
+  local _exp _lvout _lvrc _lvlist; _exp="${DR_VPS_BRIDGE_IP:-10.123.0.1}/24"
+  _lvout=$(LC_ALL=C ip -o -4 addr show dev drvps0 2>/dev/null); _lvrc=$?
+  if [ "$_lvrc" -ne 0 ]; then
+    printf 'cannot read the drvps0 addresses (ip addr rc=%s) -- refusing to verify the live bridge address' "$_lvrc"; return 0
+  fi
+  awk -v expct="$_exp" '$2=="drvps0" && $4==expct {found=1} END {exit !found}' <<<"$_lvout" && return 0
+  _lvlist=$(awk '$2=="drvps0"{printf "%s ",$4}' <<<"$_lvout")
+  printf 'the drvps-owned bridge drvps0 is ACTIVE but does not carry the expected live address %s (live: %s) -- live-address drift; restart the rig net (virsh net-destroy %s && virsh net-start %s) or full-reinstall' "$_exp" "${_lvlist:-none}" "$DR_VPS_NET_NAME" "$DR_VPS_NET_NAME"
+}
+# --reapply-egress is the LIGHT path (no step_libvirt). If the operator passes a DR_VPS_BRIDGE_IP that
+# does NOT match the installed simnet, reapply would move squid/nft/proxy/fleet-guard to the new address
+# while libvirt stays on the old one: guests break AND, if the new value is a
+# wider/host subnet, the squid source ACL widens. Renumbering is a FULL reinstall, not an egress reapply.
+# FAIL CLOSED on EVERY uncertainty: "cannot read the live net" must never collapse
+# into "no net -> allow". Distinguish authoritatively-absent (net-list succeeds, name not present) from
+# unreadable (virsh absent / net-list errors / ip unparsable) -- only the first is safe to allow.
+_assert_reapply_bridge_matches() {
+  have virsh || { echo "[setup] FATAL (reapply-egress): virsh unavailable -- cannot verify the installed simnet matches DR_VPS_BRIDGE_IP='${DR_VPS_BRIDGE_IP}'; refusing (a bridge renumber via the light path would split-brain). Start libvirt/virsh, or full-reinstall to renumber." >&2; exit 1; }
+  local names nrc; names=$(LC_ALL=C virsh net-list --all --name 2>/dev/null); nrc=$?
+  [ "$nrc" -eq 0 ] || { echo "[setup] FATAL (reapply-egress): cannot read 'virsh net-list' (libvirt down?) -- refusing; cannot prove the live bridge matches DR_VPS_BRIDGE_IP='${DR_VPS_BRIDGE_IP}'. Start libvirt and retry, or full-reinstall to renumber." >&2; exit 1; }
+  _lines_has "$names" "$DR_VPS_NET_NAME" || return 0                 # authoritatively NO such net -> nothing to contradict (pipe-free)
+  # Validate the FULL owned-net shape (supersedes the older /24-tuple-only check): the
+  # /24-only check let a marked net with a foreign <bridge>/<forward>/dns pass, and reapply then refreshed
+  # an nft fence keyed to drvps0 that the guests (on the other bridge, or NATted) are not behind. The
+  # light path may not repair the net (it skips step_libvirt), so ANY shape drift is a full-reinstall.
+  # Distinguish unreadable/not-ours (refuse) from wrong-shape (refuse, with the observed cidr).
+  local _x; _x=$(LC_ALL=C virsh net-dumpxml "$DR_VPS_NET_NAME" 2>/dev/null)
+  { _net_is_ours "$DR_VPS_NET_NAME" && [ -n "$_x" ]; } || { echo "[setup] FATAL (reapply-egress): a '$DR_VPS_NET_NAME' network exists but its XML is unreadable or not drvps-owned -- refusing; cannot prove it matches DR_VPS_BRIDGE_IP='${DR_VPS_BRIDGE_IP}'." >&2; exit 1; }
+  if _dr_vps_net_shape_ok "$_x"; then
+    # reapply never runs _preflight_collision, and step_proxy sets ip_nonlocal_bind=1,
+    # so squid can bind a MISSING bridge address and the bind-poll false-passes -- the light path must
+    # verify the live address itself when the owned net is ACTIVE (an inactive net has nothing live to
+    # verify; starting it is step_libvirt work = full install). Fail closed on every uncertainty.
+    if _own_net_active; then
+      have ip || { echo "[setup] FATAL (reapply-egress): 'ip' (iproute2) unavailable -- cannot verify the live drvps0 address matches DR_VPS_BRIDGE_IP='${DR_VPS_BRIDGE_IP}'; refusing." >&2; exit 1; }
+      local _lmiss; _lmiss=$(_live_bridge_addr_missing)
+      [ -z "$_lmiss" ] || { echo "[setup] FATAL (reapply-egress): $_lmiss" >&2; exit 1; }
+    fi
+    return 0
+  fi
+  local _first; _first=$(printf '%s' "$_x" | _net_ip_cidrs | head -1)
+  echo "[setup] FATAL (reapply-egress): the installed simnet does NOT match the rig net contract (bridge drvps0, dns off, no <forward>, EXACTLY one IPv4 subnet on ${DR_VPS_BRIDGE_IP}/24 with dhcp; observed first subnet '${_first:-?}'). Renumbering, a prefix change, or net-shape drift is NOT an egress reapply (the light path skips step_libvirt) -- re-run WITHOUT the DR_VPS_BRIDGE_IP override, or do a full reinstall to renumber/repair." >&2
+  exit 1
+}
+# Extract each <ip address=.. netmask|prefix=..> from a libvirt net XML (stdin) as 'addr/mask' tokens.
+_net_ip_cidrs() {
+  local tag a m
+  grep -oE '<ip[^>]*>' | while IFS= read -r tag; do
+    a=$(printf '%s' "$tag" | grep -oE "address=['\"][^'\"]*" | head -1 | sed -E "s/address=['\"]//")
+    m=$(printf '%s' "$tag" | grep -oE "(netmask|prefix)=['\"][^'\"]*" | head -1 | sed -E "s/(netmask|prefix)=['\"]//")
+    [ -n "$a" ] && [ -n "$m" ] && printf '%s/%s\n' "$a" "$m"
+  done
+}
+# Cheap, NON-mutating host probe -- run at the start of BOTH do_install and do_reapply so every later
+# step reads detected facts instead of re-probing (and reapply, which skips step_libvirt, still gets a
+# real LIBVIRT_UNIT for the units it refreshes).
+detect_host() {
+  PM=$(detect_pm)
+  LIBVIRT_UNIT=$(_libvirt_unit)
+  if _selinux_on; then SELINUX_ON=1; else SELINUX_ON=0; fi
+  # apt family (Debian/Ubuntu): /var/log is root:syslog 2775 -- a GROUP-WRITABLE ancestor, unsafe for a
+  # root-created log dir (the strict ancestor guard would rightly refuse it). When the operator has NOT
+  # chosen an explicit path, relocate the console-log dir under the rig's own root:root-ancestor state base
+  # so the guard passes with NO relaxation. Ownership stays drvps:<qemu-grp> 0750, so the console-dump
+  # consumer (the drvps daemon) still reads it; step_env then persists this value into the runtime env, so
+  # the domain renderer, the gate, and console-dump all agree. Fedora keeps the /var/log default (root:root
+  # there, and virt_log_t applies). Only the DEFAULT is moved -- an explicit DR_VPS_CONSOLE_LOG_DIR wins.
+  # SCOPE: apt/Debian support is NEW in this change, so there are NO pre-relocation Debian installs to
+  # migrate -- every apt host gets /var/lib from its FIRST install, and reapply/uninstall (which also run
+  # detect_host first) resolve the SAME path. No cross-path migration is required.
+  # The relocation is a FIRST-INSTALL default decision ONLY. Once /etc/distro-rig-vps/env exists, api.sh
+  # has ALREADY sourced the persisted DR_VPS_CONSOLE_LOG_DIR (whatever it was resolved to at first install
+  # -- /var/lib for a normal apt install, or an operator-chosen path), so that STORED value is authoritative
+  # and we must not re-classify it: the `! -e env` guard prevents a later reapply from mistaking a persisted
+  # value that merely equals the /var/log default (e.g. an operator who explicitly chose it on a hardened
+  # /var/log apt host) for the unset default. (`_DR_VPS_CONSOLE_DIR_OPERATOR`, captured before api.sh, still
+  # honors an operator override supplied in the CURRENT invocation's environment.)
+  # The env-load condition MIRRORS api.sh's own line 56 (`TEST_SEAMS != 1 && [ -r env ] && . env`): relocate
+  # the default ONLY when api.sh did NOT load a persisted value -- i.e. TEST_SEAMS=1 OR the env file is not
+  # readable (a genuine first install). If api.sh loaded a persisted DR_VPS_CONSOLE_LOG_DIR that merely
+  # equals the /var/log default, that is a STORED choice and must be kept, not re-classified.
+  if [ "$PM" = apt ] && [ -z "$_DR_VPS_CONSOLE_DIR_OPERATOR" ] \
+     && [ "$DR_VPS_CONSOLE_LOG_DIR" = /var/log/distro-rig-vps/console ] \
+     && { [ "${DR_VPS_TEST_SEAMS:-}" = 1 ] || [ ! -r /etc/distro-rig-vps/env ]; }; then
+    DR_VPS_CONSOLE_LOG_DIR=/var/lib/distro-rig-vps/console
+  fi
+}
+# COLLISION preflight (B5): the rig OWNS bridge drvps0 + subnet 10.123.0.0/24. A pre-existing FOREIGN
+# owner (another libvirt network, docker, a manual iface) means the nft egress fence -- keyed to drvps0 --
+# would attach to the wrong link or the subnet would route ambiguously. Detect + FAIL CLOSED before any
+# mutation. Our OWN net ($DR_VPS_NET_NAME) legitimately owns them (re-run), so it is excluded.
+_preflight_collision() {
+  local hit="" n xml cidr rdest _addrs _arc _routes _rrc _linkout _lrc
+  # (1) a drvps0 LINK that is NOT owned by our marked+active net = foreign (e.g. a stale manual bridge
+  #     with 10.123.0.1/24 and NO libvirt net). Distinguish "no such link" (the normal
+  #     first-install case) from a link-probe ERROR: only a rc that is provably
+  #     "does not exist" means absent; any other error must FAIL CLOSED (an unnumbered foreign drvps0
+  #     that the addr/route scans cannot see would otherwise slip through).
+  if have ip; then
+    local _linkout _lrc; _linkout=$(ip link show drvps0 2>&1); _lrc=$?
+    if [ "$_lrc" -eq 0 ]; then
+      if ! _own_net_active; then
+        hit="a link named drvps0 already exists and is not owned by the drvps '$DR_VPS_NET_NAME' network"
+      else
+        # An OWNED ACTIVE drvps0 must also CARRY the expected live address: a
+        # DELETED or REPLACED <bip>/24 leaves the stored net XML correct (reconcile no-ops, net stays
+        # ACTIVE) and setup would report success with a bridge the guests cannot reach. Shared helper
+        # (r15 m folded the same check into the reapply light path).
+        hit=$(_live_bridge_addr_missing)
+      fi
+    else
+      case "$_linkout" in
+        *"does not exist"*|*"Cannot find device"*|*"cannot find device"*) : ;;   # genuinely absent (normal first install)
+        *) hit="cannot determine whether a 'drvps0' link exists (ip link rc=$_lrc: ${_linkout}) -- refusing to verify collision";;
+      esac
+    fi
+  fi
+  # (2) another libvirt network reusing bridge drvps0, OR whose subnet OVERLAPS 10.123.0.0/24 (real CIDR
+  #     overlap -- catches an inactive foreign net on 10.123.0.254/24 that string-matching would miss).
+  if [ -z "$hit" ] && have virsh; then hit=$(_scan_libvirt_nets); fi
+  # (3) any host interface (other than a drvps0 we own) whose address OVERLAPS our subnet (docker/other
+  #     bridge, or a wider net like 10.123.1.1/16 that contains 10.123.0.0/24). FAIL CLOSED if the probe
+  #     itself errors (an unchecked `ip` failure was indistinguishable from "no overlap").
+  if [ -z "$hit" ] && have ip; then
+    _addrs=$(LC_ALL=C ip -o -4 addr show 2>/dev/null); _arc=$?
+    [ "$_arc" -eq 0 ] || hit="cannot read host interface addresses (ip addr rc=$_arc) -- refusing to verify subnet collision"
+    if [ -z "$hit" ]; then
+      # Exempt ONLY the exact expected <bridge-ip>/24 on drvps0: skipping ALL drvps0
+      # addresses let a WIDENED live prefix (e.g. 10.200.0.1/16 after manual/stale drift) evade the scan --
+      # and step_libvirt does not repair live link addresses, so the drift survived setup. Block (1) has
+      # already proven drvps0 ownership when drvps0 lines exist here; any OTHER address on our bridge is
+      # live drift and must be overlap-checked like a foreign interface.
+      while IFS= read -r cidr; do
+        [ -n "$cidr" ] || continue
+        _cidr_overlaps_rig "$cidr" && { hit="host interface address $cidr overlaps the rig subnet $(_rig_subnet)"; break; }
+      done < <(printf '%s\n' "$_addrs" | awk -v expct="${DR_VPS_BRIDGE_IP:-10.123.0.1}/24" '$2=="drvps0" && $4==expct { next } { print $4 }')
+    fi
+  fi
+  # (4) any host ROUTE (not on our own drvps0) whose destination OVERLAPS our subnet:
+  #     a VPN/nested host can carry `10.200.0.0/24 via <gw>` with NO interface address in that subnet --
+  #     interface scan (3) misses it, and starting simnet would then fail late (after mutations) or
+  #     install a competing connected route that HIJACKS that traffic. The destination is $1 for a plain
+  #     unicast route but $2 for a TYPED route (blackhole/unreachable/local/...); the own-bridge exclusion
+  #     must match `dev drvps0` EXACTLY (not the prefix, which would wrongly skip drvps01). FAIL CLOSED on
+  #     an `ip route` error. Only the literal `default` dest is skipped.
+  if [ -z "$hit" ] && have ip; then
+    _routes=$(LC_ALL=C ip -o -4 route show table all 2>/dev/null); _rrc=$?
+    [ "$_rrc" -eq 0 ] || hit="cannot read host routes (ip route rc=$_rrc) -- refusing to verify subnet collision"
+    if [ -z "$hit" ]; then
+      while IFS= read -r rdest; do
+        [ -n "$rdest" ] || continue
+        case "$rdest" in
+          'OWNK '*)
+            # Own-bridge kernel-route CANDIDATE: exempt ONLY a destination CONTAINED in the rig /24
+            # (dev+proto+src alone also matched the kernel route of a WIDENED live
+            # prefix, e.g. 10.200.0.0/16, letting route drift evade the scan). Not-within (or unparsable,
+            # rc 2) falls through to the overlap check like any other route.
+            rdest=${rdest#OWNK }
+            _cidr_within_rig "$rdest" && continue;;
+        esac
+        _cidr_overlaps_rig "$rdest" && { hit="a host route to $rdest overlaps the rig subnet $(_rig_subnet)"; break; }
+      done < <(printf '%s\n' "$_routes" | awk -v bridge="${DR_VPS_BRIDGE_IP:-10.123.0.1}" '
+        $1=="default" { next }
+        { dest=$1 }
+        $1 ~ /^(blackhole|unreachable|prohibit|throw|nat|local|broadcast|multicast|anycast)$/ { dest=$2 }
+        # Flag (do NOT silently drop) OUR OWN bridge KERNEL-generated route candidates -- with `table all`
+        # the local table also carries the kernel-auto `local <bip>/32` and `broadcast ...` entries for
+        # drvps0, which are typed and were false-colliding (the connected route alone
+        # is not enough). The discriminator: `dev drvps0` + `proto kernel` (the kernel installs these for
+        # OUR bridge address) + `src == the bridge ip` + no via/nexthop. A FOREIGN route on drvps0 is NOT
+        # proto kernel (manual routes are proto static/boot) or has a different src, so it stays
+        # overlap-checked. The OWNK candidates get a DEST-containment check in the shell loop
+        # -- awk cannot do CIDR math, so the exemption decision moved out of here.
+        { own=0; nh=0; hv=0; pk=0; src=""
+          for(i=1;i<=NF;i++){
+            if($i=="nexthop") nh=1
+            if($i=="via") hv=1
+            if($i=="dev"   && $(i+1)=="drvps0") own=1
+            if($i=="proto" && $(i+1)=="kernel") pk=1
+            if($i=="src") src=$(i+1)
+          } }
+        (own && pk && !nh && !hv && src==bridge && dest!="") { print "OWNK", dest; next }
+        dest!="" { print dest }')
+    fi
+  fi
+  if [ -n "$hit" ]; then
+    echo "[setup] FATAL (collision preflight): $hit. The rig owns bridge drvps0 + subnet $(_rig_subnet); refusing to mutate the host. Remove/rename the conflicting resource, or set DR_VPS_FORCE_COLLISION=1 to proceed at your own risk." >&2
+    [ "$DRY_RUN" = 1 ] && { echo "[setup] (dry-run: would refuse; nothing changed)" >&2; return 0; }
+    [ "${DR_VPS_FORCE_COLLISION:-0}" = 1 ] || exit 1
+    echo "[setup] WARNING (collision preflight): DR_VPS_FORCE_COLLISION=1 -- proceeding despite the collision" >&2
+  fi
+}
+# PREFLIGHT gate (M1 + B5): unsupported distro, absent KVM, or a drvps0/subnet collision must FAIL CLOSED
+# HERE -- before packages/users/networks are mutated -- not surface as a broken rig after the DONE banner.
+step_preflight() {
+  local _fj
+  say "preflight: distro-family='$PM' selinux=$([ "$SELINUX_ON" = 1 ] && echo on || echo off) libvirt-unit='$LIBVIRT_UNIT'"
+  [ "$PM" = unknown ] && { echo "[setup] FATAL (preflight): unsupported host distro -- need a Fedora/RHEL (dnf) or Debian/Ubuntu (apt) family host per /etc/os-release" >&2; exit 11; }
+  # python3 is a HARD dep (fd-safe fs guards, the CIDR-overlap collision test, the watcher). Require it
+  # HERE so _preflight_collision's _cidr_overlaps_rig can never fail OPEN on a missing python3.
+  have python3 || { echo "[setup] FATAL (preflight): python3 is required (fd-safe fs ops, CIDR-overlap collision check, the watcher) -- install python3 first" >&2; exit 11; }
+  # iproute2 is a HARD dep too: the collision gate's link/addr/route scans are its
+  # ONLY view of a pre-existing drvps0 / overlapping subnet. Without `ip` those checks silently no-op and
+  # a stripped host would pass the gate blind. Require it HERE, before any mutation.
+  have ip || { echo "[setup] FATAL (preflight): the 'ip' command (iproute2) is required -- the drvps0/subnet collision checks cannot run without it. Install iproute2 first" >&2; exit 11; }
+  if [ "$DRY_RUN" -ne 1 ]; then
+    [ -e /dev/kvm ] || { echo "[setup] FATAL (preflight): /dev/kvm is absent -- no usable KVM on this host (load the kvm module / enable nested virtualization). Refusing to build a rig that cannot run VMs." >&2; exit 1; }
+  fi
+  # EARLY fleet lockstep: mirror EXACTLY what step_env installs + guards --
+  # the LITERAL runtime path /etc/distro-rig-vps/fleet.json (step_env pins DR_VPS_FLEET_JSON to it and
+  # ignores a caller override for the install target; checking a different override path here would let a
+  # renumber pass preflight and only fail in step_env AFTER step_libvirt mutated -> split rig). Same
+  # symlink refusal as step_env (a symlinked fleet must not pass here and refuse only later). On a RE-RUN
+  # the file exists -> guard before step_libvirt; on a FRESH install it is absent -> step_env installs+guards.
+  _fj=/etc/distro-rig-vps/fleet.json
+  # test -L FIRST (`-e` is FALSE for a DANGLING symlink, so an `[ -e ] && [ -L ]`
+  # order would let a dangling fleet symlink slip preflight and only trip step_env's -L check AFTER
+  # step_libvirt mutated). A symlink of ANY kind is refused here, exactly as step_env refuses it.
+  if [ -L "$_fj" ]; then
+    echo "[setup] FATAL (preflight): $_fj is a SYMLINK -- refusing (root+drvps read it)" >&2; exit 1
+  elif [ -e "$_fj" ]; then
+    _dr_vps_fleet_cache_guard "$_fj" || exit 1
+  fi
+  _preflight_collision
+}
+
+# policycoreutils-python-utils provides `semanage` -- REQUIRED on a SELinux-enforcing Fedora/RHEL host so
+# step_state can label the pool (else step_state fatals late, after packages/user/libvirt).
+# Harmless on a SELinux-off host. (Debian defaults SELinux-off, so apt does not need it; step_state's
+# SELinux gate skips semanage there, and its missing-tool message covers a rare SELinux-on Debian.)
+PKGS_dnf="qemu-kvm libvirt virt-install qemu-img cloud-utils genisoimage nftables squid jq sqlite guestfs-tools libxml2 openssl python3 inotify-tools policycoreutils-python-utils acl"
+# Debian/Ubuntu split Squid into base `squid` (NO SSL-bump) and `squid-openssl` (the OpenSSL flavor that
+# provides SSL-Bump + security_file_certgen). step_proxy generates an SSL-bump config unconditionally, so
+# the apt path MUST install squid-openssl, else squid -k parse / certgen discovery fails LATE after
+# host mutation. squid-openssl Conflicts/Replaces base squid, so apt swaps it cleanly.
+# qemu-system-x86 (NOT qemu-kvm): on Ubuntu 26.04 `qemu-kvm` is a VIRTUAL package with no install
+# candidate (E: has no installation candidate); it is only Provides: of qemu-system-x86. Older Ubuntu
+# shipped a transitional qemu-kvm, but the concrete x86 emulator+KVM package qemu-system-x86 exists on
+# ALL current apt-family releases (22.04/24.04/26.04 + Debian), so it is the portable choice. (Fedora's
+# PKGS_dnf keeps qemu-kvm -- there it IS a real package.)
+PKGS_apt="qemu-system-x86 libvirt-daemon-system virtinst qemu-utils cloud-image-utils genisoimage nftables squid-openssl jq sqlite3 libguestfs-tools libxml2-utils openssl python3 inotify-tools acl"
+
+step_deps() {
+  local pm; pm="${PM:-$(detect_pm)}"; say "deps (package manager: $pm)"
+  # shellcheck disable=SC2086  # $PKGS_* is a TRUSTED literal list, deliberately word-split into argv
+  case "$pm" in
+    dnf) run dnf install -y $PKGS_dnf ;;
+    apt) run_sh 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"' $PKGS_apt ;;
+    *)   echo "unsupported host distro (need dnf or apt)" >&2; exit 11 ;;
+  esac
+}
+
+step_user() {                      # explicit, irreversible -> needs --yes; ONLY this account
+  if getent passwd "$DR_VPS_SERVICE_USER" >/dev/null 2>&1; then
+    say "service user '$DR_VPS_SERVICE_USER' exists (ok)"
+  else
+    if [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+      echo "refusing to create OS user '$DR_VPS_SERVICE_USER' without --yes" >&2; exit 12
+    fi
+    say "create service user '$DR_VPS_SERVICE_USER' (system account, no login shell)"
+    run useradd --system --create-home --shell /usr/sbin/nologin "$DR_VPS_SERVICE_USER"
+  fi
+  say "add '$DR_VPS_SERVICE_USER' to kvm,libvirt,qemu"
+  # add to whichever virt groups EXIST (Fedora: kvm,libvirt,qemu; Debian/Ubuntu: kvm,libvirt,libvirt-qemu)
+  run_sh 'for g in kvm libvirt qemu libvirt-qemu; do getent group "$g" >/dev/null && usermod -aG "$g" "$1"; done; true' "$DR_VPS_SERVICE_USER"
+}
+
+step_sshkey() {
+  # A DEDICATED throwaway keypair for reaching test VMs (NOT the operator's personal key).
+  local home keyf grp
+  home=$(getent passwd "$DR_VPS_SERVICE_USER" 2>/dev/null | cut -d: -f6); : "${home:=/home/$DR_VPS_SERVICE_USER}"
+  _safe_path "$home" "home of $DR_VPS_SERVICE_USER"   # passwd home flows into paths + the env file -- no metachars
+  grp=$(id -gn "$DR_VPS_SERVICE_USER" 2>/dev/null);                       : "${grp:=$DR_VPS_SERVICE_USER}"
+  keyf="$home/.ssh/drvps_vm_ed25519"
+  say "dedicated VM ssh key for $DR_VPS_SERVICE_USER: $keyf"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] install -d %s/.ssh + ssh-keygen ed25519 (no passphrase) -> chown %s:%s\n' "$home" "$DR_VPS_SERVICE_USER" "$grp"
+    return 0
+  fi
+  # ~drvps is drvps-owned, so drvps could plant a symlink at ~/.ssh OR at the keyfiles before a root
+  # re-run. `ssh-keygen -f` writes drvps_vm_ed25519.pub with O_CREAT|O_TRUNC and NO O_NOFOLLOW, so it
+  # would follow a planted .pub symlink (e.g. -> /root/.ssh/authorized_keys) and write AS ROOT out of
+  # tree. So: create .ssh no-follow, GENERATE in a ROOT-OWNED temp (drvps has no access), then fd-INSTALL
+  # both key files into .ssh with O_CREAT|O_EXCL|O_NOFOLLOW -- root never writes a key into a path drvps
+  # can influence.
+  _safe_mkdir_owned "$home/.ssh" "$DR_VPS_SERVICE_USER" "$grp" 0700
+  if [ ! -e "$keyf" ] && [ ! -L "$keyf" ]; then
+    local ktmp; ktmp=$(mktemp -d) || { echo "[setup] mktemp for ssh key failed" >&2; exit 1; }
+    chmod 0700 "$ktmp"
+    if ! ssh-keygen -t ed25519 -N '' -C drvps-vm -f "$ktmp/k" >/dev/null; then rm -rf "$ktmp"; echo "[setup] ssh-keygen failed" >&2; exit 1; fi
+    _safe_put_file "$keyf"     "$DR_VPS_SERVICE_USER" "$grp" 0600 "$ktmp/k"
+    _safe_put_file "$keyf.pub" "$DR_VPS_SERVICE_USER" "$grp" 0644 "$ktmp/k.pub"
+    rm -rf "$ktmp"
+  fi
+  # ALWAYS re-assert ownership/mode of both key files no-follow -- also on a RE-RUN where the private key
+  # already exists: this REFUSES a drvps-planted symlink at either key path (O_NOFOLLOW), making the
+  # "a pre-planted key/.pub is refused" invariant hold on every path, not just first install.
+  _safe_file_owned "$keyf"     "$DR_VPS_SERVICE_USER" "$grp" 0600
+  _safe_file_owned "$keyf.pub" "$DR_VPS_SERVICE_USER" "$grp" 0644
+}
+
+# The simnet definition: ISOLATED (no <forward> => no NAT/routing off-host), DHCP for addresses,
+# <dns enable="no"/> so there is NO host/internal resolver path; guests use seeded
+# /etc/hosts + the IP-addressed cache proxy. The ip + dhcp range derive from DR_VPS_BRIDGE_IP
+# (validate_env enforces the .1-of-its-/24 shape) so a subnet-colliding host renumbers EVERYTHING
+# with one knob; the default emits the historical 10.123.0.1/24 bytes exactly.
+_dr_vps_net_xml() {
+  local bip="${DR_VPS_BRIDGE_IP:-10.123.0.1}" n24; n24="${DR_VPS_NET24:-${bip%.1}}"
+  printf '<network><name>%s</name><metadata><drvps:owner xmlns:drvps="%s">drvps</drvps:owner></metadata><dns enable="no"/><bridge name="drvps0"/><ip address="%s" netmask="255.255.255.0"><dhcp><range start="%s.10" end="%s.250"/></dhcp></ip></network>\n' \
+    "$DR_VPS_NET_NAME" "$DR_VPS_NET_MARKER" "$bip" "$n24" "$n24"
+}
+# LOCKSTEP GUARD: the nft-allowed cache endpoint (fleet simulated_allow.cache_cidr) must be the bridge
+# ip -- a diverging fleet would pass install and then STARVE every guest's package path (squid bound
+# where nft does not allow). rc1 + remedy on divergence; step_env fails closed on it.
+_dr_vps_fleet_cache_guard() {  # <fleet.json path>
+  local want="${DR_VPS_BRIDGE_IP:-10.123.0.1}/32" got
+  got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("simulated_allow",{}).get("cache_cidr",""))' "$1" 2>/dev/null) || got=""
+  [ "$got" = "$want" ] && return 0
+  echo "[setup] FATAL: fleet simulated_allow.cache_cidr ('${got}') != DR_VPS_BRIDGE_IP/32 ('${want}') in $1 -- edit that file to match the bridge (or remove it to reinstall the packaged default when the bridge is the stock 10.123.0.1), then re-run" >&2
+  return 1
+}
+step_libvirt() {
+  # RE-DETECT after step_deps installed libvirt: the package provides libvirtd.service on both families
+  # today, but a modular-only host exposes only virtqemud.service -- order/enable against what EXISTS.
+  LIBVIRT_UNIT=$(_libvirt_unit)
+  say "enable $LIBVIRT_UNIT + define isolated network '$DR_VPS_NET_NAME'"
+  run systemctl enable --now "$LIBVIRT_UNIT"
+  # ISOLATED network (NO <forward> => no NAT/routing off-host) but WITH an IP + DHCP so the
+  # guest actually gets an address. The bridge IP $DR_VPS_BRIDGE_IP is where the
+  # cache/mocks listen (must match fleet.json simulated_allow.cache_cidr -- guarded in step_env).
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] virsh net-define (isolated %s, %s/24 + dhcp, DNS disabled) + reconcile + start\n' "$DR_VPS_NET_NAME" "$DR_VPS_BRIDGE_IP"
+  else
+    _collision_libvirt_strict           # recheck with libvirt UP, before defining our net
+    local x; x=$(mktemp)
+    _dr_vps_net_xml >"$x"
+    # RECONCILE a pre-existing net. OWNERSHIP is by our <metadata> MARKER, not just the
+    # bridge name -- a foreign net could share name 'simnet'/bridge 'drvps0'. Ours -> accept-if-exact
+    # else redefine. Unmarked -> REFUSE (never destroy a foreign net) unless --adopt-simnet.
+    if virsh net-info "$DR_VPS_NET_NAME" >/dev/null 2>&1; then
+      local _cur; _cur=$(LC_ALL=C virsh net-dumpxml "$DR_VPS_NET_NAME" 2>/dev/null)
+      if _net_is_ours "$DR_VPS_NET_NAME"; then
+        # STRUCTURAL full-shape check: bridge drvps0 + <dns enable='no'> + NO
+        # <forward> + exactly one IPv4 <ip>==bridge /24 with <dhcp>, all as DIRECT children of <network>
+        # (substring checks matched a spoofing <description>). If the shape is exact -> keep; else redefine.
+        if _dr_vps_net_shape_ok "$_cur"; then
+          : # our net, already the correct isolated+dhcp+no-dns+drvps0+bridge-ip+/24 shape
+        else
+          say "  reconciling our own wrong-shaped '$DR_VPS_NET_NAME'"
+          virsh net-destroy "$DR_VPS_NET_NAME" 2>/dev/null || true
+          virsh net-undefine "$DR_VPS_NET_NAME" 2>/dev/null || true
+          virsh net-define "$x" || { echo "[setup] net-define failed (fail-closed)" >&2; rm -f "$x"; exit 1; }
+        fi
+      elif [ "$ADOPT_SIMNET" = 1 ]; then
+        say "  --adopt-simnet: taking over an UNMARKED existing '$DR_VPS_NET_NAME'"
+        virsh net-destroy "$DR_VPS_NET_NAME" 2>/dev/null || true
+        virsh net-undefine "$DR_VPS_NET_NAME" 2>/dev/null || true
+        virsh net-define "$x" || { echo "[setup] net-define failed (fail-closed)" >&2; rm -f "$x"; exit 1; }
+      else
+        echo "[setup] FATAL: an existing libvirt network '$DR_VPS_NET_NAME' is NOT drvps-owned (no drvps metadata marker). If it is a leftover from an older drvps, remove it (virsh net-destroy $DR_VPS_NET_NAME; virsh net-undefine $DR_VPS_NET_NAME) and re-run; if it is foreign, this host is unsuitable. To take it over anyway: re-run with --adopt-simnet." >&2
+        rm -f "$x"; exit 1
+      fi
+    else
+      virsh net-define "$x" || { echo "[setup] net-define failed (fail-closed)" >&2; rm -f "$x"; exit 1; }
+    fi
+    # AUTOSTART fail-closed (M4->M3): a masked autostart failure means the rig net does NOT come back
+    # after a reboot -> guests can't attach + squid (nonlocal-bind) has no bridge IP. Require it, then
+    # verify net-info reports it enabled (LC_ALL=C for a stable "Autostart: yes").
+    LC_ALL=C virsh net-autostart "$DR_VPS_NET_NAME" || { echo "[setup] net-autostart failed for '$DR_VPS_NET_NAME' -- the rig network would not survive a reboot (guests could not attach). Fix libvirt then re-run." >&2; rm -f "$x"; exit 1; }
+    virsh net-start "$DR_VPS_NET_NAME" 2>/dev/null || true   # may already be active; the ACTIVE postcondition below is authoritative
+    rm -f "$x"
+    # POSTCONDITION (fail-closed): the net must be ACTIVE, isolated, DHCP-enabled, DNS-off.
+    # Active check via `virsh net-list --name` (the ACTIVE-only list) -- locale/format-robust,
+    # unlike grepping a (translatable, variably-spaced) net-info "Active:" line. On failure,
+    # dump diagnostics so the real cause (bridge/dnsmasq/NetworkManager/firewalld) is visible.
+    local nx; nx=$(LC_ALL=C virsh net-dumpxml "$DR_VPS_NET_NAME" 2>/dev/null)
+    # net-start (best-effort above) -> the ACTIVE list can lag on a socket-activated modular libvirt; poll.
+    if ! _dr_vps_verify_poll 20 0.5 "net $DR_VPS_NET_NAME ACTIVE" _vp_net_active "$DR_VPS_NET_NAME"; then
+      echo "[setup] $DR_VPS_NET_NAME is not ACTIVE -- diagnostics:" >&2
+      LC_ALL=C virsh net-list --all 2>&1 | sed 's/^/    /' >&2 || true
+      LC_ALL=C virsh net-info "$DR_VPS_NET_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+      echo "    check: journalctl -u libvirtd --no-pager | tail -30 ; is NetworkManager/firewalld" >&2
+      echo "    blocking bridge drvps0, or does the default net / $(_rig_subnet) conflict?" >&2
+      exit 1
+    fi
+    # AUTOSTART verify (M3): active-now is not enough; it must be flagged autostart so a reboot re-brings it.
+    # net-autostart above returned success (authoritative -- it wrote the autostart symlink). On a modular,
+    # socket-activated libvirt (virtnetworkd on Fedora) net-info can briefly LAG reflecting that flag right
+    # after net-autostart/net-start, so POLL rather than read-once-and-race the daemon (a standalone net-info
+    # always shows it; the single read here false-negatived on fc44). Up to ~10s, then fail closed.
+    _dr_vps_verify_poll 20 0.5 "net $DR_VPS_NET_NAME autostart flag" _vp_net_autostart "$DR_VPS_NET_NAME" \
+      || { echo "[setup] $DR_VPS_NET_NAME autostart is not enabled -- it would not survive a reboot" >&2; exit 1; }
+    # STRUCTURAL postcondition: bridge drvps0 + dns-off + no-forward + exactly one
+    # IPv4 <ip>==bridge /24 with <dhcp>, all direct children of <network> (substring checks could be
+    # spoofed by a <description> and had no bridge check at all).
+    _dr_vps_net_shape_ok "$nx" || { echo "[setup] $DR_VPS_NET_NAME is not the expected isolated shape (bridge drvps0, dns off, no forward, exactly one /24 <ip> on ${DR_VPS_BRIDGE_IP} with dhcp)" >&2; exit 1; }
+  fi
+}
+
+step_env() {                       # wire runtime to the installed pool/seed/state + fleet
+  say "write /etc/distro-rig-vps/{env,fleet.json} (so the CLI uses the installed paths)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] install fleet.json + write /etc/distro-rig-vps/env (conditional := so explicit env wins)\n'
+    return 0
+  fi
+  run install -d -m 0755 /etc/distro-rig-vps
+  # Install the packaged fleet.json ONLY IF MISSING -- never clobber an operator's EDITED runtime
+  # config. The advertised flow is "edit /etc/distro-rig-vps/fleet.json, then --reapply-egress
+  # (which re-runs step_env); silently overwriting it would lose the allowlist edit. To reset to the
+  # packaged default, remove the file first.
+  if [ ! -f /etc/distro-rig-vps/fleet.json ]; then
+    run install -m 0644 "$SRC/../etc/fleet.json" /etc/distro-rig-vps/fleet.json
+  else
+    say "  keeping existing /etc/distro-rig-vps/fleet.json (edit it + --reapply-egress; rm to reset)"
+  fi
+  # fleet.json is read AS User=drvps at VM birth (dr_vps_net_create_guard) -- NORMALISE + VERIFY it exactly like
+  # env: an operator edit under a restrictive umask (0600 root:root), a symlink, or invalid JSON would
+  # otherwise let install/--reapply-egress print success while every later create/use fails closed on unreadable
+  # runtime config -- a green install over a broken rig.
+  [ ! -L /etc/distro-rig-vps/fleet.json ] || { echo "[setup] FATAL: /etc/distro-rig-vps/fleet.json is a SYMLINK -- refusing (root+drvps read it)" >&2; exit 1; }
+  chown root:root /etc/distro-rig-vps/fleet.json || { echo "[setup] chown fleet.json failed" >&2; exit 1; }
+  chmod 0644 /etc/distro-rig-vps/fleet.json || { echo "[setup] chmod fleet.json failed" >&2; exit 1; }
+  python3 -c 'import json,sys; json.load(open("/etc/distro-rig-vps/fleet.json"))' 2>/dev/null \
+    || { echo "[setup] FATAL: /etc/distro-rig-vps/fleet.json is not valid JSON -- refusing" >&2; exit 1; }
+  _dr_vps_fleet_cache_guard /etc/distro-rig-vps/fleet.json || exit 1
+  runuser -u "$DR_VPS_SERVICE_USER" -- test -r /etc/distro-rig-vps/fleet.json 2>/dev/null \
+    || { echo "[setup] POSTCONDITION FAILED: $DR_VPS_SERVICE_USER cannot read /etc/distro-rig-vps/fleet.json" >&2; exit 1; }
+  local dhome root
+  dhome=$(getent passwd "$DR_VPS_SERVICE_USER" 2>/dev/null | cut -d: -f6); : "${dhome:=/home/$DR_VPS_SERVICE_USER}"
+  # the passwd home is written into /etc/distro-rig-vps/env (DR_VPS_SSH_KEY=$dhome/...), which api.sh
+  # SOURCES as root -- a pre-existing user whose home contains $(...)/backticks/`;` would inject root
+  # code when the env is sourced. Validate it is an absolute, shell-safe path (bypasses argv run()).
+  _safe_path "$dhome" "home of $DR_VPS_SERVICE_USER"
+  root=$(cd -P "$HERE/.." && pwd -P)
+  # Conditional ':=' assignments so an explicit DR_VPS_* in the caller's env still WINS
+  # (a plain VAR=value would clobber overrides + break the test suite on installed hosts).
+  cat >/etc/distro-rig-vps/env <<EOF || { echo "[setup] write env failed" >&2; exit 1; }
+: "\${DR_VPS_STATE_DIR:=$DR_VPS_SYS_STATE}"
+: "\${DR_VPS_POOL_DIR:=$DR_VPS_SYS_STATE/pool}"
+: "\${DR_VPS_SEED_DIR:=$DR_VPS_SYS_STATE/seed}"
+: "\${DR_VPS_SNAP_DIR:=$DR_VPS_SYS_STATE/snapshots}"
+: "\${DR_VPS_TMP_DIR:=$DR_VPS_SYS_STATE/tmp}"
+: "\${DR_VPS_SPOOL_DIR:=$DR_VPS_SPOOL_BASE}"
+: "\${DR_VPS_SSH_KEY:=$dhome/.ssh/drvps_vm_ed25519}"
+: "\${DR_VPS_BIN:=$root/bin/dr-vps}"
+: "\${DR_VPS_FLEET_JSON:=/etc/distro-rig-vps/fleet.json}"
+: "\${DR_VPS_SEED_GROUP:=$(_qemu_grp)}"
+: "\${DR_VPS_RIG_NET:=$DR_VPS_NET_NAME}"
+: "\${DR_VPS_NET_STATE:=$DR_VPS_NET_STATE}"
+: "\${DR_VPS_CONSOLE_LOG_DIR:=$DR_VPS_CONSOLE_LOG_DIR}"
+: "\${DR_VPS_CONSOLE_TAIL_MAX_BYTES:=$DR_VPS_CONSOLE_TAIL_MAX_BYTES}"
+: "\${DR_VPS_CONSOLE_MAX_VMS:=$DR_VPS_CONSOLE_MAX_VMS}"
+: "\${DR_VPS_CONSOLE_RESERVE_MARGIN:=$DR_VPS_CONSOLE_RESERVE_MARGIN}"
+: "\${DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE:=$DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE}"
+: "\${DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS:=$DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS}"
+: "\${DR_VPS_BRIDGE_IP:=$DR_VPS_BRIDGE_IP}"
+: "\${DR_VPS_GUEST_PROXY:=http://$DR_VPS_BRIDGE_IP:3128}"
+EOF
+  # Root umask 077 would make this 0600 root:root -> drvps-rigctl can't source it and the watcher
+  # crashes (no DR_VPS_SPOOL_DIR). It is non-secret (paths only); make it world-readable + verify drvps can read it.
+  chmod 0644 /etc/distro-rig-vps/env || { echo "[setup] chmod env failed" >&2; exit 1; }
+  # Verify readability AS the service user via `runuser` (util-linux -- ALWAYS present), NOT `sudo`
+  # (sudo is not in the dep set, so on a minimal host `sudo -u` would be command-not-found and
+  # abort after mutations). runuser as root needs no PAM auth and works with the user's nologin shell.
+  if ! runuser -u "$DR_VPS_SERVICE_USER" -- test -r /etc/distro-rig-vps/env 2>/dev/null; then
+    echo "[setup] POSTCONDITION FAILED: $DR_VPS_SERVICE_USER cannot read /etc/distro-rig-vps/env" >&2; exit 1
+  fi
+  # Pin the installer's OWN later steps (step_proxy/step_nft) to the installed runtime fleet, so a
+  # partial/odd-state install can't have them read a stale dev-default path.
+  export DR_VPS_FLEET_JSON=/etc/distro-rig-vps/fleet.json
+}
+
+step_state() {
+  say "system state dir $DR_VPS_SYS_STATE (pool/seed) owned $DR_VPS_SERVICE_USER:qemu"
+  # no-follow safe-create (a drvps-planted symlink at pool/seed must not make root chown out-of-tree)
+  _safe_mkdir_owned "$DR_VPS_SYS_STATE"      "$DR_VPS_SERVICE_USER" "$(_qemu_grp)" 0750
+  _safe_mkdir_owned "$DR_VPS_SYS_STATE/pool" "$DR_VPS_SERVICE_USER" "$(_qemu_grp)" 0750
+  _safe_mkdir_owned "$DR_VPS_SYS_STATE/seed" "$DR_VPS_SERVICE_USER" "$(_qemu_grp)" 0750
+  # SNAPSHOT bundles + the flatten/digest/validation temps live here; qemu must TRAVERSE snapshots/ to back
+  # a VM onto a snapshot image, so they get the SAME drvps:<qemu> 0750 + the recursive virt_image_t label
+  # below (else use --from-snap fails to boot on SELinux).
+  _safe_mkdir_owned "$DR_VPS_SYS_STATE/snapshots" "$DR_VPS_SERVICE_USER" "$(_qemu_grp)" 0750
+  _safe_mkdir_owned "$DR_VPS_SYS_STATE/tmp"       "$DR_VPS_SERVICE_USER" "$(_qemu_grp)" 0750
+  # SELinux (B6): label the pool/seed so the confined qemu:///system can READ overlays/seeds. The old
+  # best-effort form suppressed errors (2>/dev/null) with NO postcondition -> a silent semanage/label
+  # failure produced a "successful" install where every VM create later fails (qemu denied on the disk).
+  # Gate on SELinux, apply IDEMPOTENTLY (-a; if the rule already exists, -m), restorecon, then VERIFY the
+  # effective type is a qemu-readable virt type -- FAIL CLOSED naming the exact gap otherwise.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # NB: a bare `[ test ] && printf` as the LAST statement makes step_state RETURN the test's exit
+    # status -- on a SELinux-OFF host (Debian/Ubuntu, or Fedora with SELinux disabled) that is 1, which
+    # breaks the `&& step chain` in do_install and aborts --dry-run with a bogus "install failed". Use a
+    # real `if` so the dry-run branch always returns 0 regardless of SELINUX_ON.
+    if [ "$SELINUX_ON" = 1 ]; then printf '  [dry-run] semanage virt_image_t + restorecon %s + verify label\n' "$DR_VPS_SYS_STATE"; fi
+  elif [ "$SELINUX_ON" = 1 ]; then
+    command -v semanage >/dev/null 2>&1 || { echo "[setup] FATAL (SELinux): semanage is missing but SELinux is enabled -- install policycoreutils-python-utils so the pool can be labeled (qemu would be denied on $DR_VPS_SYS_STATE)" >&2; exit 1; }
+    semanage fcontext -a -t virt_image_t "$DR_VPS_SYS_STATE(/.*)?" 2>/dev/null \
+      || semanage fcontext -m -t virt_image_t "$DR_VPS_SYS_STATE(/.*)?" 2>/dev/null \
+      || { echo "[setup] FATAL (SELinux): could not set the virt_image_t fcontext on $DR_VPS_SYS_STATE" >&2; exit 1; }
+    restorecon -RF "$DR_VPS_SYS_STATE" || { echo "[setup] FATAL (SELinux): restorecon failed on $DR_VPS_SYS_STATE" >&2; exit 1; }
+    # EXACT type match: a substring glob would wrongly accept a custom type CONTAINING
+    # 'virt_image_t'. Parse the SELinux TYPE field (context field 3) and accept only the two
+    # qemu-readable virt types.
+    local _ctx _type; _ctx=$(stat -c %C "$DR_VPS_SYS_STATE/pool" 2>/dev/null); _type=$(printf '%s' "$_ctx" | cut -d: -f3)
+    case "$_type" in
+      virt_image_t|svirt_image_t) ;;                   # the only qemu-readable virt types
+      *) echo "[setup] FATAL (SELinux): $DR_VPS_SYS_STATE/pool has SELinux type '$_type' (context '$_ctx'), not virt_image_t/svirt_image_t -- qemu:///system would be denied at VM create. Check 'semanage fcontext -l | grep virt_image' then restorecon -RvF $DR_VPS_SYS_STATE." >&2; exit 1;;
+    esac
+  fi
+}
+
+# ---- Observability: persistent serial-console log dir + BOUNDED virtlogd (CONCEPT-OBSERVABILITY E/F)
+# The renderer emits <serial><log file='$DR_VPS_CONSOLE_LOG_DIR/<id>.log'/>; virtlogd persists + ROTATES it
+# so `console-dump` reads a bounded tail. This step (1) creates the dir drvps:<qemu> 0750 + virt_log_t (so
+# the confined virtlogd may WRITE it), and (2) writes BOUNDED max_size/max_backups into virtlogd's fixed
+# config + restarts virtlogd so the RUNNING daemon is bounded (the doctor/admission gate REQUIRES bounded).
+step_console() {
+  local cdir="$DR_VPS_CONSOLE_LOG_DIR" cparent qgrp
+  qgrp=$(_qemu_grp); cparent=$(dirname "$cdir")
+  say "console-log dir $cdir (drvps:$qgrp 0750, virt_log_t) + bounded virtlogd (max_size=$DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE max_backups=$DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS)"
+  # create the rig-namespace parent then the leaf, race-free (fd-based O_NOFOLLOW, drvps:<qemu> 0750).
+  _safe_mkdir_owned "$cparent" "$DR_VPS_SERVICE_USER" "$qgrp" 0750
+  _safe_mkdir_owned "$cdir"    "$DR_VPS_SERVICE_USER" "$qgrp" 0750
+  # SELinux: label the console dir virt_log_t so virtlogd may write the per-VM logs (an inherited
+  # var_log_t would be denied). Persistent fcontext + restorecon + verify, fail-closed -- mirrors the
+  # pool virt_image_t handling in step_state.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # same falsy-return class as step_state's dry-run branch: use a real `if` (a bare `[ ] && printf`
+    # would return 1 on a SELinux-off host if it were ever the function's last statement).
+    if [ "$SELINUX_ON" = 1 ]; then printf '  [dry-run] semanage virt_log_t + restorecon %s + verify label\n' "$cdir"; fi
+  elif [ "$SELINUX_ON" = 1 ]; then
+    command -v semanage >/dev/null 2>&1 || { echo "[setup] FATAL (SELinux): semanage missing but SELinux enabled -- install policycoreutils-python-utils so the console dir can be labeled virt_log_t" >&2; exit 1; }
+    semanage fcontext -a -t virt_log_t "$cdir(/.*)?" 2>/dev/null \
+      || semanage fcontext -m -t virt_log_t "$cdir(/.*)?" 2>/dev/null \
+      || { echo "[setup] FATAL (SELinux): could not set the virt_log_t fcontext on $cdir" >&2; exit 1; }
+    restorecon -RF "$cdir" || { echo "[setup] FATAL (SELinux): restorecon failed on $cdir" >&2; exit 1; }
+    local _ctx _type; _ctx=$(stat -c %C "$cdir" 2>/dev/null); _type=$(printf '%s' "$_ctx" | cut -d: -f3)
+    case "$_type" in
+      virt_log_t) ;;
+      *) echo "[setup] FATAL (SELinux): $cdir has SELinux type '$_type' (context '$_ctx'), not virt_log_t -- virtlogd would be denied writing the console log. Check 'semanage fcontext -l | grep virt_log' then restorecon -RvF $cdir." >&2; exit 1;;
+    esac
+  fi
+  # BOUNDED virtlogd (fixed read path /etc/libvirt/virtlogd.conf): upsert max_size/max_backups preserving
+  # any other operator settings, then reload-or-restart virtlogd so the RUNNING daemon uses them. Values
+  # are strict integers (validate_env); passed as run_sh positional args, NEVER interpolated into the snippet.
+  systemctl cat virtlogd >/dev/null 2>&1 || { [ "$DRY_RUN" -eq 1 ] || { echo "[setup] FATAL: virtlogd is not available on this host -- console capture requires libvirt's virtlogd daemon" >&2; exit 1; }; }
+  run_sh '
+    conf=/etc/libvirt/virtlogd.conf
+    tmp="$(mktemp)"
+    { [ -f "$conf" ] && grep -vE "^[[:space:]]*(max_size|max_backups)[[:space:]]*=" "$conf"; } > "$tmp" 2>/dev/null || true
+    printf "max_size = %s\nmax_backups = %s\n" "$1" "$2" >> "$tmp"
+    install -m 0644 -o root -g root "$tmp" "$conf"
+    command -v restorecon >/dev/null 2>&1 && restorecon "$conf" 2>/dev/null || true
+    rm -f "$tmp"
+  ' "$DR_VPS_CONSOLE_VIRTLOGD_MAX_SIZE" "$DR_VPS_CONSOLE_VIRTLOGD_MAX_BACKUPS"
+  # reload-or-restart: prefers virtlogd's SIGUSR1 self-re-exec (preserves the log fds of RUNNING VMs) over
+  # a hard restart; starts it if the socket-activated daemon is not yet spawned. Then keep the socket
+  # enabled for reboot-persistence (best-effort: libvirt already enables it).
+  run systemctl reload-or-restart virtlogd
+  run_sh 'systemctl enable virtlogd.socket 2>/dev/null || systemctl enable virtlogd 2>/dev/null || true'
+}
+
+step_proxy() {
+  # OWN THE WHOLE squid.conf. Fedora's stock squid.conf has NO `include conf.d/*.conf`
+  # (verified by a real squid behavior test), so a conf.d drop would never load and the
+  # SSRF boundary would be silently inactive. Write a COMPLETE deny-by-default policy,
+  # constrained by SOURCE (the guest subnet only), METHOD, and PORT, with the mirror
+  # allowlist generated FROM fleet.json (single source of truth -- no drift vs the preflight
+  # check). enable + RESTART (not just --now, which won't reload an already-running daemon)
+  # + verify the listener. Back up the original once (gating); restored on uninstall.
+  local fleet conf mirrors d squ pip="${DR_VPS_PROXY_IP:-10.123.0.1}" _prc _sqfail _jlog _shmerr
+  fleet="${DR_VPS_FLEET_JSON:-$SRC/../etc/fleet.json}"
+  say "caching proxy (squid): deny-by-default from $fleet (src+method+port constrained), restart+verify"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] back up squid.conf; write src/method/port policy from mirror_allowlist; squid -k parse; restart; verify %s:3128\n' "$pip"
+    return 0
+  fi
+  mirrors=""
+  while IFS= read -r d; do
+    case "$d" in ''|*[!A-Za-z0-9.-]*) echo "[setup] bad mirror domain in fleet: '$d'" >&2; exit 1;; esac
+    mirrors="${mirrors:+$mirrors }$d"
+  done < <(jq -r '.mirror_allowlist[]' "$fleet")
+  [ -n "$mirrors" ] || { echo "[setup] fleet mirror_allowlist empty" >&2; exit 1; }
+  # COEXISTENCE guard (B3): the rig OWNS the whole squid.conf. Every generated conf carries the marker
+  # below. If an existing squid.conf lacks it AND we have not taken over before (no .drvps-orig backup),
+  # it belongs to ANOTHER squid deployment -- refuse to clobber it silently. --force-squid overrides
+  # (the original is still backed up to squid.conf.drvps-orig and restored on uninstall).
+  # Refuse based SOLELY on the CURRENT conf lacking our marker: the old ".drvps-orig
+  # already exists" exemption let a foreign conf RESTORED after a prior takeover be silently clobbered.
+  # Our own re-run always carries the marker, so the marker check alone is re-run-safe.
+  local drvps_marker='# distro-rig-vps-managed squid.conf'
+  if [ -f /etc/squid/squid.conf ] && ! grep -qF "$drvps_marker" /etc/squid/squid.conf; then
+    if [ "$FORCE_SQUID" -ne 1 ]; then
+      echo "[setup] FATAL (squid coexistence): /etc/squid/squid.conf is a FOREIGN (non-drvps) config -- the rig would take over the WHOLE file (deny-by-default, guest-subnet only), breaking any other squid use. Re-run with --force-squid to take it over (the original is saved to squid.conf.drvps-orig and restored on uninstall)." >&2
+      exit 1
+    fi
+    echo "[setup] WARNING (squid coexistence): --force-squid -- taking over an existing foreign squid.conf (original -> squid.conf.drvps-orig)" >&2
+  fi
+  # back up the original ONCE -- if squid.conf exists, the backup MUST succeed (we overwrite it)
+  if [ -f /etc/squid/squid.conf ] && [ ! -f /etc/squid/squid.conf.drvps-orig ]; then
+    cp /etc/squid/squid.conf /etc/squid/squid.conf.drvps-orig || { echo "[setup] could not back up squid.conf (fail-closed)" >&2; exit 1; }
+  fi
+  # SSL-bump CA: generated ONCE (root-owned, squid-readable). The guest trusts this CA (baked
+  # into every golden by the build), so squid decrypts + CACHES the otherwise-opaque HTTPS repo
+  # traffic to the allowlisted mirrors. The CA only signs certs for the allowlisted hosts.
+  local certgen=""
+  for _c in /usr/lib64/squid/security_file_certgen /usr/lib/squid/security_file_certgen /usr/libexec/squid/security_file_certgen; do
+    [ -x "$_c" ] && { certgen="$_c"; break; }
+  done
+  [ -n "$certgen" ] || { echo "[setup] squid security_file_certgen not found (ssl-bump needs it)" >&2; exit 1; }
+  squ=$(_squid_usr); install -d -o "$squ" -g "$squ" -m 0750 /var/lib/squid
+  # M3 upgrade: an OLD unconstrained CA must not survive a re-run -- regenerate if it lacks the
+  # nameConstraints (goldens built before this must be rebuilt; that is announced).
+  if [ -f /etc/squid/drvps-ca.crt ] && ! openssl x509 -in /etc/squid/drvps-ca.crt -text -noout 2>/dev/null | grep -q 'X509v3 Name Constraints'; then
+    echo "[setup] existing cache CA lacks nameConstraints -- regenerating (REBUILD goldens made before this)" >&2
+    rm -f /etc/squid/drvps-ca.pem /etc/squid/drvps-ca.crt /etc/squid/drvps-ca.key
+  fi
+  # A real CA half-state (.pem without its .crt) -> regenerate the CA.
+  if [ -f /etc/squid/drvps-ca.pem ] && [ ! -f /etc/squid/drvps-ca.crt ]; then
+    echo "[setup] cache CA half-state (.pem without .crt) -- regenerating" >&2
+    rm -f /etc/squid/drvps-ca.pem
+  fi
+  # ssl_db is a DISPOSABLE leaf-cert cache, NOT the CA. If only it is missing but the CA material is
+  # intact, REINIT just ssl_db -- rotating the whole CA here would needlessly invalidate every
+  # golden's baked trust anchor (forcing a rebuild of all goldens).
+  if [ -f /etc/squid/drvps-ca.pem ] && [ -f /etc/squid/drvps-ca.crt ] && [ ! -d /var/lib/ssl_db ]; then
+    echo "[setup] ssl_db missing -- reinitializing the leaf-cert cache (CA preserved, no rebuild needed)" >&2
+    "$certgen" -c -s /var/lib/ssl_db -M 4MB >/dev/null 2>&1 || { echo "[setup] ssl_db reinit failed" >&2; exit 1; }
+    chown -R "$squ:$squ" /var/lib/ssl_db 2>/dev/null || true
+  fi
+  # The CA's nameConstraints must TRACK the mirror allowlist: adding an HTTPS mirror (--reapply-egress)
+  # needs a CA that permits it, else its TLS bump fails. Hash the allowlist used to build the CA and
+  # regenerate on any change (announce: goldens trust the CA cert, which is stable across regen only
+  # if the key is reused -- here we rotate, so a changed allowlist means REBUILD goldens).
+  # Compute the CANONICAL permitted parent domains ONCE (fail-closed on public suffixes / empty) and use
+  # them for BOTH the drift hash and the CA generation below.
+  local parents; parents=$(_drvps_ca_parents "$fleet") || exit 2
+  # Hash the CANONICAL DERIVED nameConstraints (not the raw mirror list) so the CA regenerates whenever
+  # the constraint CONTENT changes -- including the DR-3 exact-FQDN -> parent-domain change -- but is
+  # ORDER-INSENSITIVE (canonical parents), so a mere mirror_allowlist reorder does NOT rotate the CA.
+  local mhash mfile=/etc/squid/drvps-ca.mirrors
+  mhash=$(_drvps_ca_nc "$parents" | sha256sum | awk '{print $1}')
+  if [ -f /etc/squid/drvps-ca.pem ] && [ "$(cat "$mfile" 2>/dev/null)" != "$mhash" ]; then
+    echo "[setup] mirror allowlist changed since the CA was built -- regenerating CA (REBUILD goldens)" >&2
+    rm -f /etc/squid/drvps-ca.pem /etc/squid/drvps-ca.crt /etc/squid/drvps-ca.key
+  fi
+  if [ ! -f /etc/squid/drvps-ca.pem ]; then
+    # nameConstraints: the X.509 layer ALSO limits the CA to the allowlisted mirror domains, so a
+    # leaked key / squid regression can't forge trusted certs for the whole internet (not just the
+    # runtime squid+nft layers). umask 077 closes the create-time world-readable window on the key.
+    # permitted DNS = the mirror PARENT domains (DR-3; covers squid's wildcard-mimic leaves); EXCLUDE
+    # all IP-address SANs so a forged/leaked-key cert cannot escape the DNS allowlist via an IP SAN.
+    local nc cnf; nc=$(_drvps_ca_nc "$parents")
+    cnf=$(mktemp)
+    { printf '[req]\ndistinguished_name=dn\nx509_extensions=v3_ca\n[dn]\n[v3_ca]\n'
+      printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n'
+      printf 'nameConstraints=critical,%s\n' "$nc"
+    } >"$cnf"
+    ( umask 077; openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
+        -config "$cnf" -extensions v3_ca -subj "/CN=distro-rig-vps cache CA" \
+        -keyout /etc/squid/drvps-ca.key -out /etc/squid/drvps-ca.crt >/dev/null 2>&1 ) \
+      || { rm -f "$cnf"; echo "[setup] cache CA generation failed" >&2; exit 1; }
+    rm -f "$cnf"
+    ( umask 077; cat /etc/squid/drvps-ca.crt /etc/squid/drvps-ca.key >/etc/squid/drvps-ca.pem )
+    chgrp "$squ" /etc/squid/drvps-ca.pem; chmod 0640 /etc/squid/drvps-ca.pem
+    rm -f /etc/squid/drvps-ca.key            # squid uses only the combined .pem; don't keep the bare key
+    rm -rf /var/lib/ssl_db
+    "$certgen" -c -s /var/lib/ssl_db -M 4MB >/dev/null 2>&1 || { echo "[setup] ssl_db init failed" >&2; exit 1; }
+  fi
+  rm -f /etc/squid/drvps-ca.key            # UNCONDITIONAL: never leave the bare CA key on disk (squid uses the .pem)
+  # UNCONDITIONAL ownership re-enforce (every run, not just fresh gen): a rerun after a squid-user
+  # change / wrong prior owner must leave the CA + ssl_db readable by the DETECTED squid user.
+  [ -f /etc/squid/drvps-ca.pem ] && { chgrp "$squ" /etc/squid/drvps-ca.pem; chmod 0640 /etc/squid/drvps-ca.pem; }
+  [ -d /var/lib/ssl_db ] && chown -R "$squ:$squ" /var/lib/ssl_db
+  # SELinux: the confined squid_t cert helper (security_file_certgen) must read/write ssl_db. The
+  # stock squid policy maps /var/lib/ssl_db -> squid_cache_t, but files created here by the UNCONFINED
+  # installer inherit var_lib_t -> AVC denials -> squid never signals ready -> systemd start times out
+  # (first-contact bug the seam suite can't catch: no SELinux in bats). restorecon applies the correct
+  # label from the policy fcontext. No-op on non-SELinux hosts (restorecon absent). See STATUS/known-limits.
+  [ -d /var/lib/ssl_db ] && command -v restorecon >/dev/null 2>&1 && restorecon -RF /var/lib/ssl_db >/dev/null 2>&1 || true
+  printf '%s\n' "$mhash" >"$mfile"          # record the allowlist the current CA constrains (drift detect on re-run)
+  install -m 0644 /etc/squid/drvps-ca.crt /etc/distro-rig-vps/cache-ca.crt \
+    || { echo "[setup] publishing cache CA failed (goldens would lack a trust anchor)" >&2; exit 1; }   # for golden baking
+  conf=$(mktemp)
+  { printf '%s -- regenerated by dr-vps-setup; edit /etc/distro-rig-vps/fleet.json + --reapply-egress, NOT this file\n' "$drvps_marker"
+    printf 'http_port %s:3128 ssl-bump cert=/etc/squid/drvps-ca.pem generate-host-certificates=on dynamic_cert_mem_cache_size=4MB\n' "$pip"
+    printf 'sslcrtd_program %s -s /var/lib/ssl_db -M 4MB\n' "$certgen"
+    printf 'acl drvps_guests src %s\n' "${DR_VPS_PROXY_SRC:-10.123.0.0/24}"
+    # AUTHORIZE on the real destination (dstdomain), NOT the guest-controlled SNI: a guest can set
+    # CONNECT host and SNI independently, so SNI-based http_access would let `CONNECT evil:443` with
+    # a mirror SNI reach the internet. SNI is used ONLY as the bump selector.
+    printf 'acl mirror_sni ssl::server_name %s\n' "$mirrors"
+    printf 'acl mirror_dst dstdomain %s\n' "$mirrors"
+    printf 'acl mirror_methods method GET HEAD\n'
+    printf 'acl drvps_connect method CONNECT\n'
+    printf 'acl drvps_https port 443\n'
+    printf 'acl drvps_http port 80 443\n'   # GET on http(80) or the bumped https(443)
+    printf 'acl step1 at_step SslBump1\n'
+    printf 'ssl_bump peek step1\n'
+    printf 'ssl_bump bump mirror_sni\n'     # bump (decrypt+cache) only when the SNI is a mirror
+    printf 'ssl_bump terminate all\n'       # any other TLS host: terminate (nothing else leaves)
+    printf 'http_access deny !drvps_guests\n'
+    printf 'http_access allow drvps_connect mirror_dst drvps_https\n'    # CONNECT only to mirror HOST :443 (-> bumped+cached)
+    printf 'http_access allow mirror_methods mirror_dst drvps_http\n'    # GET/HEAD only to mirror host :80|443
+    printf 'http_access deny all\n'
+    printf 'coredump_dir /var/spool/squid\n'
+    # PERSISTENT on-demand content cache: distro packages fetched once are stored + reused across
+    # VMs (a compact base + a warm cache, not a TB mirror). SSL-bump makes the HTTPS repo cacheable.
+    printf 'cache_dir ufs /var/spool/squid %s 16 256\n' "${DR_VPS_CACHE_MB:-8192}"
+    printf 'maximum_object_size %s MB\n' "${DR_VPS_CACHE_MAXOBJ_MB:-2048}"
+    printf 'cache_mem 256 MB\n'
+    printf 'refresh_pattern -i \\.(rpm|drpm|xml|gz|xz|bz2|sqlite)$ 10080 90%% 43200\n'
+  } >"$conf"
+  # PARSE THE TEMP FIRST: validate the generated config before it clobbers the live squid.conf, so a
+  # render regression can't leave the proxy with a broken config it then can't restart from. Capture the
+  # parser's stderr (M4): a squid BUILD without the needed ssl-bump options fails here with a real
+  # message that a bare >/dev/null 2>&1 would have hidden.
+  local _perr
+  if ! _perr=$(squid -f "$conf" -k parse 2>&1 >/dev/null); then
+    rm -f "$conf"
+    echo "[setup] generated squid.conf failed 'squid -k parse' -- NOT installing (live config preserved). squid says:" >&2
+    printf '%s\n' "$_perr" | sed 's/^/    squid| /' >&2
+    exit 1
+  fi
+  install -m 0644 "$conf" /etc/squid/squid.conf || { rm -f "$conf"; echo "[setup] write squid.conf failed" >&2; exit 1; }
+  rm -f "$conf"
+  run squid -k parse
+  run_sh 'squid -z 2>/dev/null; true'        # initialize the cache_dir structure (idempotent)
+  # Reboot-safety (advisor): squid binds the bridge IP 10.123.0.1, which only exists once
+  # libvirtd brings up drvps0. Allow non-local bind + order squid After=libvirtd so a host
+  # reboot can't start squid first, fail to bind, and leave the rig with no proxy.
+  run_sh 'printf "net.ipv4.ip_nonlocal_bind = 1\n" > /etc/sysctl.d/99-drvps.conf; sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null'
+  run install -d -m 0755 /etc/systemd/system/squid.service.d
+  run_sh 'printf "[Unit]\nAfter=%s\nWants=%s\n" "$1" "$1" > /etc/systemd/system/squid.service.d/10-drvps.conf' "$LIBVIRT_UNIT"
+  run systemctl daemon-reload
+  run systemctl enable squid
+  # SELinux/robustness (B2): a stale /run/squid.pid left mislabeled (var_run_t) by a previously-crashed
+  # or non-squid_t process makes the confined squid_t (re)start fail or time out (systemd Type=notify
+  # never signals ready). Remove the stale pidfile so the fresh squid_t start creates a correctly
+  # type-transitioned one -- but ONLY when the unit is inactive AND no squid PROCESS is running at all
+  # (a MANUAL squid can hold a valid /run/squid.pid while the unit reads
+  # inactive; pgrep rc==1 proves none, 0 running / >1 error both keep). If pgrep is unavailable, fall
+  # back to the unit-inactive guard alone (its historical behaviour).
+  if ! systemctl is-active --quiet squid && [ -e /run/squid.pid ] \
+     && { ! have pgrep || { pgrep -x squid >/dev/null 2>&1; [ "$?" -eq 1 ]; }; }; then
+    say "  removing a stale /run/squid.pid before start (squid inactive, no squid process)"
+    rm -f /run/squid.pid
+  fi
+  # RESTART explicitly (not run(), M4): if the restart itself fails, run() would abort with a bare
+  # message and the listener/journal diagnostic below would never run. Print status+journal+AVC hint here.
+  # SysV-shm recovery (surfaced by a live install): an aborted PRIOR squid start
+  # leaves /dev/shm/squid-* and the next start FATALs "Ipc::Mem::Segment::create ... File exists". We do
+  # NOT pre-emptively sweep (that raced with any other squid, since /dev/shm/squid-* is a GLOBAL
+  # namespace). Instead we clean ONLY inside this failure branch and ONLY when BOTH hold: (a) the failure
+  # log actually shows that shm error, AND (b) pgrep proves NO squid process is running (rc 1) -- so there
+  # is provably no live instance whose segments we could corrupt. Then retry ONCE. (Residual: the
+  # check->rm->restart is not atomic against a third-party squid starting in that microsecond; that is an
+  # inherent limit of a shared FS namespace with no cross-instance lock, and is out of the serialized
+  # installer's operational model -- documented, not silently ignored.)
+  if ! systemctl restart squid; then
+    _sqfail=1
+    # Capture the journal FIRST, then a pipe-free bash match: `journalctl | grep -q`
+    # under `set -o pipefail` can return 141 -- grep -q exits on the match, SIGPIPEs the still-writing
+    # journalctl, and the pipeline reports that failure -- FALSE-NEGATING the recovery on a real shm error.
+    _jlog=$(journalctl -u squid -n 30 --no-pager 2>/dev/null)
+    case "$_jlog" in *'Ipc::Mem::Segment'*) _shmerr=1;; *) _shmerr=0;; esac
+    if have pgrep && [ "$_shmerr" -eq 1 ]; then
+      pgrep -x squid >/dev/null 2>&1; _prc=$?          # rc 1 == NO squid anywhere (0 running, >1 error)
+      if [ "$_prc" -eq 1 ] && ls /dev/shm/squid-* >/dev/null 2>&1; then
+        say "  squid start hit a stale SysV-shm segment and NO squid is running -- clearing /dev/shm/squid-* and retrying once"
+        rm -f /dev/shm/squid-*
+        systemctl restart squid && _sqfail=0
+      fi
+    fi
+    if [ "$_sqfail" -ne 0 ]; then
+      echo "[setup] squid restart FAILED (fail-closed) -- diagnostics:" >&2
+      LC_ALL=C systemctl status squid --no-pager -l 2>&1 | sed 's/^/    status| /' >&2 || true
+      journalctl -u squid -n 30 --no-pager 2>&1 | sed 's/^/    squid| /' >&2 || true
+      echo "    SELinux hosts: ausearch -m avc -ts recent (ssl_db/pidfile denials)" >&2
+      exit 1
+    fi
+  fi
+  if command -v ss >/dev/null 2>&1; then   # verify the listener actually bound (restart->bind can lag on a slow host; poll)
+    _dr_vps_verify_poll 20 0.5 "squid listener ${pip}:3128" _vp_squid_bound "$pip" || {
+      echo "[setup] squid not listening on ${pip}:3128 (fail-closed). squid's own error follows:" >&2
+      journalctl -u squid -n 15 --no-pager 2>/dev/null | sed 's/^/    squid| /' >&2 || true
+      echo "    SELinux hosts: check 'ausearch -m avc -ts recent' for squid denials (ssl_db/pidfile)." >&2
+      exit 1
+    }
+  fi
+}
+
+step_nft() {
+  say "load the simulated deny-by-default nft ruleset"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] dr_vps_net_apply (nft -f simulated ruleset)\n'
+  else
+    # pass $SRC as a POSITIONAL param + quote it inside the program (defense-in-depth: never interpolate
+    # the path into the bash -c string, even though it is charset-validated at the top).
+    DR_VPS_FLEET_JSON="${DR_VPS_FLEET_JSON:-$SRC/../etc/fleet.json}" \
+      bash -c '. "$1/dr_vps_api.sh"; . "$1/dr_vps_net.sh"; dr_vps_net_apply' _ "$SRC" \
+        || { echo "[setup] nft apply failed (fail-closed)" >&2; exit 1; }
+  fi
+}
+
+step_spool() {                     # Phase-2: the agent control-loop spool + the drvpsctl group
+  say "agent control-loop spool ($DR_VPS_SPOOL_BASE) + group '$DR_VPS_CTL_GROUP'"
+  local sp="$DR_VPS_SPOOL_BASE"   # OWN parent (drvps:drvpsctl), NOT under the qemu-private state tree
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] groupadd %s; spool requests(0700)/processing(0700)/results(2750)+audit\n' "$DR_VPS_CTL_GROUP"; return 0
+  fi
+  getent group "$DR_VPS_CTL_GROUP" >/dev/null || run groupadd --system "$DR_VPS_CTL_GROUP"
+  run usermod -aG "$DR_VPS_CTL_GROUP" "$DR_VPS_SERVICE_USER"
+  # no-follow safe-create (a drvps-planted symlink at requests/processing/results must not make root
+  # chown out-of-tree). Modes: sp 0750 (agent group-traverses to reach results/); requests 0700
+  # drvps-ONLY (the agent has NO filesystem write to the spool -- it submits via the drvps-rigsubmit
+  # ingress socket, so it can never plant a poison dir a never-root watcher couldn't reclaim);
+  # processing 0700 watcher-private; results 2750 setgid (agent group-READS its result envelope).
+  _safe_mkdir_owned "$sp"            "$DR_VPS_SERVICE_USER" "$DR_VPS_CTL_GROUP"    0750
+  _safe_mkdir_owned "$sp/requests"   "$DR_VPS_SERVICE_USER" "$DR_VPS_SERVICE_USER" 0700
+  _safe_mkdir_owned "$sp/processing" "$DR_VPS_SERVICE_USER" "$DR_VPS_SERVICE_USER" 0700
+  _safe_mkdir_owned "$sp/results"    "$DR_VPS_SERVICE_USER" "$DR_VPS_CTL_GROUP"    2750
+  # S4 idempotency journal: drvps-ONLY 0700 (the agent never reads it; idem replays flow through
+  # results/). Pre-created here as a REAL dir (F5) so the watcher's on-demand makedirs never has to
+  # trust an existing path -- and its symlink refusal has a validated root.
+  _safe_mkdir_owned "$sp/idem"       "$DR_VPS_SERVICE_USER" "$DR_VPS_SERVICE_USER" 0700
+  # audit.log: fd-based create+own (race-free; a symlink at the path -> refused)
+  _safe_file_owned "$sp/audit.log" "$DR_VPS_SERVICE_USER" "$DR_VPS_CTL_GROUP" 0640
+  # POSTCONDITION: the spool must NOT live under the qemu-private state tree, else a drvpsctl-only
+  # agent (NOT in the qemu group) could not TRAVERSE to it (Unix needs +x on every parent). Fail closed.
+  case "$(readlink -f "$sp")/" in
+    "$(readlink -f "$DR_VPS_SYS_STATE")"/*)
+      echo "[setup] FATAL: spool $sp is under the qemu-private $DR_VPS_SYS_STATE -- the agent could not reach it" >&2; exit 1 ;;
+  esac
+}
+
+step_units() {                     # Phase-2: the watcher service + the reaper timer (User=drvps)
+  say "systemd units: drvps-rigctl.service (watcher) + drvps-rigreaper.timer"
+  local root; root="$(cd -P "$HERE/.." && pwd -P)"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] install + enable drvps-rigctl.service + drvps-rigreaper.timer\n'; return 0; fi
+  _assert_install_tree_safe "$root"   # BEFORE any unit is written: never leave poisoned units from an unsafe tree
+  # SELinux (B1): a tree deployed under /opt can inherit a FOREIGN label -- e.g. docker's
+  # container_file_t with per-container MCS categories -- which a confined systemd service (init_t)
+  # CANNOT exec, so the watcher crash-loops 203/EXEC (the exact first-contact live failure). restorecon
+  # the install tree to its policy default (usr_t) so the units can exec $root/bin/*. No-op off SELinux.
+  if [ "$SELINUX_ON" = 1 ] && command -v restorecon >/dev/null 2>&1; then
+    say "  restorecon $root (SELinux: ensure the units can exec the install tree)"
+    # FAIL CLOSED: a masked relabel failure would surface later as a 203/EXEC crash-loop on a
+    # unit/timer. Capture the error + abort BEFORE writing/enabling units, and verify the launcher label
+    # is no longer a foreign container_file_t.
+    local _rcerr
+    if ! _rcerr=$(restorecon -RF "$root" 2>&1); then
+      echo "[setup] FATAL (SELinux): restorecon failed on $root -- the units could not exec the tree (203/EXEC). restorecon said:" >&2
+      printf '%s\n' "$_rcerr" | sed 's/^/    restorecon| /' >&2
+      exit 1
+    fi
+    case "$(stat -c %C "$root/bin/drvps-rigctl" 2>/dev/null | cut -d: -f3)" in
+      container_file_t) echo "[setup] FATAL (SELinux): $root/bin/drvps-rigctl is still labeled container_file_t after restorecon -- systemd cannot exec it (203/EXEC). Check the fcontext for $root." >&2; exit 1;;
+    esac
+  fi
+  # UNIX MODES: _assert_install_tree_safe only rejects group/other-WRITABLE trees -- a umask-0077
+  # deploy (0700 dirs / 0600 files) PASSES it yet leaves the tree UNREADABLE/NON-EXEC to User=drvps, so the
+  # watcher would die 203/EXEC (the Unix-mode twin of the SELinux case above). Normalise to traversable/readable
+  # (still root-owned + non-group/other-writable): dirs + bin/* -> 0755, everything else -> 0644. Then PROVE the
+  # service user can exec the launcher + read the runtime src, failing closed here instead of as a crash-loop.
+  find "$root" -type d -exec chmod 0755 {} + || { echo "[setup] FATAL: chmod dirs failed under $root" >&2; exit 1; }
+  find "$root" -type f ! -path "$root/bin/*" -exec chmod 0644 {} + || { echo "[setup] FATAL: chmod files failed under $root" >&2; exit 1; }
+  find "$root/bin" -type f -exec chmod 0755 {} + || { echo "[setup] FATAL: chmod bin failed under $root" >&2; exit 1; }
+  runuser -u "$DR_VPS_SERVICE_USER" -- test -x "$root/bin/drvps-rigctl" \
+    || { echo "[setup] FATAL: '$DR_VPS_SERVICE_USER' cannot exec $root/bin/drvps-rigctl after mode-normalise -- would be 203/EXEC" >&2; exit 1; }
+  runuser -u "$DR_VPS_SERVICE_USER" -- test -r "$root/src/drvps_rigctl.py" \
+    || { echo "[setup] FATAL: '$DR_VPS_SERVICE_USER' cannot read $root/src -- the watcher import would fail" >&2; exit 1; }
+  # BLOCKER fix: re-apply the nft egress fence + re-stamp the (tmpfs) marker EVERY boot, BEFORE
+  # the watcher runs. Without this the fence is lost on reboot while a persistent marker would
+  # make create_guard fail OPEN; with the marker on tmpfs + this unit it instead fails CLOSED.
+  cat >/etc/systemd/system/drvps-egress.service <<EOF || { echo "[setup] write egress unit failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps egress fence (nft + tmpfs marker), re-applied each boot
+After=$LIBVIRT_UNIT
+Wants=$LIBVIRT_UNIT
+Before=drvps-rigctl.service
+[Service]
+Type=oneshot
+# NO RemainAfterExit: the oneshot must return to inactive after each run so drvps-egress.timer can
+# RE-START it (a timer start against an already-active RemainAfterExit unit is a no-op -> the
+# periodic nft re-assertion would never fire). Before=/Requires=/After= still gate the watcher on
+# the COMPLETED start job, not on the unit staying active.
+Environment=DR_VPS_FLEET_JSON=/etc/distro-rig-vps/fleet.json
+Environment=DR_VPS_NET_STATE=$DR_VPS_NET_STATE
+ExecStart=/bin/bash -c '. $root/src/dr_vps_api.sh; . $root/src/dr_vps_net.sh; dr_vps_net_apply'
+[Install]
+WantedBy=multi-user.target
+EOF
+  # Periodic re-apply: net_apply LIVE-verifies nft (root) then refreshes the marker, so a runtime
+  # flush/delete of the fence (root-only; the agent can't) is RE-ASSERTED and the marker re-validated
+  # within the interval. (create_guard runs as drvps and cannot read live nft -- this bounds the
+  # marker-vs-live staleness window instead of leaving it open until the next reboot.)
+  cat >/etc/systemd/system/drvps-egress.timer <<EOF || { echo "[setup] write egress timer failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps periodic egress-fence re-apply (re-assert nft + refresh marker)
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${DR_VPS_EGRESS_REAPPLY_SEC:-120}
+[Install]
+WantedBy=timers.target
+EOF
+  # Phase-2 INGRESS: the agent no longer writes the spool directly (requests/ is drvps-only 0700).
+  # It submits over this socket; drvps-rigsubmit (User=drvps, Accept=yes -> one instance per
+  # connection) validates + writes the request. SocketGroup=drvpsctl + SocketMode=0660 lets ONLY the
+  # agent group connect. MaxConnections* bound a connect flood; the accepter self-bounds read time+size.
+  cat >/etc/systemd/system/drvps-rigsubmit.socket <<EOF || { echo "[setup] write submit socket failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps agent request ingress socket
+[Socket]
+ListenStream=/run/drvps-submit.sock
+SocketUser=$DR_VPS_SERVICE_USER
+SocketGroup=$DR_VPS_CTL_GROUP
+SocketMode=0660
+Accept=yes
+MaxConnections=64
+MaxConnectionsPerSource=8
+[Install]
+WantedBy=sockets.target
+EOF
+  cat >/etc/systemd/system/drvps-rigsubmit@.service <<EOF || { echo "[setup] write submit service failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps agent request ingress handler (per connection)
+[Service]
+User=$DR_VPS_SERVICE_USER
+ExecStart=$root/bin/drvps-rigsubmit
+StandardInput=socket
+StandardOutput=socket
+TimeoutStartSec=15
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=$DR_VPS_SPOOL_BASE
+ProtectHome=yes
+EOF
+  cat >/etc/systemd/system/drvps-rigctl.service <<EOF || { echo "[setup] write watcher unit failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps agent control-loop watcher
+After=$LIBVIRT_UNIT drvps-egress.service
+Wants=$LIBVIRT_UNIT
+Requires=drvps-egress.service
+[Service]
+User=$DR_VPS_SERVICE_USER
+ExecStart=$root/bin/drvps-rigctl
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+# RestrictSUIDSGID intentionally OMITTED on the watcher: it runs the snapshot scrub, whose libguestfs/supermin
+# appliance build MUST create setuid files (mount, etc.). RestrictSUIDSGID=yes makes supermin exit 1 ("supermin
+# exited with error status 1" -- DR-4, root-caused 2026-07-08). Kept on drvps-rigsubmit + drvps-rigreaper, which
+# never build a libguestfs appliance.
+LockPersonality=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/systemd/system/drvps-rigreaper.service <<EOF || { echo "[setup] write reaper unit failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps TTL reaper
+[Service]
+Type=oneshot
+User=$DR_VPS_SERVICE_USER
+ExecStart=$root/bin/drvps-rigreaper
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+EOF
+  cat >/etc/systemd/system/drvps-rigreaper.timer <<EOF || { echo "[setup] write reaper timer failed" >&2; exit 1; }
+[Unit]
+Description=distro-rig-vps TTL reaper timer
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target
+EOF
+  run systemctl daemon-reload
+  run systemctl enable drvps-egress.service      # re-applies the fence each boot (already applied by step_nft now)
+  run systemctl enable --now drvps-egress.timer  # periodic re-assert + marker refresh (bounds runtime-flush window)
+  run systemctl enable --now drvps-rigsubmit.socket   # agent ingress (socket-activated; must be up before the agent submits)
+  # explicit (not run()) so a 203/EXEC or start failure prints the SELinux label + journal, not a bare msg
+  systemctl enable --now drvps-rigctl.service || {
+    echo "[setup] drvps-rigctl.service failed to start (fail-closed) -- diagnostics:" >&2
+    LC_ALL=C ls -Zd "$root/bin/drvps-rigctl" 2>&1 | sed 's/^/    label| /' >&2 || true
+    journalctl -u drvps-rigctl.service -n 20 --no-pager 2>&1 | sed 's/^/    rigctl| /' >&2 || true
+    echo "    203/EXEC => a foreign SELinux label on $root; fix: restorecon -RvF $root" >&2
+    exit 1
+  }
+  run systemctl enable --now drvps-rigreaper.timer
+}
+
+step_verify() {
+  # INFORMATIONAL sanity preview only -- NOT an install postcondition.
+  # The hard postconditions (net Active+isolated+DHCP+DNS-off, nft applied, squid -k parse)
+  # are enforced FAIL-CLOSED in their own steps. doctor is the per-CREATE gate and also
+  # depends on a fresh-login group set for non-root users, so it must not gate the install.
+  say "sanity (informational, non-gating): dr-vps doctor"
+  run_sh 'DR_VPS_STATE_DIR="$1" "$2"/dr-vps doctor || true' "$DR_VPS_SYS_STATE" "$HERE"
+}
+
+do_install() {
+  need_root
+  # detect_host BEFORE validate_env: it fills PM/LIBVIRT_UNIT/SELINUX_ON and, on the apt family, relocates
+  # the console-log DEFAULT under /var/lib -- validate_env's ancestor check must see the relocated path.
+  detect_host
+  validate_env
+  # Assert the install tree is root-owned + non-writable BEFORE any privileged step. step_env writes
+  # /etc/distro-rig-vps/env with DR_VPS_BIN=$root/bin/dr-vps; a non-root-owned (but charset-safe)
+  # checkout would otherwise POISON that env (-> the watcher execs an attacker binary as drvps) BEFORE
+  # a later step_units guard could abort. Skipped in --dry-run (no writes; tree may be the dev checkout).
+  [ "$DRY_RUN" -eq 1 ] || _assert_install_tree_safe "$(cd -P "$HERE/.." && pwd -P)"
+  say "distro-rig-vps install  (dry-run=$DRY_RUN)"
+  # Refuse the irreversible OS-user creation WITHOUT --yes BEFORE installing ~16 packages -- a gate
+  # framed as "required to change the host" shouldn't first mutate the host with a package install.
+  if ! getent passwd "$DR_VPS_SERVICE_USER" >/dev/null 2>&1 && [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+    echo "[setup] refusing to create OS user '$DR_VPS_SERVICE_USER' without --yes (re-run with --yes)" >&2; exit 12
+  fi
+  # &&-chained inside an if so a step that returns nonzero (without exiting) halts BEFORE
+  # the DONE banner.
+  if step_preflight && step_deps && step_user && step_sshkey && step_libvirt && step_state && step_console && step_env && step_proxy && step_nft && step_spool && step_units && step_verify; then
+    :
+  else
+    echo "[setup] install failed (fail-closed)" >&2; exit 1
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # dry-run made NO changes -- do not claim the watcher/units/user exist (the DONE banner must not
+    # assert a running install after a --dry-run that mutated nothing).
+    say "DONE (DRY-RUN): NOTHING was changed. The log above shows what a real (--yes) run WOULD do."
+    say "A real run WOULD create the '$DR_VPS_SERVICE_USER' user + groups (group changes then need a FRESH"
+    say "re-login before /dev/kvm works) and start 'drvps-rigctl.service'. Re-run WITHOUT --dry-run on a"
+    say "KVM-capable host to actually install."
+  else
+    say "DONE. IMPORTANT: group changes need a FRESH login -- '$DR_VPS_SERVICE_USER' (and any"
+    say "interactive user) must re-login (or use 'newgrp kvm') before /dev/kvm works."
+    say "A dedicated throwaway VM ssh key was created: ~$DR_VPS_SERVICE_USER/.ssh/drvps_vm_ed25519"
+    say "Live acceptance (a fresh login session picks up the new groups + sets HOME so the key is found):"
+    say "  runuser -l $DR_VPS_SERVICE_USER -c 'DRVPS_LIVE=1 $HERE/../tests/acceptance/live-fedora44.sh --smoke'"
+    say "Phase-2 agent loop: watcher 'drvps-rigctl.service' is running as $DR_VPS_SERVICE_USER."
+    say "  To let the AGENT drive it, add the agent user to '$DR_VPS_CTL_GROUP' then re-login:"
+    say "    usermod -aG $DR_VPS_CTL_GROUP <agent-user>"
+    say "  then the agent runs: $HERE/rigctl create|exec|recreate|destroy ... (no sudo, no KVM)."
+  fi
+}
+
+do_uninstall() {
+  need_root
+  detect_host                     # BEFORE validate_env: apt console relocation, so we validate + remove the REAL console path
+  validate_env
+  say "UNINSTALL (dry-run=$DRY_RUN) -- removes network, rules, state; leaves packages"
+  # Destroy+undefine ONLY the rig's OWN guests: enumerate the STORE and, for each id, destroy only if
+  # the LIVE domain's UUID matches the stored UUID. NEVER blindly destroy every 'drvps-vm-*' libvirt
+  # domain -- a foreign same-prefix domain must not be touched by root. Store DB gone -> leave all
+  # domains intact + tell the operator. Done directly with quoted argv -- no string-built shell.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] gated destroy of store-registered guests (live UUID must match stored UUID)\n'
+  elif [ -f "$DR_VPS_SYS_STATE/store.db" ] && have sqlite3; then
+    # FAIL CLOSED if the store query ERRORS while the DB exists -- a swallowed error would read zero
+    # rows, destroy nothing, then strip state -> live domains orphaned. (The column is domain_uuid.)
+    local _rows
+    if ! _rows=$(sqlite3 "$DR_VPS_SYS_STATE/store.db" "SELECT id||'|'||COALESCE(domain_uuid,'') FROM vms;"); then
+      echo "[setup] FATAL: cannot read the store DB to identify rig guests -- refusing to strip state with live domains untracked (fix the DB or destroy guests manually first)" >&2; exit 1
+    fi
+    while IFS='|' read -r _id _uu; do
+      [ -n "$_id" ] || continue
+      _live=$(virsh domuuid "$_id" 2>/dev/null | tr -d '[:space:]')
+      if [ -n "$_uu" ] && [ "$_live" = "$_uu" ]; then
+        virsh destroy "$_id" 2>/dev/null; virsh undefine "$_id" 2>/dev/null
+      fi
+    done <<< "$_rows"
+  else
+    echo "[setup] (uninstall) store DB absent -- NOT auto-destroying any libvirt domain; remove rig guests manually via gated 'dr-vps destroy <id>'" >&2
+  fi
+  # NET ownership: destroy/undefine '$DR_VPS_NET_NAME' ONLY if it carries our marker (or the
+  # operator forces via --adopt-simnet). Never tear down a foreign net that merely shares the name.
+  if ! have virsh || _net_is_ours "$DR_VPS_NET_NAME" || [ "$ADOPT_SIMNET" = 1 ]; then
+    run_sh 'virsh net-destroy "$1" 2>/dev/null; virsh net-undefine "$1" 2>/dev/null; true' "$DR_VPS_NET_NAME"
+  else
+    say "  (uninstall) '$DR_VPS_NET_NAME' is not drvps-owned (no marker) -- leaving it (use --adopt-simnet to force)"
+  fi
+  run_sh 'nft delete table inet drvps_sim 2>/dev/null; true'
+  run_sh 'systemctl disable --now drvps-rigctl.service drvps-rigreaper.timer drvps-rigreaper.service drvps-rigsubmit.socket drvps-egress.timer drvps-egress.service 2>/dev/null; true'
+  run_sh 'systemctl stop "drvps-rigsubmit@*.service" 2>/dev/null; true'   # any live per-connection ingress handlers
+  run rm -f /etc/systemd/system/drvps-rigctl.service /etc/systemd/system/drvps-rigreaper.service /etc/systemd/system/drvps-rigreaper.timer /etc/systemd/system/drvps-rigsubmit.socket /etc/systemd/system/drvps-rigsubmit@.service /etc/systemd/system/drvps-egress.timer /etc/systemd/system/drvps-egress.service
+  run_sh 'groupdel "$1" 2>/dev/null; true' "$DR_VPS_CTL_GROUP"
+  # squid: STOP the SSL-bump proxy, restore-or-remove its config, and DESTROY the cache CA secret +
+  # ssl_db (a CA every golden trusts must not survive uninstall); reset the sysctl + drop-in.
+  # OWNERSHIP GUARD: touch squid ONLY if the rig actually manages it -- the current conf
+  # carries our marker, OR a recorded takeover backup exists. Never disable/remove a FOREIGN squid that
+  # was never drvps-managed (e.g. `--uninstall` run on a host where drvps was never installed).
+  if grep -qF '# distro-rig-vps-managed squid.conf' /etc/squid/squid.conf 2>/dev/null || [ -f /etc/squid/squid.conf.drvps-orig ]; then
+    run_sh 'systemctl disable --now squid 2>/dev/null; true'
+    run rm -f /etc/sysctl.d/99-drvps.conf /etc/systemd/system/squid.service.d/10-drvps.conf
+    run_sh 'if [ -f /etc/squid/squid.conf.drvps-orig ]; then mv -f /etc/squid/squid.conf.drvps-orig /etc/squid/squid.conf; else rm -f /etc/squid/squid.conf; fi; true'
+    run_sh 'rm -f /etc/squid/drvps-ca.key /etc/squid/drvps-ca.crt /etc/squid/drvps-ca.pem /etc/squid/drvps-ca.mirrors; rm -rf /var/lib/ssl_db; true'
+    run_sh 'sysctl -w net.ipv4.ip_nonlocal_bind=0 2>/dev/null; true'
+  else
+    say "  (uninstall) /etc/squid/squid.conf is not drvps-managed + no takeover backup -- leaving squid untouched"
+  fi
+  run_sh 'systemctl daemon-reload 2>/dev/null; true'
+  # Remove the console-log dir (rig state, validate_env-fenced) + its now-empty rig-namespace parent. The
+  # bounded virtlogd.conf is LEFT in place -- reverting to virtlogd's unbounded default would be a worse
+  # state; the two rotation lines are harmless without the rig.
+  # Symlink-safe (fd-relative, O_NOFOLLOW) delete of the drvps-owned rig subtree -- a plain path-based
+  # `rm -rf` here is a TOCTOU on the mutable service-owned tree (a compromised drvps could swap a component
+  # to a symlink after validate_env). /etc/distro-rig-vps + /run/distro-rig-vps are root-owned but go
+  # through the same safe path for uniformity. A refusal (a detected symlink swap or a real fs error) FAILS
+  # CLOSED. The console-namespace PARENT is then rmdir'd IF EMPTY (rmdir never follows a symlink, and its
+  # ancestors -- /var/log or /var/lib -- are root-owned, not drvps-swappable).
+  # /etc/distro-rig-vps is removed LAST -- it holds the persisted env (the custom paths). If a later
+  # removal FAILS CLOSED (a detected swap, a too-deep tree, an fs error), the env is still present so a
+  # re-run can still resolve the remaining state to clean up.
+  for _p in "$DR_VPS_SYS_STATE" "$DR_VPS_SPOOL_BASE" "$DR_VPS_CONSOLE_LOG_DIR" /run/distro-rig-vps /etc/distro-rig-vps; do
+    _fs_rm_rf_safe "$_p" || { echo "[setup] uninstall: safe-rm refused/failed (symlink-swap?): $_p" >&2; exit 1; }
+  done
+  run_sh 'rmdir "$1" 2>/dev/null || true' "$(dirname "$DR_VPS_CONSOLE_LOG_DIR")"
+  say "virtlogd.conf console bounds (max_size/max_backups) are left in place (bounded logging is a safe default)"
+  say "service user '$DR_VPS_SERVICE_USER' is left in place (remove manually if desired)"
+}
+
+do_reapply_egress() {
+  # LIGHT path: regenerate ONLY the egress policy (squid allowlist from fleet.json + nft) and
+  # reload -- NO deps/user/libvirt/units/cache-recreate. For adding an allowlist host or a distro
+  # master without re-running the whole installer (operator asked: no sudo installer too often).
+  need_root
+  detect_host                     # BEFORE validate_env (apt console relocation); reapply skips step_libvirt so still needs a real LIBVIRT_UNIT
+  validate_env
+  # reapply is the LIGHT path (no step_libvirt) -- refuse a bridge renumber it cannot actually apply.
+  [ "$DRY_RUN" -eq 1 ] || _assert_reapply_bridge_matches
+  # SAME early tree-safety guard as do_install: reapply runs step_env first, which rewrites the env
+  # file with DR_VPS_BIN=$root/bin/dr-vps. A non-root-owned checkout must be refused BEFORE that write,
+  # or the persisted env points the watcher at an attacker binary even though step_units later aborts.
+  [ "$DRY_RUN" -eq 1 ] || _assert_install_tree_safe "$(cd -P "$HERE/.." && pwd -P)"
+  say "reapply-egress (squid allowlist + nft from fleet.json + refresh systemd units) -- no full reinstall"
+  # step_units too: refresh the unit FILES (e.g. the egress timer / a fixed unit) + daemon-reload on
+  # existing hosts. `enable --now` does NOT restart an already-running watcher, so this is
+  # non-destructive; a unit-body change still needs a deliberate `systemctl restart drvps-rigctl`.
+  if step_env && step_proxy && step_nft && step_units; then
+    say "egress reapplied + units refreshed; allowlist/policy changes are live."
+  else
+    echo "[setup] reapply-egress failed (fail-closed)" >&2; exit 1
+  fi
+}
+
+# GATE SELF-TEST (B7): the install-time positive control for gate PORTABILITY. On a host whose
+# libvirt/qemu auto-adds a benign element the CURATED allow-set does not yet recognize, the agent would
+# hit "gate refused" only later, at first exec. This turns that into "the install names the unknown
+# element NOW, for a human to curate." It boots a THROWAWAY probe VM from a golden, runs the REAL
+# `dr-vps gate guestexec` (identical to the runtime path -- no weakened probe mode), then destroys it.
+# It SURFACES an unknown element; it NEVER auto-adds to the whitelist (that would gut the closed-shape
+# proof -- a hard project limit). Opt-in + post-golden: `--gate-selftest <distro>`.
+do_gate_selftest() {
+  need_root                          # creates/destroys a real probe VM via qemu:///system
+  detect_host                        # BEFORE validate_env (apt console relocation)
+  validate_env
+  local art="$GATE_SELFTEST" cli="$HERE/dr-vps" probe="drvps-gate-selftest" proj="default" probe_id out rc dump created
+  say "gate self-test: boot a throwaway probe '$probe' from '$art', run the REAL gate, then destroy it"
+  say "  (SURFACES an unrecognized-but-benign libvirt/qemu auto-add for a human to CURATE -- it NEVER auto-allows)"
+  # PRECOMPUTE the DETERMINISTIC id (drvps-vm-<sha16(name\037project)>, which is ALSO the libvirt domain
+  # name) BEFORE `create`, so probe_id is set BEFORE the create window: an INT/TERM that lands mid-create
+  # (domain already defined, create's stdout not yet returned) still has a real id to destroy -- closing
+  # the last leak. INT/TERM trap only (NOT EXIT: an EXIT trap fires after `return 0` pops
+  # this frame where the local is gone). Normal paths destroy explicitly.
+  probe_id="drvps-vm-$(printf '%s\037%s' "$probe" "$proj" | sha256sum | awk '{print substr($1,1,16)}')"
+  _gst_cleanup() { "$cli" destroy "$probe_id" >/dev/null 2>&1 || true; }
+  trap '_gst_cleanup; exit 130' INT TERM
+  _gst_cleanup                                          # clear any leftover probe from a prior interrupted run
+  created=$("$cli" create "$probe" "$art" 2>/dev/null) || { echo "[setup] gate self-test: could not create a probe VM from '$art' -- build a golden first (dr-vps build <distro>) and pass its distro id." >&2; trap - INT TERM; exit 1; }
+  # the created id MUST equal our precomputed id -- a mismatch means the id scheme drifted; destroy BOTH
+  # and abort so a leaked probe under the real id can never survive.
+  [ "$created" = "$probe_id" ] || { echo "[setup] gate self-test: created id '$created' != expected '$probe_id' (id-scheme drift) -- cleaning up both + aborting" >&2; "$cli" destroy "$created" >/dev/null 2>&1 || true; _gst_cleanup; trap - INT TERM; exit 1; }
+  out=$("$cli" gate guestexec "$probe_id" 2>&1); rc=$?
+  # SURFACE the exact element on failure -- dump the probe's real domain XML BEFORE destroying it.
+  if [ "$rc" -ne 0 ]; then
+    dump=$(mktemp /tmp/drvps-gate-selftest-XXXXXX.xml)
+    LC_ALL=C virsh dumpxml "$probe_id" >"$dump" 2>/dev/null || true
+  fi
+  "$cli" destroy "$probe_id" >/dev/null 2>&1 || true   # ALWAYS tear the probe down, both paths
+  trap - INT TERM
+  if [ "$rc" -eq 0 ]; then
+    say "gate self-test PASSED: the gate accepts this host's normal VM shape (no unknown element)."
+    return 0
+  fi
+  echo "[setup] gate self-test FAILED: the gate REFUSED a NORMAL probe VM on this host -- libvirt/qemu emitted an element the CURATED allow-set does not recognize. Its domain XML is saved at $dump; find the offending element there and, IF benign, add a NARROWED rule to src/dr_vps_gate.sh + a faithful tests/gate.bats fixture. DO NOT auto-allow. The gate's refusal follows:" >&2
+  printf '%s\n' "$out" | sed 's/^/    gate| /' >&2
+  exit 1
+}
+
+# Dispatch only when EXECUTED, not when SOURCED -- so tests can source this file to unit-test the
+# step_* functions (e.g. the CA-regen state machine) with stubbed openssl/certgen/squid.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  if   [ "$UNINSTALL" -eq 1 ]; then do_uninstall
+  elif [ "$REAPPLY"   -eq 1 ]; then do_reapply_egress
+  elif [ -n "$GATE_SELFTEST" ]; then do_gate_selftest
+  else do_install; fi
+fi

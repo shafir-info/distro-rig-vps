@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# drvps-rigreaper -- timer-driven oneshot (runs as drvps). Takes the SAME work-lock as the
+# watcher (per-op; interleaves -- no race), then sweeps expired VMs (each gate-checked). s5.
+set -uo pipefail
+# allexport: the env file's `: "${VAR:=...}"` assignments must be EXPORTED so any subprocess inherits
+# them (and a future python helper); preserves the conditional-:= design.
+set -a
+# shellcheck disable=SC1091
+[ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env
+set +a
+# This launcher ONLY runs on an installed host: pin the spool to the INSTALL location so a missing
+# env line can't make the reaper GC a DIFFERENT spool than the watcher (api.sh's dev default is ~).
+: "${DR_VPS_SPOOL_DIR:=/var/spool/distro-rig-vps}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+# shellcheck disable=SC1091
+. "$HERE/dr_vps_api.sh"
+# shellcheck disable=SC1091
+. "$HERE/dr_vps_reaper.sh"
+# shellcheck disable=SC2153  # DR_VPS_SPOOL_DIR comes from the sourced api/env
+lockfile="${DR_VPS_SPOOL_DIR}/.lock"
+[ -e "$lockfile" ] || { mkdir -p "$DR_VPS_SPOOL_DIR" 2>/dev/null && : >"$lockfile"; } 2>/dev/null || true
+# A broken spool (wrong owner/perms after a partial install, .lock is a dir, ...) must NOT be a
+# SILENT no-op: exit NONZERO so the oneshot unit shows `failed` in the journal rather than green
+# forever while TTL enforcement is quietly off. We still never sweep UNLOCKED.
+exec {lk}>"$lockfile" 2>/dev/null || { echo "drvps-rigreaper: cannot open lock $lockfile -- TTL sweep SKIPPED" >&2; exit 1; }
+"$DR_FLOCK" "$lk" || { echo "drvps-rigreaper: cannot acquire lock $lockfile -- TTL sweep SKIPPED" >&2; exit 1; }
+# Run pending schema migrations before the sweep gates VMs by the new columns: the reaper
+# may be the first process to touch an upgraded store, and gaterow selecting a not-yet-migrated
+# column would make every gate refuse -> nothing reaped. Fail CLOSED if the store can't initialize.
+dr_vps_store_init || { echo "drvps-rigreaper: store init/migration failed -- TTL sweep SKIPPED" >&2; exit 1; }
+dr_vps_reaper_sweep

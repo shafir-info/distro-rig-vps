@@ -1,0 +1,8 @@
+{
+  "_comment": "Golden recipe for Debian 13 (trixie) genericcloud -- the apt FAMILY (Phase 3). OPERATOR must PIN upstream_sha256 to the image's SHA-256 (the verifier computes sha256sum; Debian publishes SHA512SUMS -- verify the download against the vendor sha512 FIRST, then pin the locally computed sha256 of that verified image). Build FAILS CLOSED until it matches. The seed routes apt through the cache proxy; deb.debian.org must be in fleet.json mirror_allowlist. apt's signed-Release verification keeps integrity end-to-end through the cache.",
+  "distro": "debian13",
+  "family": "apt",
+  "upstream_url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2",
+  "upstream_sha256": "PIN_ME_to_the_verified_SHA256_value",
+  "packages": ["systemd", "openssh-server", "cloud-init", "tmux", "ca-certificates"]
+}

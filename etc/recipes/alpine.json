@@ -1,0 +1,8 @@
+{
+  "_comment": "Alpine Linux cloud image -- the apk FAMILY (PROXY-ONLY; dl-cdn.alpinelinux.org is a single CDN, no mirror sprawl). OPERATOR must PIN upstream_sha256 and add dl-cdn.alpinelinux.org to fleet mirror_allowlist. NOTE: Alpine uses OpenRC (not systemd) and musl; CAVEAT: an agent `exec apk add` may need http_proxy set in the command (ssh non-interactive does not source profile.d).",
+  "distro": "alpine",
+  "family": "apk",
+  "upstream_url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2",
+  "upstream_sha256": "PIN_ME_to_the_vendor_sha256",
+  "packages": ["openssh", "tmux", "ca-certificates"]
+}

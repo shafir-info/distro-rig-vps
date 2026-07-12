@@ -1,0 +1,30 @@
+# distro-rig-vps — ignore runtime/state, images, and local artifacts
+state/
+*.db
+*.db-wal
+*.db-shm
+*.qcow2
+*.img
+*.iso
+seed/
+pool/
+*.log
+*.tmp
+tmp/
+.venv/
+__pycache__/
+# security: never commit runtime spools, env files, or key material
+spool/
+snapshots/
+requests/
+results/
+.env
+.env.*
+.ssh/
+*.pem
+*.key
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+BACKUPS/

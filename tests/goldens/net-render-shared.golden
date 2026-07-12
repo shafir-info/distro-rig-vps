@@ -1,0 +1,29 @@
+# drvps simulated egress (deny-by-default). The generation is a REAL nft rule comment
+# (preserved by 'nft list ruleset'), NOT a '#' line comment (which nft drops). guest_in
+# polices guest->host on the isolated bridge. forward uses policy ACCEPT + explicit drvps0
+# drops: that isolates the sim net (no routing on/off it) WITHOUT clobbering the host's
+# OTHER forwarded traffic (podman, libvirt default-NAT) -- nft runs ALL base chains on a
+# hook, so a policy-drop here would override their accepts. Same for input (policy accept).
+# IDEMPOTENT replace: 'add' the table (no-op if present) then delete it, so a re-apply
+# REPLACES the ruleset in one atomic 'nft -f' transaction instead of APPENDING duplicates.
+add table inet drvps_sim
+delete table inet drvps_sim
+table inet drvps_sim {
+  chain guest_in {
+    meta nfproto ipv6 drop
+    ct state established,related accept comment "drvps-gen-NORM"
+    udp dport { 67, 68 } accept
+    ip daddr 10.123.0.1/32 tcp dport 3128 accept
+    ip daddr 10.123.0.1/32 tcp dport { 8443 } accept
+    drop
+  }
+  chain input {
+    type filter hook input priority 0; policy accept;
+    iifname "drvps0" jump guest_in
+  }
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    iifname "drvps0" drop
+    oifname "drvps0" drop
+  }
+}

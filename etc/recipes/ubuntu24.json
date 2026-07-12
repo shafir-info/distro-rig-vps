@@ -1,0 +1,8 @@
+{
+  "_comment": "Golden recipe for Ubuntu 24.04 LTS (noble) cloud image -- apt FAMILY, debian-family (a supported consumer family). OPERATOR must PIN upstream_sha256 to the vendor value before building (the build FAILS CLOSED until sha256sum matches): Ubuntu publishes it at https://cloud-images.ubuntu.com/noble/current/SHA256SUMS (GPG-verify SHA256SUMS.gpg against the Ubuntu Cloud Image signing key first). The seed routes the guest's apt through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com must be in fleet.json mirror_allowlist (they are). Base packages only -- consumer installers pull their own deps.",
+  "distro": "ubuntu24",
+  "family": "apt",
+  "upstream_url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+  "upstream_sha256": "5fa5b05e5ec239858c4531485d6023b0896448c2df7c63b34f8dae6ea6051a44",
+  "packages": ["systemd", "openssh-server", "cloud-init", "tmux", "ca-certificates"]
+}

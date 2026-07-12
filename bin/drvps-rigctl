@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# drvps-rigctl -- launcher for the Phase-2 watcher (runs as the unprivileged drvps user).
+# Sources the installed env, pins DR_VPS_BIN, and execs the python watcher. See CONCEPT.md (agent control loop).
+set -uo pipefail
+# set -a (allexport): the env file uses `: "${VAR:=...}"` conditional assignments, which set SHELL
+# variables only. The python watcher reads os.environ, so they MUST be EXPORTED -- without allexport
+# DR_VPS_SPOOL_DIR is invisible to python and the watcher crashes with KeyError. allexport preserves
+# the conditional-:= design (explicit env still wins) while exporting everything the file sets.
+set -a
+# shellcheck disable=SC1091
+[ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env
+set +a
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export DR_VPS_BIN="${DR_VPS_BIN:-$HERE/bin/dr-vps}"
+
+# Watcher-boundary ACL precondition, FAIL CLOSED before serving. When the private
+# result store is on (default), the watcher grants each agent read on its 0600 result via setfacl, so
+# the spool fs MUST support POSIX ACLs -- a rig that cannot make results private must NOT silently write
+# results no agent can read. Probed here as the drvps service user; DR_VPS_RESULT_PRIVATE=0 opts into
+# the legacy 0640 group-readable behaviour (trusted single-tenant rig) and skips the probe. On failure
+# the launcher exits nonzero, so `systemctl start`/`dr-vps-setup` surface it (fail-closed), not a silent
+# degrade. This runs only for the REAL service (the --once test path invokes python directly).
+if [ "${DR_VPS_RESULT_PRIVATE:-1}" != 0 ]; then
+  _rdir="${DR_VPS_SPOOL_DIR:-/var/spool/distro-rig-vps}/results"
+  if ! command -v setfacl >/dev/null 2>&1; then
+    echo "drvps-rigctl: FATAL -- setfacl (the 'acl' package) is missing but the private result store is on; install 'acl' or set DR_VPS_RESULT_PRIVATE=0" >&2
+    exit 1
+  fi
+  if _pr="$(mktemp "$_rdir/.aclprobe.XXXXXX" 2>/dev/null)"; then
+    if setfacl -m u:0:r "$_pr" 2>/dev/null && getfacl -pcn "$_pr" 2>/dev/null | grep -q '^user:0:r'; then
+      rm -f "$_pr"
+    else
+      rm -f "$_pr"
+      echo "drvps-rigctl: FATAL -- the spool fs at ${DR_VPS_SPOOL_DIR:-/var/spool/distro-rig-vps} does not support POSIX ACLs (needed for the private result store); mount it with 'acl' or set DR_VPS_RESULT_PRIVATE=0" >&2
+      exit 1
+    fi
+  else
+    echo "drvps-rigctl: FATAL -- cannot create an ACL probe file under $_rdir (spool permissions?)" >&2
+    exit 1
+  fi
+fi
+
+exec python3 "$HERE/src/drvps_rigctl.py" "$@"

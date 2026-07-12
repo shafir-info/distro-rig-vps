@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# rigctl -- the AGENT-side client for the Phase-2 control loop. The agent (unprivileged, in the
+# drvpsctl group) runs ONLY this: it SUBMITS one validated request over the drvps ingress SOCKET
+# (it has NO filesystem write to the spool), then bounded-waits on the result the drvps watcher
+# writes into the group-readable results/ dir. No sudo, no KVM. See CONCEPT.md (agent control loop).
+set -uo pipefail
+# shellcheck disable=SC1091
+[ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env
+SPOOL="${DR_VPS_SPOOL_DIR:-/var/spool/distro-rig-vps}"
+
+die() { echo "rigctl: $*" >&2; exit 2; }
+# S4: client-side idem-key fence (charset + length); the watcher re-checks (authoritative). Catch a
+# bad key BEFORE submit so the agent gets a clear usage error, not a server-side rejection envelope.
+ck_idem() {
+  case "$1" in ''|*[!A-Za-z0-9_.-]*) die "--idem key must be 1-64 chars of [A-Za-z0-9_.-] (got '$1')";; esac
+  [ "${#1}" -le 64 ] || die "--idem key must be 1-64 chars of [A-Za-z0-9_.-] (too long: ${#1})"
+}
+# results/ is the agent-readable half of the spool (2750, drvpsctl group-read); requests/ is now
+# drvps-only, so probe results/ for a basic "installed + in the group?" sanity check.
+[ -d "$SPOOL/results" ] || die "no spool at $SPOOL (is the rig installed + are you in the drvpsctl group?)"
+
+verb="${1:-}"; shift || true
+# reqid: agent-side, charset-fenced (the watcher re-checks reqid + filename==reqid).
+reqid="r$(date +%s)$$${RANDOM}"; reqid="${reqid//[^A-Za-z0-9_-]/}"
+
+# Validate the timeout envs UP FRONT, before any submit. RIGCTL_TIMEOUT is consumed only AFTER the request
+# is sent (the poll deadline), so a non-integer would otherwise crash the client POST-submit -- with no
+# claimed/never-claimed guidance -- and a leading-zero value (e.g. 060) would be mis-read as octal by $(( )).
+# Normalize to decimal so 09/060 mean 9/60, not an octal error / 48.
+for _tvar in RIGCTL_TIMEOUT RIGCTL_SUBMIT_TIMEOUT; do
+  _tval="${!_tvar:-}"
+  [ -z "$_tval" ] && continue
+  case "$_tval" in ''|*[!0-9]*) die "${_tvar} must be a non-negative integer (got '${_tval}')" ;; esac
+  printf -v "$_tvar" '%d' "$((10#$_tval))"
+done
+
+case "$verb" in
+  create)
+    # S1b/S4: extract `--class <v>` + `--idem <key>` (flags, anywhere); the rest stay positional
+    # <name> <distro> [ttl] [mem] [cpus].
+    _class=""; _idem=""; _pos=()
+    while [ "$#" -gt 0 ]; do case "$1" in
+      --class) [ "$#" -ge 2 ] || die "create: --class needs a value (throwaway|service)"; _class="$2"; shift 2;;
+      --idem)  [ "$#" -ge 2 ] || die "create: --idem needs a value"; ck_idem "$2"; _idem="$2"; shift 2;;
+      *) _pos+=("$1"); shift;;
+    esac; done
+    set -- ${_pos[@]+"${_pos[@]}"}
+    { [ "$#" -ge 2 ] && [ "$#" -le 5 ]; } || die "create <name> <distro> [ttl] [mem] [cpus] [--class service] [--idem KEY]"
+    # Validate the optional numeric args CLIENT-SIDE: a non-integer (e.g. `2h`) would make
+    # --argjson fail, the unchecked substitution would wipe $json to '', and the agent would see a
+    # confusing server-side "not valid JSON" instead of a clear client usage error naming the flag.
+    for _pair in "ttl:${3:-}" "mem:${4:-}" "cpus:${5:-}"; do
+      _v="${_pair#*:}"; [ -z "$_v" ] && continue
+      case "$_v" in ''|*[!0-9]*) die "${_pair%%:*} must be a non-negative integer (got '$_v')" ;; esac
+    done
+    case "$_class" in ''|throwaway|service) ;; *) die "create: --class must be 'throwaway' or 'service' (got '$_class')" ;; esac
+    json=$(jq -nc --arg r "$reqid" --arg n "$1" --arg d "$2" \
+      '{reqid:$r,op:"create",name:$n,distro:$d}')
+    [ -n "${3:-}" ] && json=$(jq -c --argjson v "$3" '.ttl=$v'  <<<"$json")
+    [ -n "${4:-}" ] && json=$(jq -c --argjson v "$4" '.mem=$v'  <<<"$json")
+    [ -n "${5:-}" ] && json=$(jq -c --argjson v "$5" '.cpus=$v' <<<"$json")
+    [ -n "$_class" ] && json=$(jq -c --arg c "$_class" '.class=$c' <<<"$json")
+    [ -n "$_idem" ] && json=$(jq -c --arg i "$_idem" '.idem=$i' <<<"$json") ;;
+  exec)  [ "$#" -eq 2 ] || die "exec <vm> <cmd>  (quote the command as ONE argument)"
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg c "$2" '{reqid:$r,op:"exec",vm:$v,cmd:$c}') ;;
+  exec-detach) [ "$#" -eq 2 ] || die "exec-detach <vm> <cmd>  (quote the command as ONE argument)"
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg c "$2" '{reqid:$r,op:"exec-detach",vm:$v,cmd:$c}') ;;
+  exec-status) [ "$#" -eq 1 ] || die "exec-status <job>"
+    json=$(jq -nc --arg r "$reqid" --arg j "$1" '{reqid:$r,op:"exec-status",job:$j}') ;;
+  exec-output) [ "$#" -eq 1 ] || die "exec-output <job>"
+    json=$(jq -nc --arg r "$reqid" --arg j "$1" '{reqid:$r,op:"exec-output",job:$j}') ;;
+  pull)  [ "$#" -eq 2 ] || die "pull <vm> <remote>"
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg p "$2" '{reqid:$r,op:"pull",vm:$v,remote:$p}') ;;
+  push)  [ "$#" -eq 3 ] || die "push <vm> <localfile> <remote>"
+    [ -f "$2" ] || die "no such local file: $2"
+    # base64 -> a TEMP FILE read via jq --rawfile, NOT a shell var passed as jq --arg (ARG_MAX hazard, DR-1): a large
+    # payload as an argv element hits MAX_ARG_STRLEN (~128KiB) and fails with a confusing "Argument list too
+    # long" BEFORE the watcher can enforce its own transfer cap. --rawfile has no argv limit; the decider still
+    # rejects an over-cap decoded size cleanly. (The oversize whole-request cap is enforced server-side too.)
+    _b64f=$(mktemp "${TMPDIR:-/tmp}/rigctl.push.XXXXXX") || die "mktemp failed"
+    base64 -w0 <"$2" > "$_b64f" || { rm -f "$_b64f"; die "base64 failed"; }
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg p "$3" --rawfile b "$_b64f" \
+      '{reqid:$r,op:"push",vm:$v,remote:$p,content_b64:$b}') || { rm -f "$_b64f"; die "request build failed"; }
+    rm -f "$_b64f" ;;
+  recreate|destroy)
+    # S4: lifecycle mutators take an optional --idem <key>; the read verbs below deliberately do NOT.
+    _idem=""; _pos=()
+    while [ "$#" -gt 0 ]; do case "$1" in
+      --idem) [ "$#" -ge 2 ] || die "$verb: --idem needs a value"; ck_idem "$2"; _idem="$2"; shift 2;;
+      *) _pos+=("$1"); shift;;
+    esac; done
+    set -- ${_pos[@]+"${_pos[@]}"}
+    [ "$#" -eq 1 ] || die "$verb <vm> [--idem KEY]"
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg o "$verb" '{reqid:$r,op:$o,vm:$v}')
+    [ -n "$_idem" ] && json=$(jq -c --arg i "$_idem" '.idem=$i' <<<"$json") ;;
+  wait|status|inspect|console-dump)
+    [ "$#" -eq 1 ] || die "$verb <vm>"
+    json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg o "$verb" '{reqid:$r,op:$o,vm:$v}') ;;
+  list) [ "$#" -eq 0 ] || die "list  (no arguments)"
+    json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"list"}') ;;
+  distros) [ "$#" -eq 0 ] || die "distros  (no arguments)"
+    json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"distros"}') ;;
+  version) [ "$#" -eq 0 ] || die "version  (no arguments)"
+    json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"version"}') ;;
+  snapshot)
+    { [ "$#" -ge 1 ]; } || die "snapshot <vm> [--keep-secrets] [--notes STR] [--idem KEY]"
+    _v="$1"; shift
+    json=$(jq -nc --arg r "$reqid" --arg v "$_v" '{reqid:$r,op:"snapshot",vm:$v}')
+    while [ "$#" -gt 0 ]; do case "$1" in
+      --keep-secrets) json=$(jq -c '.keep_secrets=true' <<<"$json"); shift;;
+      --notes) [ "$#" -ge 2 ] || die "--notes needs a value"; json=$(jq -c --arg n "$2" '.notes=$n' <<<"$json"); shift 2;;
+      --idem)  [ "$#" -ge 2 ] || die "--idem needs a value"; ck_idem "$2"
+        json=$(jq -c --arg i "$2" '.idem=$i' <<<"$json"); shift 2;;
+      *) die "snapshot: unknown flag: $1";;
+    esac; done ;;
+  snap-rm)
+    _idem=""; _pos=()
+    while [ "$#" -gt 0 ]; do case "$1" in
+      --idem) [ "$#" -ge 2 ] || die "snap-rm: --idem needs a value"; ck_idem "$2"; _idem="$2"; shift 2;;
+      *) _pos+=("$1"); shift;;
+    esac; done
+    set -- ${_pos[@]+"${_pos[@]}"}
+    [ "$#" -eq 1 ] || die "snap-rm <snap-id-or-name> [--idem KEY]"
+    json=$(jq -nc --arg r "$reqid" --arg s "$1" '{reqid:$r,op:"snap-rm",snap:$s}')
+    [ -n "$_idem" ] && json=$(jq -c --arg i "$_idem" '.idem=$i' <<<"$json") ;;
+  snap-show) [ "$#" -eq 1 ] || die "snap-show <snap-id-or-name>"
+    json=$(jq -nc --arg r "$reqid" --arg s "$1" '{reqid:$r,op:"snap-show",snap:$s}') ;;
+  snap-ls)   [ "$#" -eq 0 ] || die "snap-ls  (no arguments)"
+    json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"snap-ls"}') ;;
+  use)
+    # use <name> --from-snap <snap-id> [--ttl H] [--mem M] [--cpus N]
+    # clone a NEW VM from one of the caller's OWN snapshots. The accepter stamps owner_uid (kernel peercred);
+    # the watcher forces the create envelope (--net/--ssh-key/--project agent) + owner-scopes the resolve.
+    [ "$#" -ge 1 ] || die "use <name> --from-snap <snap-id> [--ttl H] [--mem M] [--cpus N]"
+    _name="$1"; shift
+    json=$(jq -nc --arg r "$reqid" --arg n "$_name" '{reqid:$r,op:"use",name:$n}')
+    _snap=""
+    while [ "$#" -gt 0 ]; do case "$1" in
+      --from-snap) [ "$#" -ge 2 ] || die "--from-snap needs a value"; _snap="$2"
+        json=$(jq -c --arg s "$2" '.snap=$s' <<<"$json"); shift 2;;
+      --ttl)  [ "$#" -ge 2 ] || die "--ttl needs a value";  case "$2" in ''|*[!0-9]*) die "ttl must be a non-negative integer (got '$2')" ;; esac
+        json=$(jq -c --argjson v "$2" '.ttl=$v'  <<<"$json"); shift 2;;
+      --mem)  [ "$#" -ge 2 ] || die "--mem needs a value";  case "$2" in ''|*[!0-9]*) die "mem must be a non-negative integer (got '$2')" ;; esac
+        json=$(jq -c --argjson v "$2" '.mem=$v'  <<<"$json"); shift 2;;
+      --cpus) [ "$#" -ge 2 ] || die "--cpus needs a value"; case "$2" in ''|*[!0-9]*) die "cpus must be a non-negative integer (got '$2')" ;; esac
+        json=$(jq -c --argjson v "$2" '.cpus=$v' <<<"$json"); shift 2;;
+      --class) [ "$#" -ge 2 ] || die "--class needs a value (throwaway|service)"   # S1b: clone as a service VM
+        case "$2" in throwaway|service) ;; *) die "--class must be 'throwaway' or 'service' (got '$2')" ;; esac
+        json=$(jq -c --arg c "$2" '.class=$c' <<<"$json"); shift 2;;
+      --idem) [ "$#" -ge 2 ] || die "--idem needs a value"; ck_idem "$2"   # S4
+        json=$(jq -c --arg i "$2" '.idem=$i' <<<"$json"); shift 2;;
+      --restore-secrets)   # S6: explicit ack to restore a SECRET-BEARING snapshot (service-class, policy-gated)
+        json=$(jq -c '.restore_secrets=true' <<<"$json"); shift;;
+      *) die "use: unknown flag: $1  (use <name> --from-snap <snap-id> [--ttl H] [--mem M] [--cpus N] [--class service] [--idem KEY] [--restore-secrets])";;
+    esac; done
+    [ -n "$_snap" ] || die "use requires --from-snap <snap-id>" ;;
+  *) die "usage: rigctl create|exec|exec-detach|exec-status|exec-output|push|pull|recreate|destroy|wait|status|inspect|console-dump|list|distros|version|snapshot|snap-ls|snap-show|snap-rm|use ..." ;;
+esac
+
+# Submit over the drvps-side ingress SOCKET -- the agent has NO filesystem write to the spool (so it
+# can never plant a poison dir a never-root watcher couldn't reclaim). drvps-rigsubmit validates +
+# writes the request into the drvps-only requests/ dir and replies "OK <reqid>" / "ERR <reason>".
+# Transport is an inline python3 (already a dependency -- the watcher is python) so no extra package.
+sock="${DR_VPS_SUBMIT_SOCK:-/run/drvps-submit.sock}"
+resp=$(printf '%s' "$json" | python3 -c '
+import socket, sys
+path, timeout = sys.argv[1], float(sys.argv[2])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sent = False
+try:
+    s.settimeout(timeout)
+    s.connect(path)
+    s.sendall(sys.stdin.buffer.read())
+    sent = True                       # bytes are on the wire -- the ingress MAY now enqueue the request
+    s.shutdown(socket.SHUT_WR)
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+except Exception as e:
+    # BEFORE the send completes -> definitely not submitted (exit 3, safe to retry). AFTER it -> the request
+    # may be enqueued but the ack was lost (exit 4, INDETERMINATE). Never conflate the two -- an agent must
+    # not blindly re-run a mutation it cannot confirm.
+    sys.stderr.write(str(e) + "\n"); sys.exit(4 if sent else 3)
+if not buf:
+    sys.exit(4)                       # sent, but the peer closed with NO acknowledgment -> may be enqueued
+sys.stdout.write(buf.decode("utf-8", "replace"))
+' "$sock" "${RIGCTL_SUBMIT_TIMEOUT:-10}")
+_subrc=$?                                               # capture BEFORE anything resets it (need resp AND rc)
+_indet="MAY already be enqueued; treat as INDETERMINATE: do NOT blindly re-run a mutation, reconcile with 'rigctl list' / 'status' / 'snap-ls' first"
+case "$_subrc" in
+  0) ;;                                                 # got an acknowledgment; parse OK/ERR below
+  3) die "could not reach the submit socket ($sock) -- is drvps-rigsubmit.socket enabled and are you in the drvpsctl group? (request NOT submitted -- safe to re-issue once fixed)" ;;
+  4) die "submit acknowledgment lost after sending -- request $reqid $_indet" ;;
+  *) die "submit failed (rc=$_subrc)" ;;
+esac
+case "$resp" in
+  "OK "*)  : ;;                                         # submitted; fall through to poll the result
+  "ERR "*) die "submit refused: ${resp#ERR }" ;;
+  *)       die "unexpected submit response '${resp}' -- request $reqid $_indet" ;;
+esac
+
+# bounded wait for the result (claimed marker tells "queued" from "lost").
+res="$SPOOL/results/${reqid}.json"
+deadline=$(( $(date +%s) + ${RIGCTL_TIMEOUT:-360} ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  if [ -f "$res" ]; then
+    # The result EXISTS -- but treat existence as completion ONLY if we can actually READ
+    # it. Under the private result store the watcher grants read via a POSIX ACL set atomically with the
+    # file; if that setfacl FAILED the file is 0600 drvps-only -- we can stat it (the dir is group-
+    # traversable) but not read it. That is NOT success: fail with a clear, NONZERO, do-not-assume message
+    # instead of cat-ing nothing and exiting 0. The ACL is atomic with the link, so this won't self-heal.
+    if [ ! -r "$res" ]; then
+      echo "rigctl: result for $reqid exists but is UNREADABLE by your account (a result-ACL publication anomaly on the watcher -- the file is drvps-only). Do NOT assume success; reconcile with 'rigctl list'/'status'/'snap-ls'. Operator: check 'journalctl -u drvps-rigctl' + $SPOOL/audit.log (spool fs 'acl' mount?)." >&2
+      exit 1
+    fi
+    if [ "$verb" = console-dump ]; then
+      # console-dump moves the UNTRUSTED persistent console-log tail as base64 (Observability Step 8):
+      # decode it, then SANITIZE for terminal display -- the guest fully controls its serial output, so a
+      # RAW dump could inject terminal escape sequences. Strip C0 control bytes (KEEP tab \011/newline
+      # \012/CR \015) + DEL \177, leaving printable text + high bytes. Only on a GENUINE success (status ok
+      # AND exit_code 0); any failure (incl. "no persistent log -> recreate to enable") prints the envelope
+      # + exits nonzero, and FAIL CLOSED on corrupt base64 so an empty/failed dump is never a false success.
+      if [ "$(jq -r '.status // "?"' "$res")" = ok ] && [ "$(jq -r '.exit_code // 1' "$res")" = 0 ]; then
+        # convergence r1: content_b64 MUST be a string on a genuine success. Its ABSENCE is an anomaly, NOT an
+        # empty dump -- `jq '.content_b64 // ""' | base64 -d ""` would print nothing and exit 0 (false success).
+        jq -e '.content_b64|type=="string"' "$res" >/dev/null 2>&1 \
+          || { echo "rigctl: console-dump: result is missing content_b64 (not a valid dump)" >&2; cat "$res"; echo; exit 1; }
+        # DECODE + SANITIZE untrusted guest serial output entirely inside python (already a dependency) so it
+        # runs as a UTF-8 CODEPOINT filter, NOT a bash variable (which strips NUL + warns) or a raw byte-range
+        # delete (which corrupts multibyte UTF-8 by eating 0x80-0x9F continuation bytes). base64-decode with
+        # validate=True so corrupt input yields NO output + a nonzero exit (fail closed, no partial bytes).
+        # KEEP tab/newline/CR + printable ASCII + every codepoint >= U+00A0; DROP C0 controls, DEL, and C1
+        # controls U+0080-U+009F (CSI 0x9b / OSC 0x9d etc. are terminal-active WITHOUT an ESC). Invalid bytes
+        # decode to U+FFFD (inert), so a raw C1 byte cannot survive as an active control.
+        if jq -r '.content_b64' "$res" | python3 -c '
+import sys, base64, binascii
+try:
+    data = base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)
+except (binascii.Error, ValueError):
+    sys.exit(1)
+text = data.decode("utf-8", "replace")
+out = "".join(c for c in text if c in "\t\n\r" or 0x20 <= ord(c) <= 0x7e or ord(c) >= 0xa0)
+sys.stdout.buffer.write(out.encode("utf-8"))
+'; then
+          exit 0
+        fi
+        echo "rigctl: console-dump: corrupt base64 in result envelope" >&2; exit 1
+      fi
+      cat "$res"; echo; exit 1
+    fi
+    if [ "$verb" = pull ]; then
+      # pull moves bytes as base64 through the result channel (D7): decode content_b64 to RAW stdout
+      # so `rigctl pull` behaves like cat (binary-safe) ONLY on a genuinely successful transfer --
+      # status==ok AND exit_code==0 (a guest read that failed has status=ok but a nonzero exit).
+      # On any failure print the envelope + exit nonzero, and FAIL CLOSED if the base64 is corrupt, so
+      # an empty/failed pull is never mistaken for a successful empty file.
+      if [ "$(jq -r '.status // "?"' "$res")" = ok ] && [ "$(jq -r '.exit_code // 1' "$res")" = 0 ]; then
+        # content_b64 MUST be a string on a genuine success; its ABSENCE is an anomaly, NOT an empty file
+        # (`.content_b64 // "" | base64 -d` on absent prints nothing + exits 0 = false success). Parity with
+        # console-dump's guard above.
+        jq -e '.content_b64|type=="string"' "$res" >/dev/null 2>&1 \
+          || { echo "rigctl: pull: result is missing content_b64 (not a valid transfer)" >&2; cat "$res"; echo; exit 1; }
+        jq -r '.content_b64' "$res" | base64 -d
+        pst=("${PIPESTATUS[@]}")   # capture BOTH statuses ATOMICALLY: pst[0]=jq, pst[1]=base64
+        # Check BOTH: a jq failure (result vanished/unreadable after the type check) feeds base64 EOF ->
+        # base64 exits 0, so checking base64 alone would falsely succeed with empty output. jq (pst[0]) must
+        # be 0 -- OR 141: on an early downstream close (`... | head`) BOTH jq and base64 take SIGPIPE (141),
+        # which is normal cat-like behaviour, not corruption. A genuine jq error is 2/3/4/5 (never 141).
+        # base64 (pst[1]) 0 = ok, 141 = downstream close, other nonzero = undecodable.
+        case "${pst[0]:-1}" in 0|141) ;; *) echo "rigctl: pull: content_b64 became unreadable" >&2; exit 1 ;; esac
+        case "${pst[1]:-1}" in 0|141) exit 0 ;; *) echo "rigctl: pull: corrupt base64 in result envelope" >&2; exit 1 ;; esac
+      fi
+      cat "$res"; echo; exit 1
+    fi
+    cat "$res"; echo; exit 0
+  fi
+  sleep 0.5
+done
+# M19: the claimed marker distinguishes "claimed but the op is slow/watcher died" from "never picked up".
+if [ -f "$SPOOL/results/${reqid}.claimed" ]; then
+  echo "rigctl: timed out -- request $reqid was CLAIMED (op still running, or the watcher died mid-op); check 'journalctl -u drvps-rigctl' + $SPOOL/audit.log" >&2
+else
+  echo "rigctl: timed out -- request $reqid was NEVER claimed (is the watcher up? 'systemctl status drvps-rigctl')" >&2
+fi
+exit 17

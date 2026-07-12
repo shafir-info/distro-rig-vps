@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# drvps-rigsubmit -- launcher for the Phase-2 request-ingress accepter (runs as the unprivileged
+# drvps user, one instance per connection via the drvps-rigsubmit.socket systemd unit, Accept=yes).
+# Sources the installed env FIRST -- exactly like bin/drvps-rigctl -- so the accepter resolves the
+# SAME DR_VPS_SPOOL_DIR / caps the watcher uses (a customized spool base must not split the two into
+# different requests/ dirs), then execs the python accepter, PRESERVING the connected socket on
+# stdin/stdout (exec inherits fds). See CONCEPT.md (agent control loop).
+set -uo pipefail
+# set -a (allexport): the env file uses `: "${VAR:=...}"` conditional assignments (shell vars only);
+# the python accepter reads os.environ, so they must be EXPORTED. allexport keeps the conditional-:=
+# design (explicit env still wins) while exporting everything the file sets.
+set -a
+# shellcheck disable=SC1091
+[ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env
+set +a
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec python3 "$HERE/src/drvps_rigsubmit.py" "$@"

@@ -1,0 +1,10 @@
+{
+  "_comment": "CentOS Stream 9 GenericCloud -- dnf FAMILY with a RECIPE-PINNED repo (CentOS Stream's default metalink sprawls across mirrors the allowlist can't enumerate, so pin to mirror.stream.centos.org, which IS allowlisted; centos.org is a mirror_ca_parent). Pinned to an IMMUTABLE dated image (not the floating -latest symlink) so upstream_sha256 does not drift. OPERATOR must keep upstream_sha256 matching the image (build fails closed until sha256 matches). Guest dnf routes through the SSL-bump cache proxy. $basearch is a dnf var (kept literal). Base packages only -- the consumer own installer pulls its deps.",
+  "distro": "centos9",
+  "family": "dnf",
+  "upstream_url": "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260630.2.x86_64.qcow2",
+  "upstream_sha256": "12d7f3dc64a4c5f7739f91e984de3629d143b758da242ae6cf4bb19945cfb347",
+  "repo_content": "[baseos-drvps]\nname=CentOS Stream 9 BaseOS (drvps pinned)\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/$basearch/os/\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial\n[appstream-drvps]\nname=CentOS Stream 9 AppStream (drvps pinned)\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/$basearch/os/\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial\n",
+  "repo_remove": "/etc/yum.repos.d/centos*.repo",
+  "packages": ["systemd", "openssh-server", "cloud-init", "tmux"]
+}

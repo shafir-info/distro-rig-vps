@@ -1,0 +1,10 @@
+{
+  "_comment": "Rocky Linux 9 GenericCloud -- the dnf FAMILY with a RECIPE-PINNED repo (Rocky's mirrorlist sprawls across mirrors the allowlist can't enumerate, so pin to dl.rockylinux.org). OPERATOR must PIN upstream_sha256 (build fails closed) and add dl.rockylinux.org to fleet mirror_allowlist. $releasever/$basearch are cloud-init/dnf vars (kept literal).",
+  "distro": "rocky9",
+  "family": "dnf",
+  "upstream_url": "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2",
+  "upstream_sha256": "PIN_ME_to_the_vendor_CHECKSUM_sha256",
+  "repo_content": "[baseos-drvps]\nname=Rocky $releasever BaseOS (drvps pinned)\nbaseurl=https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9\n[appstream-drvps]\nname=Rocky $releasever AppStream (drvps pinned)\nbaseurl=https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9\n",
+  "repo_remove": "/etc/yum.repos.d/rocky*.repo",
+  "packages": ["systemd", "openssh-server", "cloud-init", "tmux"]
+}

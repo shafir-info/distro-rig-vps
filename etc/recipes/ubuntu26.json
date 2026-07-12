@@ -1,0 +1,8 @@
+{
+  "_comment": "Ubuntu 26.04 LTS cloud image -- apt FAMILY, debian-family (the consumer-supported). Mirrors the consumer ubuntu:26.04 container (the newest LTS). PIN upstream_sha256 before building (fails closed until it matches): sha256 is published at https://cloud-images.ubuntu.com/releases/26.04/release/SHA256SUMS. Guest apt routes through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com are allowlisted. Base packages only -- the consumer own installer pulls its deps.",
+  "distro": "ubuntu26",
+  "family": "apt",
+  "upstream_url": "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img",
+  "upstream_sha256": "3ee4f67f322abb2d1d1f0fffc957f7411404ad6635dd35b026c8ff05ac6e534c",
+  "packages": ["systemd", "openssh-server", "cloud-init", "tmux", "ca-certificates"]
+}
