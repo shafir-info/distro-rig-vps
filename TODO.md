@@ -89,6 +89,17 @@ instance (fix the class, cf. LESSONS-LEARNED #14).
 An agent/operator interactive console attach over an INTERNAL socket (beyond the operator
 break-glass `dr-vps console` = virsh console). Never approved or started; revisit on demand.
 
+## Golden lifecycle: a `dr-vps rm-golden` verb (GC)
+There is no first-class way to remove a golden -- `snap-rm` deletes snapshots, but goldens accumulate
+(esp. old duplicates after an in-place upgrade + rebuild, since `create` uses the newest per distro and
+the older ones just sit on disk). The store already has the safe primitive: `dr_vps_store_image_delete`
+is golden-only and atomically **refcount-gated** (refuses while any VM backs it). Wire a proper verb:
+`dr-vps rm-golden <artifact_id>` -> resolve `golden_path`, call `dr_vps_store_image_delete`, then `rm`
+the pool file; refuse a snapshot id (point at `snap-rm`); add a red-green bats test (refcount-refusal,
+successful delete removes row + file, snapshot refused). Interim tool that does exactly this over the
+existing primitive: `tools/reclaim-goldens.sh` (dry-run default, `--commit` to apply) -- fold its logic
+into the verb, then retire it.
+
 ## Housekeeping
 - **/opt vs checkout reconcile** on the deployed host: verify `/opt` matches the current pack
   (past deploys used single-file patches); clean full redeploy if it drifts.
