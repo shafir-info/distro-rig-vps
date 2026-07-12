@@ -202,11 +202,13 @@ Every limitation, trust boundary, and deferral is maintained in **one place**:
 bats tests/
 sudo -u drvps -H env DRVPS_LIVE=1 /opt/distro-rig-vps/tests/acceptance/live-fedora44.sh --smoke
 DRVPS_LIVE=1 /opt/distro-rig-vps/tests/acceptance/live-rigctl.sh
-# shellcheck: 4 documented per-file exceptions (same commands CI runs)
+# shellcheck: documented per-file suppressions (same commands CI runs). SC2016 (single-quoted
+# templates emitted for the guest shell) is intentional in snapshot.sh + image.sh.
 shellcheck -x -s bash --exclude=SC2163,SC2012 bin/dr-vps-setup
 shellcheck -x -s bash --exclude=SC2034 src/dr_vps_domain.sh
 shellcheck -x -s bash --exclude=SC2016 src/dr_vps_snapshot.sh
-shellcheck -x -s bash bin/dr-vps bin/rigctl bin/drvps-* bin/make-pack.sh tools/backup.sh src/dr_vps_api.sh src/dr_vps_doctor.sh src/dr_vps_gate.sh src/dr_vps_identity.sh src/dr_vps_image.sh src/dr_vps_net.sh src/dr_vps_netgroup.sh src/dr_vps_reaper.sh src/dr_vps_remote.sh src/dr_vps_storage.sh src/dr_vps_store.sh
+shellcheck -x -s bash --exclude=SC2016 src/dr_vps_image.sh
+shellcheck -x -s bash bin/dr-vps bin/rigctl bin/drvps-* bin/make-pack.sh tools/backup.sh src/dr_vps_api.sh src/dr_vps_doctor.sh src/dr_vps_gate.sh src/dr_vps_identity.sh src/dr_vps_net.sh src/dr_vps_netgroup.sh src/dr_vps_reaper.sh src/dr_vps_remote.sh src/dr_vps_storage.sh src/dr_vps_store.sh
 ```
 (`live-fedora44.sh` runs as the service user — the `-H` matters, the VM ssh key is found via HOME;
 `live-rigctl.sh` runs as a `drvpsctl` member. See USAGE §8.)

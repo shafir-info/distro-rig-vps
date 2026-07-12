@@ -25,7 +25,7 @@ wired, and tested but disabled by default pending an operator decision.
 | Collision/net-ownership preflight (structural, live-address-complete) | LIVE | non-dry-run positive + planted-drift negative controls (widened /16, deleted /24, foreign net XML) |
 | Multi-distro golden builds (dnf/apt/zypper/apk profiles) | fedora44 LIVE; others SEAM | family profiles seam-tested; per-family live acceptance is the remaining step (see Deferred) |
 | Console-log observability (drvps-readable, DoS-bounded) | LIVE | reaper tail-compaction bound; readability decoupled from virtlogd |
-| Offline suite | GREEN | **741 bats tests / 22 suites**; shellcheck clean except 4 documented per-file exceptions (SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh); python ast clean |
+| Offline suite | GREEN | **741 bats tests / 22 suites**; shellcheck clean except documented per-file suppressions (SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
 
 ## Trust model and load-bearing boundaries (current, by design)
 

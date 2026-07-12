@@ -30,12 +30,15 @@ jobs:
           set -e
           shellcheck -x -s bash --exclude=SC2163,SC2012 bin/dr-vps-setup
           shellcheck -x -s bash --exclude=SC2034 src/dr_vps_domain.sh
+          # SC2016 = intentional single-quoted templates emitted for the GUEST shell (markers/vars must
+          # stay literal at printf time and expand remotely). Same class in snapshot.sh and image.sh.
           shellcheck -x -s bash --exclude=SC2016 src/dr_vps_snapshot.sh
+          shellcheck -x -s bash --exclude=SC2016 src/dr_vps_image.sh
           for f in bin/dr-vps bin/rigctl bin/drvps-rigctl bin/drvps-rigreaper bin/drvps-rigsubmit bin/make-pack.sh tools/backup.sh; do
             shellcheck -x -s bash "$f"
           done
           for f in src/dr_vps_*.sh; do
-            case "$f" in */dr_vps_domain.sh|*/dr_vps_snapshot.sh) continue;; esac
+            case "$f" in */dr_vps_domain.sh|*/dr_vps_snapshot.sh|*/dr_vps_image.sh) continue;; esac
             shellcheck -x -s bash "$f"
           done
 

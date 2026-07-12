@@ -37,14 +37,14 @@ second provider on the owner-scoping cycle). Per cycle:
 | Nested-guest live harness (fedora44, renumbered bridge) | — | 10 harness findings resolved; S0–S6 live behavior matrix 26 checks PASS; S6 identity two-arm probe resolved the keep-secrets contract |
 
 Offline suite growth across the cycle: 96 → 741 bats tests (22 suites), plus shellcheck
-(4 documented per-file exceptions) and live smokes on every convergence fix.
+(documented per-file suppressions) and live smokes on every convergence fix.
 
 ### Release verification (maintainer-reported; no public CI yet)
 
 Offline: `for f in tests/*.bats; do bats "$f"; done` -> 741 ok / 0 failed (22 suites);
-shellcheck -> clean except the 4 documented per-file exceptions (SC2163+SC2012 in dr-vps-setup,
-SC2034 in dr_vps_domain.sh, SC2016 in dr_vps_snapshot.sh -- the exact per-file commands are in
-README "Testing" and .github/workflows/ci.yml);
+shellcheck -> clean except documented per-file suppressions (SC2163+SC2012 in dr-vps-setup,
+SC2034 in dr_vps_domain.sh, SC2016 in dr_vps_snapshot.sh + dr_vps_image.sh -- the exact per-file
+commands are in README "Testing" and .github/workflows/ci.yml);
 `bash -n` + python `ast.parse` clean (2026-07-12, Fedora 44). Live: end-to-end installs + behavior
 matrices on a Fedora 44 bare-metal host and a nested-KVM fedora44 guest (renumbered bridge), plus
 an ubuntu26 outer guest for the apt installer path. A GitHub Actions workflow
