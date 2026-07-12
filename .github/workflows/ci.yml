@@ -22,7 +22,7 @@ jobs:
       - name: Syntax gates (bash -n + python ast)
         run: |
           set -e
-          for f in bin/* src/*.sh tools/*.sh tests/*.sh; do bash -n "$f"; done
+          for f in bin/* src/*.sh tools/*.sh tests/*.sh tests/*/*.sh; do bash -n "$f"; done
           for f in src/*.py; do python3 -c "import ast; ast.parse(open('$f').read())"; done
 
       - name: shellcheck (documented per-file exceptions only)
