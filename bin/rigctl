@@ -154,7 +154,25 @@ case "$verb" in
       *) die "use: unknown flag: $1  (use <name> --from-snap <snap-id> [--ttl H] [--mem M] [--cpus N] [--class service] [--idem KEY] [--restore-secrets])";;
     esac; done
     [ -n "$_snap" ] || die "use requires --from-snap <snap-id>" ;;
-  *) die "usage: rigctl create|exec|exec-detach|exec-status|exec-output|push|pull|recreate|destroy|wait|status|inspect|console-dump|list|distros|version|snapshot|snap-ls|snap-show|snap-rm|use ..." ;;
+  egress)
+    # drvpsvc splice-destination self-service: register/query. The accepter stamps owner_uid (peercred);
+    # the watcher runs `dr-vps egress` owner-scoped. The synchronous result is the submit outcome
+    # (pending+reqid / already-active / already-absent / refused); the OPERATOR's later decision
+    # (applied|rejected|expired) is published back separately (poll with `rigctl egress status <reqid>`).
+    _sub="${1:-}"; [ -n "$_sub" ] && shift
+    case "$_sub" in
+      add-splice|remove-splice)
+        { [ "$#" -ge 1 ] && [ "$#" -le 2 ]; } || die "egress $_sub <host> [port]"
+        _port="${2:-443}"; case "$_port" in ''|*[!0-9]*) die "egress port must be a non-negative integer (got '$_port')";; esac
+        json=$(jq -nc --arg r "$reqid" --arg s "$_sub" --arg h "$1" --argjson p "$_port" \
+          '{reqid:$r,op:"egress",egress_op:$s,host:$h,port:$p}') ;;
+      status) [ "$#" -eq 1 ] || die "egress status <reqid>   # the reqid printed by add-splice/remove-splice"
+        json=$(jq -nc --arg r "$reqid" --arg q "$1" '{reqid:$r,op:"egress",egress_op:"status",qreqid:$q}') ;;
+      list) [ "$#" -eq 0 ] || die "egress list  (no arguments)"
+        json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"egress",egress_op:"list"}') ;;
+      *) die "egress add-splice|remove-splice <host> [port] | list | status <reqid>" ;;
+    esac ;;
+  *) die "usage: rigctl create|exec|exec-detach|exec-status|exec-output|push|pull|recreate|destroy|wait|status|inspect|console-dump|list|distros|version|snapshot|snap-ls|snap-show|snap-rm|use|egress ..." ;;
 esac
 
 # Submit over the drvps-side ingress SOCKET -- the agent has NO filesystem write to the spool (so it

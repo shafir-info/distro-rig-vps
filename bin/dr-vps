@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../src/dr_vps_api.sh
 . "$HERE/dr_vps_api.sh"
-for _m in identity store image storage net doctor domain gate remote snapshot; do
+for _m in identity store image storage net doctor domain gate remote snapshot egress; do
   # shellcheck source=/dev/null
   . "$HERE/dr_vps_${_m}.sh"
 done
@@ -107,6 +107,7 @@ main() {
     snap-rm)           need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_rm "$@" ;;
     snap-rename)       need 2 "$@"; dr_vps_store_init && dr_vps_snapshot_rename "$@" ;;
     snap-fsck)         DR_VPS_STORE_LENIENT_INIT=1 dr_vps_store_init && dr_vps_snapshot_fsck "$@" ;;   # diagnose corruption, don't fail-closed on it ; [--prune] removes orphan bundles (operator)
+    egress)            need 1 "$@"; dr_vps_egress_cmd "$@" ;;   # drvpsvc splice-destination register (own file store; no VM store_init)
     ''|-h|--help|help) usage; [ -z "$cmd" ] && exit "$DR_VPS_E_USAGE" || exit 0 ;;
     *)                 printf 'dr-vps: unknown verb: %s\n' "$cmd" >&2; usage; exit "$DR_VPS_E_USAGE" ;;
   esac

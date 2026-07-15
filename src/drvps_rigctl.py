@@ -38,6 +38,9 @@ SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,64}\Z')
 SAFE_SNAP = re.compile(r'^[A-Za-z0-9_.:-]{1,128}\Z')
 JOB_RE = re.compile(r'^[0-9a-f]{16,64}\Z')               # async job id: opaque lowercase hex (no path/shell metachar)
 TMP_RE = re.compile(r'^\.[A-Za-z0-9_-]{1,128}\.tmp\Z')   # the ACCEPTER's in-progress '.{reqid}.tmp' (preserve briefly)
+# egress splice host: an argv-safety fence only (no leading '-', bounded length, no path/shell metachar). The
+# AUTHORITATIVE FQDN validation (labels, IDN, wildcard/ip/url rejection) is canon_fqdn in drvps_egress_member.
+EGRESS_HOST_RE = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9.-]{0,252}\Z')
 
 # wait is GUESTEXEC, not lifecycle: it reaches the guest over SSH, so it must pass the full
 # closed-shape + fresh-egress proof (a domain that passes identity but fails guestexec -- extra NIC,
@@ -57,7 +60,10 @@ VM_VERBS = {"wait": "guestexec", "exec": "guestexec", "push": "guestexec", "pull
 # daemon runs `dr-vps snap-*` as drvps and dr_vps_snapshot_rm is itself refcount-gated (agent owns snapshots).
 # exec-status/exec-output are JOB-keyed (not vm-keyed): the daemon derives the vm from the host job meta and
 # gates guestexec internally. They are OWNER-SCOPED reads (a client cannot poll/read another owner's job).
-GLOBAL_VERBS = {"create", "list", "distros", "snap-ls", "snap-show", "snap-rm", "use", "version", "exec-status", "exec-output"}
+GLOBAL_VERBS = {"create", "list", "distros", "snap-ls", "snap-show", "snap-rm", "use", "version", "exec-status", "exec-output",
+                # egress: drvpsvc splice-destination register/query. No vm; owner-scoped (below); the store
+                # logic (admit + caps + idempotency) is dr_vps_egress.sh -> drvps_egress_member.py.
+                "egress"}
 PREEMPT_VERBS = {"destroy", "recreate"}
 # Lifecycle MUTATORS get the generous lifecycle_timeout (boot/flatten+boot can take minutes), NOT the tighter
 # exec_timeout -- killing one mid-flight can orphan a domain / leave partial storage. `use` (clone-from-snap)
@@ -120,7 +126,10 @@ def decide(filename, raw, gate_fn, caps):
                           # S1a: VM ownership. create stamps the new row; the mutations/guest-reads below
                           # are refused (below) unless owner-verified. Reads (list/status/inspect/wait/
                           # distros/version) stay GLOBAL -- ids/names are non-secrets; payloads+lifecycle are.
-                          "create", "destroy", "recreate", "exec", "push", "pull", "console-dump")
+                          "create", "destroy", "recreate", "exec", "push", "pull", "console-dump",
+                          # egress: a member registers/queries only their OWN splice requests -- an unstamped
+                          # egress request must NOT run unscoped (it would submit/read as uid 0 admin).
+                          "egress")
     owner = req.get("owner_uid")
     owner_args = []
     if owner is not None:
@@ -210,6 +219,34 @@ def decide(filename, raw, gate_fn, caps):
         # LESS than the agent can already act on, so no confidentiality boundary is crossed.
         return {"action": "run", "reqid": reqid, "op": op, "vm": None,
                 "argv": [caps["bin"], "distros"], "preempt": False}
+
+    if op == "egress":
+        # drvpsvc member self-service register/query of a splice destination. owner_args is guaranteed
+        # non-empty (egress is OWNER_SCOPED, so an unstamped request already failed closed above), so
+        # `dr-vps egress` runs owner-scoped. This branch only SHAPES + charset-fences the argv; the admit
+        # gate + caps + idempotency + already-active/absent all live dr-vps-side (dr_vps_egress.sh ->
+        # drvps_egress_member.py). No idem journal (member submit is natively idempotent per tuple).
+        sub = req.get("egress_op")
+        if sub not in ("add-splice", "remove-splice", "list", "status"):
+            return _reject(reqid, "bad egress_op")
+        argv = [caps["bin"], "egress", sub]
+        if sub in ("add-splice", "remove-splice"):
+            host = req.get("host")
+            if not isinstance(host, str) or not EGRESS_HOST_RE.match(host):
+                return _reject(reqid, "bad host")
+            p = _intcap(req.get("port", 443), 1, 65535)
+            if p is None:
+                return _reject(reqid, "bad port")
+            argv += [host, str(p)]
+        elif sub == "status":
+            # status is addressed by the ATTEMPT's reqid (a 32-hex nonce), NOT a host, so a remove
+            # outcome is deliverable and the reason is returned.
+            qreqid = req.get("qreqid")
+            if not isinstance(qreqid, str) or not REQID_RE.match(qreqid):
+                return _reject(reqid, "bad qreqid")
+            argv += [qreqid]
+        argv += owner_args
+        return {"action": "run", "reqid": reqid, "op": op, "vm": None, "argv": argv, "preempt": False}
 
     if op == "snap-ls":
         return {"action": "run", "reqid": reqid, "op": op, "vm": None,

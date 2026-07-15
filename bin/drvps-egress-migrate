@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""drvps-egress-migrate -- one-time, root-run v1 -> v2 egress store migration (docs/EGRESS-STORE-ARCH-UPGRADE.md
+Stage 3). The v1 store (drvps-owned STATE_DIR/egress) and the v2 store (root-owned /var/lib/distro-rig-vps-egress)
+are SEPARATE trees, so migration is a copy-OUT: it BUILDS a fresh v2 tree under a ROOT-ONLY, non-traversable
+staging PARENT, copies validated v1 records in, fsyncs, then ATOMICALLY renames it onto the ABSENT v2 anchor
+(the marker is exposed atomically at cutover). The hostile v1 tree is only READ (fd-relative, O_NOFOLLOW,
+bounded, schema-validated), never re-chowned in place; the v2 anchor MUST NOT already exist (a present v2 is a
+no-op -- greenfield-provisioned or already migrated). Held under the session + data lock, so v1 writers
+serialize with the read and no exposed v2 exists to race until the cutover. Migration:
+  * REQUIRES a CLEAN v1 review state (review/{claimed,manifest,journal} empty). An in-flight v1 batch/journal
+    means a live/crashed approve; migration ABORTS and asks the operator to drain it first (run the v1 reaper +
+    finish any approve), because reconstructing an in-flight cross-version claim is unsafe.
+  * pending: v1 request + its authoritative v1 owner_record -> v2 pending (re-serialized to the v2 schema,
+    owned drvps:drvps 0600). A pending reqid that already has a v1 terminal is DROPPED (decided).
+  * decisions/root -> v2 published/decisions (root:drvps 0640); decisions/expiry -> v2 expiry (drvps:drvps 0600).
+  * owner orphans (owner_record with no pending + no terminal) and review artifacts are NOT migrated.
+No-clobber (idempotent). Fails closed on any per-record fault (that record is skipped + counted). The v2
+anchor MUST be ABSENT (migration builds it via staging + atomic cutover); a present v2 anchor is a no-op
+(greenfield-provisioned or already migrated). The privileged tool has NO runtime path seam: production paths
+are FIXED constants; tests call migrate() with
+a Paths(...) built at the Python-API level. ASCII only.
+"""
+from __future__ import annotations
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+
+for _v in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH", "IFS"):
+    os.environ.pop(_v, None)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
+import drvps_egress_layout as L   # noqa
+import drvps_egress_req as R      # noqa
+
+V1_BASE = "/var/lib/distro-rig-vps/egress"                 # legacy store (STATE_DIR/egress)
+EGRESS_LOCK_PATH = "/etc/distro-rig-vps/egress.lock"
+EGRESS_SESSION_LOCK_PATH = "/etc/distro-rig-vps/egress-session.lock"
+_REQID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+OPS = frozenset(("add-splice", "remove-splice"))
+_MAXB = 8192
+
+# v1 namespace component tuples (the OLD layout)
+V1_PENDING = ("pending",)
+V1_OWNER = ("owner",)
+V1_CLAIMED = ("review", "claimed")
+V1_COPY = ("review", "copy")
+V1_MANIFEST = ("review", "manifest")
+V1_JOURNAL = ("review", "journal")
+V1_ROOT_NS = ("decisions", "root")
+V1_EXPIRY_NS = ("decisions", "expiry")
+
+
+class Paths:
+    def __init__(self, v1_base=None, v2_anchor=None, ids=None):
+        self.v1 = v1_base if v1_base is not None else V1_BASE
+        self.v2 = v2_anchor if v2_anchor is not None else L.ANCHOR
+        self.ids = ids if ids is not None else L.production_ids()
+        self.root_uid = self.ids[L.ROOT][0]
+        self.root_gid = self.ids[L.ROOT][1]
+        self.svc_uid = self.ids[L.SVC][0]
+        self.svc_gid = self.ids[L.SVC][1]
+        # The shared data lock + root session lock are the FIXED /etc paths for ANY production migration (even
+        # with a custom v1 STATE_DIR) -- the migration must serialize with the approve tool + the OLD v1
+        # services on the SAME lock inode. Only a TEST sandbox (a non-production v2 anchor) uses beside-sandbox
+        # locks for isolation.
+        if os.path.realpath(self.v2) != os.path.realpath(L.ANCHOR):
+            _par = os.path.dirname(self.v2.rstrip("/"))
+            self.lock = os.path.join(_par, "egress.lock")
+            self.session_lock = os.path.join(_par, "egress-session.lock")
+        else:
+            self.lock = EGRESS_LOCK_PATH
+            self.session_lock = EGRESS_SESSION_LOCK_PATH
+
+
+_RUNTIME_UNITS = ("drvps-rigctl.service", "drvps-rigreaper.timer", "drvps-rigreaper.service")
+
+
+def _quiesced():
+    """The v1 runtime writers (watcher + reaper) MUST be stopped before migration (arch Stage 3) so no live
+    drvps process mutates the v1 tree during copy-out. FAIL-CLOSED: a unit is safe ONLY when its ActiveState is
+    positively `inactive` or `failed` (systemd reports a non-existent unit as inactive too). ANY other state
+    (active/activating/deactivating/reloading/unknown/empty) OR an indeterminate query (systemctl transport
+    error, timeout, non-zero exit) -> NOT quiesced. If systemctl itself is absent, there is no systemd rig
+    runtime -> quiesced. This is a POSTCONDITION so a direct migrate invocation cannot bypass quiescence."""
+    import subprocess
+    for u in _RUNTIME_UNITS:
+        try:
+            r = subprocess.run(["systemctl", "show", "-p", "ActiveState", "--value", u],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, text=True)
+        except FileNotFoundError:
+            return True                              # no systemctl -> no systemd rig runtime -> quiesced
+        except (OSError, subprocess.SubprocessError):
+            return False                             # indeterminate (transport/timeout) -> fail closed
+        if r.returncode != 0 or (r.stdout or "").strip() not in ("inactive", "failed"):
+            return False                             # not positively safe -> fail closed
+    return True
+
+
+def _open_lock(path):
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+    except PermissionError:
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def _v1_bytes(dir_fd, name, expect_uid=None, expect_gid=None, expect_mode=None):
+    """Bounded, no-follow, REGULAR, nlink==1, exact uid/gid/mode read of a HOSTILE v1 source record -- every
+    authoritative v1 input is pinned to its expected ownership + mode before it is consumed (a wrongly-owned/
+    mis-moded/hardlinked source is rejected, so it cannot inject attacker-chosen attribution)."""
+    return R._read_regular(dir_fd, name, expect_uid=expect_uid, expect_gid=expect_gid,
+                           expect_mode=expect_mode, max_bytes=_MAXB)
+
+
+# EXACT v1 source schemas: the hostile v1 records must be parsed with an EXACT field set, the applicable
+# version, AND a canonical-byte check (the v1 store wrote records via json.dumps(..., separators=(",",":"),
+# sort_keys=True)). This rejects unknown/missing fields, wrong versions, duplicate keys (a re-serialized
+# canonical form never matches a dup-bearing source), and reordered/whitespace/non-canonical numeric forms --
+# so ambiguous legacy bytes fail closed instead of being silently normalized into authoritative v2 state.
+_V1_REQ_FIELDS = frozenset(("ver", "reqid", "op", "host", "port", "owner_uid", "ts"))
+_V1_OWNER_FIELDS = frozenset(("ver", "reqid", "owner_uid"))
+_V1_DEC_FIELDS = frozenset(("reqid", "state", "reason", "ts", "owner_uid", "op", "host", "port",
+                            "batch_id", "before_hash", "after_hash"))
+
+
+def _v1_canon(obj):
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("ascii")
+
+
+def _v1_parse(data, fields):
+    """json.loads + exact field set + canonical-byte. Raises ValueError on any deviation."""
+    obj = json.loads(data.decode("ascii"))
+    if not isinstance(obj, dict) or set(obj) != fields or data != _v1_canon(obj):
+        raise ValueError("bad v1 record (fields/non-canonical)")
+    return obj
+
+
+def _v1_request(dir_fd, reqid, svc_uid, svc_gid):
+    data = _v1_bytes(dir_fd, reqid, expect_uid=svc_uid, expect_gid=svc_gid, expect_mode=0o600)
+    obj = _v1_parse(data, _V1_REQ_FIELDS)
+    if (obj["ver"] != 1 or obj["reqid"] != reqid or not isinstance(obj["op"], str) or obj["op"] not in OPS
+            or not isinstance(obj["host"], str)
+            or not isinstance(obj["port"], int) or isinstance(obj["port"], bool) or not (0 < obj["port"] < 65536)
+            or not isinstance(obj["owner_uid"], int) or isinstance(obj["owner_uid"], bool) or obj["owner_uid"] < 0
+            or not isinstance(obj["ts"], int) or isinstance(obj["ts"], bool)):
+        raise ValueError("bad v1 request")
+    return obj
+
+
+def _v1_owner(dir_fd, reqid, svc_uid, svc_gid):
+    obj = _v1_parse(_v1_bytes(dir_fd, reqid, expect_uid=svc_uid, expect_gid=svc_gid, expect_mode=0o600),
+                    _V1_OWNER_FIELDS)
+    if (obj["ver"] != 1 or obj["reqid"] != reqid
+            or not isinstance(obj["owner_uid"], int) or isinstance(obj["owner_uid"], bool) or obj["owner_uid"] < 0):
+        raise ValueError("bad v1 owner")
+    return obj["owner_uid"]
+
+
+def _v1_decision(dir_fd, reqid, want_states, expect_uid=None, expect_gid=None, expect_mode=None):
+    obj = _v1_parse(_v1_bytes(dir_fd, reqid, expect_uid=expect_uid, expect_gid=expect_gid,
+                              expect_mode=expect_mode), _V1_DEC_FIELDS)
+    if (obj["reqid"] != reqid or obj["state"] not in want_states
+            or not isinstance(obj["ts"], int) or isinstance(obj["ts"], bool)
+            or not isinstance(obj["reason"], str)
+            or (obj["owner_uid"] is not None and (not isinstance(obj["owner_uid"], int)
+                                                  or isinstance(obj["owner_uid"], bool) or obj["owner_uid"] < 0))
+            or (obj["op"] is not None and (not isinstance(obj["op"], str) or obj["op"] not in OPS))
+            or (obj["port"] is not None and (not isinstance(obj["port"], int) or isinstance(obj["port"], bool)
+                                             or not (0 < obj["port"] < 65536)))
+            or (obj["host"] is not None and not isinstance(obj["host"], str))):
+        raise ValueError("bad v1 decision")
+    return obj
+
+
+def _write_owned(dir_fd, name, data, uid, gid, mode):
+    """Atomic no-clobber write of a MIGRATED record owned uid:gid mode (root-run into the private STAGING
+    tree, under the data lock -> no contender). Returns True if written, False if it already existed. Uses a
+    temp + absent-check + rename so the published inode is always st_nlink==1 (no nlink==2 window a crash could
+    freeze). fd-relative + O_NOFOLLOW."""
+    tmp = "." + name + ".tmp." + os.urandom(6).hex()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dir_fd)
+    try:
+        mv = memoryview(data)
+        n = 0
+        while n < len(mv):
+            n += os.write(fd, mv[n:])
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        try:
+            os.lstat(name, dir_fd=dir_fd)
+            wrote = False                        # already present -> no-clobber
+        except FileNotFoundError:
+            os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            wrote = True
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+    os.fsync(dir_fd)
+    return wrote
+
+
+def _v2_request_blob(reqid, obj):
+    return json.dumps({"ver": R.SCHEMA_VER, "reqid": reqid, "op": obj["op"], "host": obj["host"],
+                       "port": obj["port"], "owner_uid": obj["owner_uid"], "ts": obj["ts"]},
+                      separators=(",", ":"), sort_keys=True).encode("ascii")
+
+
+def _v2_terminal_blob(obj):
+    # a historical terminal: keep attribution + reason, drop the (now-gone) batch binding
+    return json.dumps({"reqid": obj["reqid"], "state": obj["state"], "reason": obj.get("reason"),
+                       "ts": obj["ts"], "owner_uid": obj.get("owner_uid"), "op": obj.get("op"),
+                       "host": obj.get("host"), "port": obj.get("port"),
+                       "batch_id": None, "digest": None, "after_hash": None},
+                      separators=(",", ":"), sort_keys=True).encode("ascii")
+
+
+def _names_strict(held_fd):
+    """v1 namespace names from a HELD dir fd (os.scandir dup's the fd -> the held fd survives). A scan FAILURE
+    (overflow/unreadable) PROPAGATES so migration ABORTS rather than proceeding on a partial view."""
+    return R.list_names(held_fd)
+
+
+def _review_clean(held_fd):
+    """True iff the HELD review-namespace fd has NO entries -- a RAW scandir that counts HIDDEN entries too."""
+    with os.scandir(held_fd) as it:
+        for e in it:
+            if e.name not in (".", ".."):
+                return False
+    return True
+
+
+def _copy_records(p, pfd_v1, ofd_v1, rfd_v1, efd_v1, staging_anchor):
+    """Copy validated v1 records into the FRESH staging tree, reading ONLY through the HELD v1 namespace fds
+    (one pinned generation for the whole gate + copy), so a concurrent rename/replace of ANY v1 child namespace
+    cannot swap a tree between the gate and the copy or between enumeration and reads. Returns (migrated,
+    skipped, degraded). Ordering: terminals first (a decided pending is dropped); a reqid in BOTH v1 root+expiry
+    is a DEGRADED pair -> skip BOTH; a terminal reqid is marked decided ONLY after its write succeeds (a failed
+    terminal copy must NOT drop the pending)."""
+    root_names = [n for n in _names_strict(rfd_v1) if _REQID_RE.match(n)]
+    exp_names = [n for n in _names_strict(efd_v1) if _REQID_RE.match(n)]
+    pend_names = [n for n in _names_strict(pfd_v1) if _REQID_RE.match(n)]
+    degraded = set(root_names) & set(exp_names)      # a v1 two-terminal pair -> skip both, count as degraded
+    migrated = {"pending": 0, "decisions": 0, "expiry": 0}
+    skipped = 0
+    decided = set(degraded)                          # a degraded reqid's pending is also dropped
+    pfd_v2 = R.open_ns(staging_anchor, *L.NS_PENDING)
+    dfd_v2 = R.open_ns(staging_anchor, *L.NS_DECISIONS)
+    efd_v2 = R.open_ns(staging_anchor, *L.NS_EXPIRY)
+    try:
+        # per source: (names, v1 fd, want states, v1 EXPECTED uid/gid/mode, v2 fd, v2 mode, v2 uid, v2 gid, key)
+        # v1 modes: decisions/root were root:root 0644 (SHARED); decisions/expiry were drvps:drvps 0644.
+        for names, fd_v1, want, ex_uid, ex_gid, ex_mode, fd_v2, mode, uid, gid, key in (
+                (root_names, rfd_v1, ("applied", "rejected"), p.root_uid, p.root_gid, 0o644, dfd_v2,
+                 L.PUBLISHED_FILE_MODE, p.root_uid, p.svc_gid, "decisions"),
+                (exp_names, efd_v1, ("expired",), p.svc_uid, p.svc_gid, 0o644, efd_v2, L.PRIVATE_FILE_MODE,
+                 p.svc_uid, p.svc_gid, "expiry")):
+            for n in names:
+                if n in degraded:
+                    continue
+                try:
+                    obj = _v1_decision(fd_v1, n, want, expect_uid=ex_uid, expect_gid=ex_gid, expect_mode=ex_mode)
+                except (ValueError, OSError, UnicodeDecodeError, R.EgressReqError):
+                    skipped += 1
+                    continue
+                blob = _v2_terminal_blob(obj)
+                try:
+                    R._parse_terminal(blob, n, want)     # the SERIALIZED v2 terminal MUST satisfy the v2 contract
+                except R.EgressReqError:
+                    skipped += 1                         # invalid v2 terminal -> do NOT write, do NOT mark decided
+                    continue                             # (a preserved valid pending is migrated below); surfaced
+                try:
+                    wrote = _write_owned(fd_v2, n, blob, uid, gid, mode)
+                except OSError:
+                    skipped += 1
+                    continue
+                decided.add(n)                           # mark decided ONLY after a validated + successful write
+                if wrote:
+                    migrated[key] += 1
+        for n in pend_names:
+            if n in decided:
+                continue
+            try:
+                req = dict(_v1_request(pfd_v1, n, p.svc_uid, p.svc_gid))
+                req["owner_uid"] = _v1_owner(ofd_v1, n, p.svc_uid, p.svc_gid)   # authoritative owner (pinned)
+            except (ValueError, OSError, UnicodeDecodeError, R.EgressReqError):
+                skipped += 1
+                continue
+            blob = _v2_request_blob(n, req)
+            try:
+                R._parse_request(blob, n)                 # the SERIALIZED v2 request MUST satisfy the v2 contract
+            except R.EgressReqError:
+                skipped += 1
+                continue
+            try:
+                if _write_owned(pfd_v2, n, blob, p.svc_uid, p.svc_gid, L.PRIVATE_FILE_MODE):
+                    migrated["pending"] += 1
+            except OSError:
+                skipped += 1
+        for fd in (pfd_v2, dfd_v2, efd_v2):
+            os.fsync(fd)
+    finally:
+        for fd in (pfd_v2, dfd_v2, efd_v2):          # the v1 fds are HELD + closed by migrate()
+            os.close(fd)
+    return migrated, skipped, len(degraded)
+
+
+def migrate(p, check_quiesce=True):
+    """Returns (result_dict, exit_code). 0 = migrated / nothing-to-do / already-present; non-zero = abort.
+    v1 -> v2 is a copy-OUT: build a FRESH v2 tree under a ROOT-ONLY, non-traversable staging PARENT, copy
+    validated v1 records in, fsync, then ATOMICALLY rename it onto the (absent) v2 anchor (marker exposed
+    atomically). The hostile v1 tree is only READ. Held under session+data lock, so v1 writers serialize with
+    the read and no v2 exists to race until the atomic cutover."""
+    if not os.path.exists(p.v1):
+        return ({"status": "ok", "note": "no v1 store -- nothing to migrate"}, 0)
+    # QUIESCENCE postcondition (arch Stage 3): the runtime writers must be stopped before we copy the v1 store
+    # out -- fail closed if not, so a direct invocation cannot bypass it. `check_quiesce` is False only for the
+    # sandbox/API tests (no rig runtime); the CLI always enforces it.
+    if check_quiesce and not _quiesced():
+        return ({"status": "abort", "reason": "v1-not-quiesced",
+                 "hint": "stop drvps-rigctl.service + drvps-rigreaper.timer, then re-run"}, 5)
+    if os.path.lexists(p.v2):
+        # a present v2 anchor means a greenfield install already provisioned it OR migration already ran --
+        # migration builds v2 itself, so it must NOT exist yet. Idempotent no-op (do not touch a live store).
+        return ({"status": "ok", "note": "v2 anchor already present -- migration already done or greenfield"}, 0)
+    slfd = _open_lock(p.session_lock)
+    fcntl.flock(slfd, fcntl.LOCK_EX)
+    lfd = _open_lock(p.lock)
+    fcntl.flock(lfd, fcntl.LOCK_EX)
+    staging_parent = None
+    v1bfd = None
+    held = {}
+    try:
+        if os.path.lexists(p.v2):                    # re-check under the lock
+            return ({"status": "ok", "note": "v2 anchor appeared -- nothing to do"}, 0)
+        # PIN one COMPLETE v1 generation: open the v1 base ONCE, then open + HOLD every v1 namespace fd, and do
+        # the whole gate + copy through these held inodes. A concurrent rename/replace of ANY child (review,
+        # pending, owner, ...) after we hold its fd cannot swap a namespace between the gate and the copy or
+        # between enumeration and reads (the v1 base sits under a drvps-writable parent).
+        try:
+            v1bfd = R.open_base_fd(p.v1)
+        except (FileNotFoundError, OSError) as e:
+            return ({"status": "abort", "reason": "v1-base-unreadable", "detail": str(e)[:120]}, 4)
+        # Pin the INTERMEDIATE dirs (review, decisions) ONCE, then open each leaf from the HELD intermediate,
+        # so all children of a given parent come from ONE generation (a rename of review/ or decisions/ after
+        # we hold its fd cannot swap its children). pending/owner are direct children of the pinned base.
+        # (Combined with the required QUIESCENCE -- the watcher/reaper are stopped before migration -- and the
+        # data lock, no live drvps writer contends the v1 tree during the copy-out.)
+        _review = _dec = None
+        try:
+            _review = R.open_sub_fd(v1bfd, "review")
+            _dec = R.open_sub_fd(v1bfd, "decisions")
+            for key, parent, name in ((V1_PENDING, v1bfd, "pending"), (V1_OWNER, v1bfd, "owner"),
+                                      (V1_ROOT_NS, _dec, "root"), (V1_EXPIRY_NS, _dec, "expiry"),
+                                      (V1_CLAIMED, _review, "claimed"), (V1_COPY, _review, "copy"),
+                                      (V1_MANIFEST, _review, "manifest"), (V1_JOURNAL, _review, "journal")):
+                held[key] = R.open_sub_fd(parent, name)
+        except FileNotFoundError:
+            return ({"status": "abort", "reason": "v1-namespace-missing"}, 3)
+        except OSError as e:
+            return ({"status": "abort", "reason": "v1-namespace-unreadable", "detail": str(e)[:80]}, 3)
+        finally:
+            if _review is not None:
+                os.close(_review)
+            if _dec is not None:
+                os.close(_dec)
+        # CLEAN review state required (no in-flight v1 batch/journal, incl. a partial pre-manifest claim in
+        # review/copy). Raw scandir on the HELD fds (counts hidden artifacts).
+        for parts, label in ((V1_CLAIMED, "review/claimed"), (V1_COPY, "review/copy"),
+                             (V1_MANIFEST, "review/manifest"), (V1_JOURNAL, "review/journal")):
+            if not _review_clean(held[parts]):
+                return ({"status": "abort", "reason": "v1-review-not-clean:" + label,
+                         "hint": "drain the v1 store (run the v1 reaper + finish any approve) then re-run"}, 3)
+        # FRESH staging under a root-only non-traversable parent (drvps cannot see the half-built tree)
+        parent = os.path.dirname(p.v2.rstrip("/")) or "/"
+        staging_parent = os.path.join(parent, "." + os.path.basename(p.v2.rstrip("/")) + ".migrate." + os.urandom(6).hex())
+        os.mkdir(staging_parent, 0o700)              # root:root 0700
+        staging_anchor = os.path.join(staging_parent, os.path.basename(p.v2.rstrip("/")))
+        L.provision(staging_anchor, p.ids)           # fresh v2 layout + marker (marker exposed atomically at cutover)
+        try:
+            migrated, skipped, degraded = _copy_records(p, held[V1_PENDING], held[V1_OWNER],
+                                                        held[V1_ROOT_NS], held[V1_EXPIRY_NS], staging_anchor)
+        except (R.EgressReqError, OSError) as e:
+            return ({"status": "abort", "reason": "v1-scan-failed", "detail": str(e)[:120]}, 4)
+        # fsync the staging parent, then ATOMIC cutover (v2 absent -> atomic move exposes the whole tree)
+        pfd = os.open(staging_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(pfd)
+        finally:
+            os.close(pfd)
+        os.rename(staging_anchor, p.v2)
+        gpfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(gpfd)
+        finally:
+            os.close(gpfd)
+        os.rmdir(staging_parent)
+        staging_parent = None
+        return ({"status": "ok", "migrated": migrated, "skipped": skipped, "degraded": degraded}, 0)
+    finally:
+        for fd in held.values():
+            os.close(fd)
+        if v1bfd is not None:
+            os.close(v1bfd)
+        if staging_parent is not None:               # any failure -> remove the private half-built staging tree
+            import shutil
+            shutil.rmtree(staging_parent, ignore_errors=True)
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+        os.close(lfd)
+        fcntl.flock(slfd, fcntl.LOCK_UN)
+        os.close(slfd)
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print("usage: drvps-egress-migrate [V1_BASE]   (one-time v1->v2 egress store migration; run QUIESCED "
+              "as root; V1_BASE defaults to %s, pass the 2.0 STATE_DIR/egress on a custom-state deploy)" % V1_BASE)
+        return 2
+    v1_base = argv[0] if (argv and not argv[0].startswith("-")) else None   # the installer passes STATE_DIR/egress
+    try:
+        p = Paths(v1_base=v1_base)
+    except KeyError as e:
+        print("egress-migrate: service identity not found (%s) -- is drvps installed?" % e)
+        return 5
+    try:
+        out, code = migrate(p)
+    except L.LayoutError as e:
+        print("egress-migrate: v2 store DAMAGED (%s) -- refusing" % e)
+        return 5
+    print(json.dumps(out, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

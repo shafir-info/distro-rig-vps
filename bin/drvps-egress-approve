@@ -1,0 +1,1173 @@
+#!/usr/bin/env python3
+"""drvps-egress-approve v2 -- the root operator review+approve tool for staged egress-splice registrations,
+against the v2 store (docs/EGRESS-STORE-ARCH-UPGRADE.md). The ONLY component that opens a sink, gated by a
+human YES after a dry-run of an immutable SNAPSHOT, applied under a lock with an atomic, health-checked,
+rollback-on-failure commit.
+
+v2 ownership split (ends the recurring root<->drvps hazard class): root writes ONLY root-owned namespaces (root-private/
+{batches,journals}, published/{decisions,claims}); it READS the drvps inbox (pending/, expiry/) but never
+MUTATES it (the drvps reaper clears decided pending + writes expiry terminals). Key mechanisms:
+- SNAPSHOT-FIRST: selected requests are frozen into an immutable root-private batch; validation, the operator
+  display, the dry-run, the journal, and the commit all read the SNAPSHOT -- never a second authoritative
+  read of the mutable inbox (closes the displayed!=committed race).
+- CLAIM LEASES: published/claims/<reqid> (root:drvps) tell the drvps reaper "under review -> do not expire",
+  renewed across the unbounded YES pause.
+- ROOT SESSION LOCK (separate from the shared data lock): held for the WHOLE command incl. the YES pause, so
+  any UNJOURNALED batch present at startup is provably abandoned by a dead process and is released -- no
+  wall-clock TTL guessing. The data lock still releases during the prompt so member submit + the reaper run.
+- TWO-PHASE RECOVERY: (a) finish-or-retain JOURNALED commit batches with STATE-SPECIFIC completion (an
+  `applied` journal entry is complete ONLY when an exact published `applied` decision bound to {reqid, batch,
+  digest, after-hash} exists; a rival expiry/rejected terminal is a CONFLICT -> hard-degraded); (b) release
+  every non-journaled abandoned batch + its leases.
+- PENDING-AWARE decision GC (`gc` subcommand): a published terminal is removed only when a bounded pending
+  scan proves pending/<reqid> absent AND no rival expiry terminal exists.
+
+SECURITY: the privileged CLI has NO runtime path/command seam (production paths + restart argv are FIXED
+constants); tests import this module and construct Paths(test_root=..., ids=...) at the Python API level.
+ASCII only.
+"""
+from __future__ import annotations
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+for _v in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH", "IFS"):
+    os.environ.pop(_v, None)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
+import drvps_egress_layout as L   # noqa
+import drvps_egress_model as M    # noqa
+import drvps_egress_req as R      # noqa
+
+EGRESS_LOCK_PATH = "/etc/distro-rig-vps/egress.lock"                # shared DATA lock (member/reaper/setup)
+EGRESS_SESSION_LOCK_PATH = "/etc/distro-rig-vps/egress-session.lock"  # approve-only ROOT SESSION lock
+PROD_RESTART = ("/usr/bin/systemctl", "restart", "squid.service")
+DEFAULT_MAX_ACTIVE = 20
+LEASE_TTL = 900          # claim lease lifetime (s); renewed every LEASE_RENEW during the YES pause
+LEASE_RENEW = 300
+_REASON_RE = re.compile(r"\A[a-z][a-z0-9-]{1,31}\Z")
+_REQID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_BATCH_RE = re.compile(r"\A[0-9a-f]{16}\Z")
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+class ApplyDegraded(Exception):
+    """Apply failed AND rollback failed -- squid/fleet may be inconsistent; operator must reconcile."""
+
+
+class Paths:
+    # test_root + ids are a PYTHON-API sandbox (imported tests only); the CLI never passes them.
+    def __init__(self, test_root=None, restart=None, ids=None):
+        if test_root:
+            b = os.path.realpath(test_root)
+            self.base = os.path.join(b, "distro-rig-vps-egress")
+            self.fleet = os.path.join(b, "fleet.json")
+            self.squid_conf = os.path.join(b, "squid.conf")
+            self.squid_bin = os.path.join(b, "squid")
+            self.params = os.path.join(b, "params.json")
+            self.hostfacts = os.path.join(b, "hostfacts.json")
+            self.restart = tuple(restart) if restart else (os.path.join(b, "restart-hook"),)
+            self.lock = os.path.join(b, "egress.lock")
+            self.session_lock = os.path.join(b, "egress-session.lock")
+        else:
+            self.base = L.ANCHOR
+            self.fleet = "/etc/distro-rig-vps/fleet.json"
+            self.squid_conf = "/etc/squid/squid.conf"
+            self.squid_bin = "/usr/sbin/squid"
+            self.params = "/etc/distro-rig-vps/egress-render-params.json"
+            self.hostfacts = "/etc/distro-rig-vps/egress-host-facts.json"
+            self.restart = PROD_RESTART
+            self.lock = EGRESS_LOCK_PATH
+            self.session_lock = EGRESS_SESSION_LOCK_PATH
+        self.ids = ids if ids is not None else L.production_ids()
+        self.group_gid = self.ids[L.SVC][1]        # published records are group-readable by drvps
+        self.svc_gid = self.ids[L.SVC][1]          # drvps gid (pin expiry/pending/lease group)
+        self.svc_uid = self.ids[L.SVC][0]          # drvps uid (pin pending/expiry owner)
+        self.root_uid = self.ids[L.ROOT][0]        # root uid (pin published/root-private owner)
+
+    def status(self):
+        """L.OK | L.ABSENT; raises L.LayoutError on a DAMAGED tree (root verifies the FULL node set)."""
+        return L.probe(self.base, self.ids)
+
+    def opendir(self, parts):
+        """A dir-fd for a v2 namespace via the symlink-safe root-anchored O_NOFOLLOW chain."""
+        return R.open_ns(self.base, *parts)
+
+
+def _dfd(p):
+    return os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def _fd_lexists(dir_fd, name):
+    try:
+        os.lstat(name, dir_fd=dir_fd)
+        return True
+    except OSError:
+        return False
+
+
+def _fd_read(dir_fd, name):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        return os.read(fd, 1 << 20)
+    finally:
+        os.close(fd)
+
+
+def _hash(b):
+    return hashlib.sha256(b if isinstance(b, bytes) else b.encode("ascii")).hexdigest()
+
+
+def _read_bytes(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file: %s" % path)
+        return os.read(fd, 1 << 20)
+    finally:
+        os.close(fd)
+
+
+def _prior(path):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return (False, b"", 0o600)
+    return (True, _read_bytes(path), stat.S_IMODE(st.st_mode))
+
+
+def _drifted(path, prior):
+    now = _prior(path)
+    if now[0] != prior[0]:
+        return True
+    return now[0] and _hash(now[1]) != _hash(prior[1])
+
+
+def _atomic_install(path, data, mode):
+    d, name = os.path.dirname(path), os.path.basename(path)
+    blob = data.encode("ascii") if isinstance(data, str) else data
+    dfd = _dfd(d)
+    tmp = "." + name + ".tmp." + os.urandom(6).hex()
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dfd)
+        try:
+            n = 0
+            while n < len(blob):
+                n += os.write(fd, blob[n:])
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(dfd)
+
+
+def _restore(path, prior, mode):
+    existed, data, pmode = prior
+    if existed:
+        _atomic_install(path, data, pmode)
+    else:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _squid_parse(p, conf_text):
+    d = os.path.dirname(p.squid_conf)
+    tmpname = ".squid.conf.cand." + os.urandom(6).hex()
+    dfd = _dfd(d)
+    try:
+        fd = os.open(tmpname, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+        try:
+            b = conf_text.encode("ascii")
+            n = 0
+            while n < len(b):
+                n += os.write(fd, b[n:])
+        finally:
+            os.close(fd)
+        r = subprocess.run([p.squid_bin, "-f", os.path.join(d, tmpname), "-k", "parse"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+        return r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    finally:
+        try:
+            os.unlink(tmpname, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        os.close(dfd)
+
+
+def _render_params(p):
+    params = M.RenderParams(**json.loads(_read_bytes(p.params).decode("ascii")))
+    facts = M.HostFacts()
+    if os.path.exists(p.hostfacts):
+        facts = M.HostFacts(**{k: tuple(v) for k, v in json.loads(_read_bytes(p.hostfacts).decode("ascii")).items()})
+    return params, facts
+
+
+def _fleet_snapshot(p):
+    fbytes = _read_bytes(p.fleet)
+    fleet = json.loads(fbytes.decode("ascii"))
+    M.load_model(fleet)
+    for e in fleet.get("splice_allowlist") or []:
+        if isinstance(e, dict):
+            h, _why = M.canon_fqdn(e.get("host"))
+            if h is not None:
+                e["host"] = h
+    return fbytes, fleet
+
+
+def _load_fleet(p):
+    return _fleet_snapshot(p)[1]
+
+
+def _apply_ops(fleet, ops):
+    cur = {e["host"]: dict(e) for e in (fleet.get("splice_allowlist") or [])}
+    for op, host, port in ops:
+        if op == "add-splice":
+            cur[host] = {"host": host, "port": port}
+        else:
+            cur.pop(host, None)
+    out = dict(fleet)
+    out["splice_allowlist"] = [cur[h] for h in sorted(cur)]
+    return out
+
+
+def _pending_names(p):
+    pfd = p.opendir(L.NS_PENDING)
+    try:
+        return sorted(R.list_names(pfd))
+    finally:
+        os.close(pfd)
+
+
+def _health_ok(proxy_ip, port=3128, timeout=25.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            with socket.create_connection((proxy_ip, port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(0.4)
+    return False
+
+
+def _open_lock(path):
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+    except PermissionError:
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def _flock(fd):
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+# ---- published-decision helper (root -> drvps read edge; group-readable) -------------------------
+def _publish_decision(p, decisions_fd, reqid, state, reason, **kw):
+    R.write_published_decision(decisions_fd, reqid, state, reason, int(time.time()),
+                               group_gid=p.group_gid, **kw)
+
+
+def _read_pub(p, decisions_fd, reqid):
+    return R.read_published_decision(decisions_fd, reqid, expect_uid=p.root_uid, expect_gid=p.svc_gid)
+
+
+def _read_exp(p, expiry_fd, reqid):
+    return R.read_expiry_decision(expiry_fd, reqid, expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+
+
+def _terminal_exists(p, decisions_fd, expiry_fd, reqid):
+    """True/'degraded' if reqid already has a terminal. Root reads BOTH namespaces (published + drvps expiry),
+    with owners/modes pinned. A malformed record raises (fail closed) rather than reading as 'no terminal'."""
+    try:
+        return bool(R.read_terminal(decisions_fd, expiry_fd, reqid, root_uid=p.root_uid,
+                                    svc_uid=p.svc_uid, svc_gid=p.svc_gid))
+    except R.EgressReqError as e:
+        if e.reason == "degraded":
+            return "degraded"
+        raise
+
+
+def _is_our_applied(dec, reqid, owner, op, host, port, batch_id, digest, after_hash):
+    """True iff `dec` is EXACTLY our applied decision for this commit -- EVERY binding field matches, INCLUDING
+    the snapshot-authoritative owner_uid (a foreign/misattributed applied must NOT be accepted as completion)."""
+    return (isinstance(dec, dict) and dec.get("state") == "applied" and dec.get("reqid") == reqid
+            and dec.get("owner_uid") == owner and dec.get("op") == op and dec.get("host") == host
+            and dec.get("port") == port and dec.get("batch_id") == batch_id and dec.get("digest") == digest
+            and dec.get("after_hash") == after_hash)
+
+
+def _finish_applied(p, dfd, efd, reqid, owner, op, host, port, batch_id, digest, after_hash):
+    """Record the OPEN sink's applied decision, then classify. Returns:
+      'ok'       -- our exact applied decision is durable AND no rival terminal exists.
+      'conflict' -- a rival EXPIRY (other namespace) OR a foreign/rejected published decision. The applied
+                    decision is STILL published when publishable (the sink IS open -- arch: root must not skip
+                    its applied because a rival appeared); the caller RETAINS journal+batch+leases (degraded).
+      'lost'     -- our decision could not be made durable (retain; a rerun reconciles).
+    A malformed record anywhere fails closed to 'conflict'. ORDER MATTERS: publish/verify our applied FIRST
+    (record the open sink), THEN read expiry FRESH -- so a malformed expiry does not pre-empt the applied, and
+    a rival expiry inserted DURING the publish is still caught (never classify on a stale pre-publish read)."""
+    try:
+        dec = _read_pub(p, dfd, reqid)
+    except R.EgressReqError:
+        return "conflict"
+    if dec is None:
+        try:
+            _publish_decision(p, dfd, reqid, "applied", "applied", owner_uid=owner, op=op, host=host,
+                              port=port, batch_id=batch_id, digest=digest, after_hash=after_hash)
+        except R.EgressReqError as e:
+            if e.reason != "dup":
+                return "lost"
+        try:
+            dec = _read_pub(p, dfd, reqid)
+        except R.EgressReqError:
+            return "conflict"
+    if not _is_our_applied(dec, reqid, owner, op, host, port, batch_id, digest, after_hash):
+        return "conflict"                            # a foreign/misattributed decision occupies the slot
+    # our applied is durable -- NOW read expiry FRESH: a rival/malformed expiry -> degraded conflict (retain)
+    try:
+        exp = _read_exp(p, efd, reqid)
+    except R.EgressReqError:
+        return "conflict"
+    return "conflict" if exp is not None else "ok"
+
+
+def _reject_from_inbox(p, decisions_fd, expiry_fd, reqid, reason, op=None, host=None, port=None):
+    """Write a durable published `rejected` decision (guarded by read_terminal). v2: root does NOT clear
+    pending -- the drvps reaper clears decided pending. Returns True on a durable decision (or a pre-existing
+    terminal), False on a write failure (caller must not lose it)."""
+    t = _terminal_exists(p, decisions_fd, expiry_fd, reqid)
+    if t == "degraded":
+        return True                                # a degraded reqid is left for the operator; do not re-decide
+    if t:
+        return True
+    try:
+        _publish_decision(p, decisions_fd, reqid, "rejected", reason, owner_uid=_owner_of_inbox(p, reqid),
+                          op=op, host=host, port=port)
+    except R.EgressReqError:
+        return False
+    return True
+
+
+def _owner_of_inbox(p, reqid):
+    """Owner from the mutable inbox -- used ONLY for a REJECTION (which opens no sink). An applied decision
+    reads the owner from the frozen SNAPSHOT (arch §4 snapshot authority)."""
+    pfd = p.opendir(L.NS_PENDING)
+    try:
+        return R.read_owner_uid(pfd, reqid, expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+    except (R.EgressReqError, OSError):
+        return None
+    finally:
+        os.close(pfd)
+
+
+def _owner_of_snapshot(p, batch_id, reqid):
+    """Owner from the immutable frozen copy (authoritative for an APPLIED decision)."""
+    bfd = p.opendir(L.NS_BATCHES)
+    try:
+        return R.read_snapshot_request(bfd, batch_id, reqid, expect_uid=p.root_uid)["owner_uid"]
+    except (R.EgressReqError, OSError):
+        return None
+    finally:
+        os.close(bfd)
+
+
+# ---- claim-lease renewal thread (across the unbounded YES pause) ---------------------------------
+def _start_renewal(p, batch_id, digest, reqids):
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(LEASE_RENEW):
+            try:
+                cfd = p.opendir(L.NS_CLAIMS)
+                try:
+                    for r in reqids:
+                        R.renew_lease(cfd, r, batch_id, digest, int(time.time()) + LEASE_TTL, p.group_gid)
+                finally:
+                    os.close(cfd)
+            except Exception:      # noqa: BLE001 -- best-effort; the ROOT SESSION LOCK is the real guarantee
+                pass
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return stop, t
+
+
+def _claim_live(p, batch_id, digest, reqids):
+    """True iff the batch is still ours: the root-private batch dir is present AND every reqid's published
+    lease is a VALID (non-suspect) lease bound to our batch_id AND digest. A SUSPECT / missing / mismatched
+    lease -> not live (a suspect claim must fail closed, never read as ours)."""
+    bfd = p.opendir(L.NS_BATCHES)
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        if not _fd_lexists(bfd, batch_id):
+            return False
+        for r in reqids:
+            st, lease = R.lease_status(cfd, r, int(time.time()), expect_root_uid=p.root_uid, expect_svc_gid=p.svc_gid)
+            if st not in (R.LEASE_FRESH, R.LEASE_STALE) or lease is None:
+                return False
+            if lease.get("batch_id") != batch_id or lease.get("digest") != digest:
+                return False
+        return True
+    finally:
+        os.close(bfd)
+        os.close(cfd)
+
+
+# ---- commit transaction (unchanged shape from v1) -----------------------------------------------
+def _commit(p, new_fleet_b, new_conf, params, prior_fleet, prior_conf, fmode, cmode):
+    try:
+        _atomic_install(p.fleet, new_fleet_b, fmode)
+        _atomic_install(p.squid_conf, new_conf, cmode)
+        rc = subprocess.run(list(p.restart), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120).returncode
+        if rc == 0 and _health_ok(params.proxy_ip):
+            return True
+    except BaseException:
+        pass
+    try:
+        _restore(p.fleet, prior_fleet, fmode)
+        _restore(p.squid_conf, prior_conf, cmode)
+        rrc = subprocess.run(list(p.restart), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120).returncode
+        if rrc != 0 or not _health_ok(params.proxy_ip):
+            raise ApplyDegraded("rollback restart/health failed")
+        return False
+    except ApplyDegraded:
+        raise
+    except BaseException as e:
+        raise ApplyDegraded("rollback error: %r" % e)
+
+
+def _reconcile_squid(p):
+    """Render squid.conf from ONE fleet snapshot, INSTALL, RESTART, HEALTH-check UNCONDITIONALLY (a matching
+    on-disk hash does NOT prove the running squid reloaded). Returns (healthy, active_hosts, fleet_hash,
+    conf_hash) ALL from the SAME snapshot -- conf_hash is the rendered squid.conf hash, so recovery can bind
+    a journal's completion to the EXACT resulting state. Fail-closed to
+    (False, set(), None, None) on any error."""
+    try:
+        fbytes, fleet = _fleet_snapshot(p)
+        fhash = _hash(fbytes)
+        active = {e["host"] for e in (fleet.get("splice_allowlist") or [])}
+        params, facts = _render_params(p)
+        want = M.render_squid(M.load_model(fleet), params, facts)
+        conf_hash = _hash(want)
+        good, _err = _squid_parse(p, want)
+        if not good:
+            return (False, active, fhash, conf_hash)
+        cur = _prior(p.squid_conf)
+        if not cur[0] or _hash(cur[1]) != _hash(want):
+            _atomic_install(p.squid_conf, want, cur[2] if cur[0] else 0o644)
+        rc = subprocess.run(list(p.restart), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120).returncode
+    except BaseException:
+        return (False, set(), None, None)
+    return (rc == 0 and _health_ok(params.proxy_ip), active, fhash, conf_hash)
+
+
+# ---- commit journal (root-private) ---------------------------------------------------------------
+_JOURNAL_FIELDS = frozenset(("batch_id", "digest", "entries", "after_fleet_hash", "after_conf_hash", "ts"))
+
+
+def _valid_journal(j, batch_id):
+    """Return (entries, digest, after_conf_hash, after_fleet_hash), or None. EXACT key set + a 16-hex batch_id
+    + 64-hex digest/after_fleet_hash/after_conf_hash + a well-typed, port-ranged entries list, so a journal
+    describes exactly one batch AND a well-typed resulting state (recovery binds completion to both hashes)."""
+    if not isinstance(j, dict) or set(j) != _JOURNAL_FIELDS:
+        return None
+    digest, after_conf, after_fleet = j.get("digest"), j.get("after_conf_hash"), j.get("after_fleet_hash")
+    if (j.get("batch_id") != batch_id or not (isinstance(batch_id, str) and _BATCH_RE.match(batch_id))
+            or not (isinstance(digest, str) and _HEX64.match(digest))
+            or not (isinstance(after_conf, str) and _HEX64.match(after_conf))
+            or not (isinstance(after_fleet, str) and _HEX64.match(after_fleet))
+            or not isinstance(j.get("ts"), int) or isinstance(j.get("ts"), bool)):
+        return None
+    entries = j.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    out = []
+    for e in entries:
+        if (not isinstance(e, list) or len(e) != 4 or e[0] not in ("add-splice", "remove-splice")
+                or not isinstance(e[1], str) or not isinstance(e[2], int) or isinstance(e[2], bool)
+                or not (0 < e[2] < 65536)
+                or not isinstance(e[3], str) or not _REQID_RE.match(e[3])):
+            return None
+        out.append((e[0], e[1], e[2], e[3]))
+    return (out, digest, after_conf, after_fleet)
+
+
+def _write_journal(p, batch_id, digest, apply_reqids, after_fleet_hash, after_conf_hash):
+    jfd = p.opendir(L.NS_JOURNALS)
+    try:
+        blob = json.dumps({"batch_id": batch_id, "digest": digest,
+                           "entries": [list(e) for e in apply_reqids],
+                           "after_fleet_hash": after_fleet_hash, "after_conf_hash": after_conf_hash,
+                           "ts": int(time.time())}, separators=(",", ":")).encode("ascii")
+        R._atomic_publish(jfd, batch_id, blob, mode=L.PRIVATE_FILE_MODE)   # root-private 0600
+    finally:
+        os.close(jfd)
+
+
+def _clear_journal(p, batch_id):
+    jfd = p.opendir(L.NS_JOURNALS)
+    try:
+        R._unlink_quiet(jfd, batch_id)
+    finally:
+        os.close(jfd)
+
+
+def _release_batch(p, batch_id, reqids):
+    bfd = p.opendir(L.NS_BATCHES)
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        R.release_batch(batch_id, reqids, bfd, cfd)
+    finally:
+        os.close(bfd)
+        os.close(cfd)
+
+
+def _remove_leases(p, reqids):
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        for r in reqids:
+            R._unlink_quiet(cfd, r)
+    finally:
+        os.close(cfd)
+
+
+# ---- two-phase recovery (arch §4; held under session + data lock) --------------------------------
+def _recover(p):
+    """Two-phase recovery. Returns the count of RETAINED / UNRESOLVED items; cmd_apply/cmd_gc MUST abort new
+    work while >0. (a) finish-or-retain JOURNALED batches (state-specific completion); (b) release every
+    NON-JOURNALED batch (provably abandoned under the session lock) + its leases; then sweep orphan leases
+    whose batch is gone. A SUSPECT (malformed/wrongly-owned/mis-moded) claim is NOT touched and is counted as
+    a retained fault, so it surfaces + gates rather than silently permitting new work."""
+    bfd = p.opendir(L.NS_BATCHES)
+    jfd = p.opendir(L.NS_JOURNALS)
+    try:
+        raw_b, raw_j = R.list_names(bfd), R.list_names(jfd)
+        batches = set(n for n in raw_b if _BATCH_RE.match(n))
+        journaled = set(n for n in raw_j if _BATCH_RE.match(n))
+        # a non-batch-id name in the ROOT-ONLY private zone is unexpected (corruption / tamper of a root
+        # namespace) -> surface it as a fault so recovery does not silently treat the store as clean
+        anomalous = sum(1 for n in raw_b + raw_j if not _BATCH_RE.match(n))
+    finally:
+        os.close(bfd)
+        os.close(jfd)
+    retained = _recover_journals(p, journaled) + anomalous
+    # (b) non-journaled batches are abandoned (no live approve: we hold the session lock) -> release
+    bfd = p.opendir(L.NS_BATCHES)
+    try:
+        for bid in batches - journaled:
+            try:
+                reqids = R.read_manifest(bfd, bid, expect_uid=p.root_uid)["reqids"]
+            except (R.EgressReqError, OSError):
+                reqids = []
+            _release_batch(p, bid, reqids)
+    finally:
+        os.close(bfd)
+    # re-list batches + journals AFTER recovery mutations so orphan-lease cleanup converges THIS pass (not the
+    # next), then: orphan leases whose batch AND journal are both gone -> drop; a SUSPECT claim -> retained fault.
+    bfd = p.opendir(L.NS_BATCHES)
+    jfd = p.opendir(L.NS_JOURNALS)
+    try:
+        cur_batches = set(n for n in R.list_names(bfd) if _BATCH_RE.match(n))
+        cur_journaled = set(n for n in R.list_names(jfd) if _BATCH_RE.match(n))
+    finally:
+        os.close(bfd)
+        os.close(jfd)
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        for reqid in R.list_names(cfd):
+            if not _REQID_RE.match(reqid):
+                R._unlink_quiet(cfd, reqid)
+                continue
+            st, lease = R.lease_status(cfd, reqid, int(time.time()), expect_root_uid=p.root_uid, expect_svc_gid=p.svc_gid)
+            if st == R.LEASE_SUSPECT:
+                retained += 1                              # fail closed: surface + gate, never touch blindly
+                continue
+            bid = lease.get("batch_id") if isinstance(lease, dict) else None
+            if bid and bid not in cur_batches and bid not in cur_journaled:
+                R._unlink_quiet(cfd, reqid)
+    finally:
+        os.close(cfd)
+    return retained
+
+
+def _any_terminal(p, dfd, efd, reqids):
+    """True if ANY of `reqids` already has a published or expiry terminal (or a malformed one -> fail closed).
+    A not-committed batch may be released ONLY when it has NO terminal at all -- a rival/applied/rejected/
+    malformed terminal means inconsistent durable state that must be RETAINED, never erased."""
+    for reqid in reqids:
+        try:
+            if _read_exp(p, efd, reqid) is not None or _read_pub(p, dfd, reqid) is not None:
+                return True
+        except (R.EgressReqError, OSError):
+            return True                                 # malformed / symlinked / unreadable terminal -> fail closed
+    return False
+
+
+def _authenticate_batch(p, bid, journal_digest):
+    """Authenticate a journaled batch against its root-private MANIFEST + frozen SNAPSHOT, and DERIVE the
+    recovery entries ENTIRELY from the snapshot (arch snapshot authority). Returns a list of
+    (op, canon_host, port, reqid, owner_uid) or None on ANY inconsistency (caller RETAINS as a hard fault):
+      * the manifest must read + its digest must equal the journal digest;
+      * every manifest reqid must have a frozen request; recompute _digest(bid, manifest.policy, frozen bytes)
+        and require it to equal the journal digest (proves the snapshot is intact + is what was committed);
+      * op/host/port/owner come from the FROZEN requests, never the journal."""
+    bfd = p.opendir(L.NS_BATCHES)
+    try:
+        try:
+            man = R.read_manifest(bfd, bid, expect_uid=p.root_uid)
+        except (R.EgressReqError, OSError):
+            return None
+        if man.get("digest") != journal_digest:
+            return None
+        reqids, policy = man["reqids"], man["policy"]
+        pairs, entries = [], []
+        for reqid in reqids:
+            try:
+                req = R.read_snapshot_request(bfd, bid, reqid, expect_uid=p.root_uid)
+            except (R.EgressReqError, OSError):
+                return None
+            pairs.append((reqid, json.dumps(req, separators=(",", ":"), sort_keys=True)))
+            host, _why = M.canon_fqdn(req["host"])
+            if host is None:
+                return None
+            entries.append((req["op"], host, req["port"], reqid, req["owner_uid"]))
+        if R._digest(bid, policy, pairs) != journal_digest:
+            return None                                 # snapshot does not recompute to the committed digest
+        return entries
+    finally:
+        os.close(bfd)
+
+
+def _recover_journals(p, journaled):
+    """Finish-or-retain each JOURNALED commit batch. STATE-SPECIFIC completion (arch §4): reconcile squid to
+    the CURRENT fleet, then per journal --
+      * squid unhealthy / fleet moved -> RETAIN.
+      * a rival expiry/rejected terminal for a journal reqid -> CONFLICT -> hard-degraded (RETAIN, surface).
+      * ALL entries reflected in the fleet (add->active, remove->absent) -> the sink IS open -> finish the
+        missing published `applied` decisions (bound to {reqid,batch,digest,after_hash}); on any decision-
+        write failure RETAIN; only when all durable: remove leases -> drop journal -> remove batch.
+      * NO entry reflected -> not committed -> release (leases+batch), drop journal.
+      * MIXED -> RETAIN (corruption)."""
+    if not journaled:
+        return 0
+    healthy, active, fhash, cur_conf_hash = _reconcile_squid(p)
+    stable = fhash is not None
+    if stable:
+        try:
+            stable = os.path.exists(p.fleet) and _hash(_read_bytes(p.fleet)) == fhash
+        except OSError:
+            stable = False
+    retained = 0
+    dfd = p.opendir(L.NS_DECISIONS)
+    efd = p.opendir(L.NS_EXPIRY)
+    jfd = p.opendir(L.NS_JOURNALS)
+    try:
+        for bid in journaled:
+            try:
+                jv = _valid_journal(json.loads(_fd_read(jfd, bid).decode("ascii")), bid)
+            except (OSError, ValueError, UnicodeDecodeError):
+                jv = None
+            if jv is None:
+                # a malformed journal with a live batch -> retain (fail closed); an orphan journal -> drop
+                if _batch_present(p, bid):
+                    retained += 1
+                else:
+                    R._unlink_quiet(jfd, bid)
+                continue
+            _entries, digest, after_conf, after_fleet = jv
+            # AUTHENTICATE the batch + DERIVE the recovery semantics ENTIRELY from the frozen SNAPSHOT (arch
+            # snapshot authority): the journal is only trusted for its digest + resulting-state hashes. A
+            # journal whose digest disagrees with the manifest, or whose snapshot does not recompute to that
+            # digest, is a hard fault -- so a well-formed journal naming a host/reqid the snapshot never froze
+            # can never drive an applied decision.
+            entries = _authenticate_batch(p, bid, digest)
+            if entries is None:
+                if _batch_present(p, bid):
+                    retained += 1                       # inconsistent journal/manifest/snapshot -> hard fault
+                else:
+                    R._unlink_quiet(jfd, bid)           # orphan journal, batch gone -> drop
+                continue
+            reqids = [e[3] for e in entries]
+            if not healthy or not stable:
+                retained += 1
+                continue
+            # COMPLETION requires BOTH the exact resulting-state hashes (the current fleet is EXACTLY the fleet
+            # the journal committed AND renders to its squid.conf) AND that EVERY snapshot-derived entry is
+            # actually reflected in the live fleet (add->active, remove->absent). A hash match alone is
+            # insufficient: a journal whose result hashes describe the PRE-commit fleet would otherwise complete
+            # an operation the fleet does not reflect. Then finish each SNAPSHOT-derived entry (publishes OUR
+            # exact applied even under a rival; a rival/foreign terminal -> degraded conflict -> RETAIN). A
+            # journal the fleet reflects NONE of -> not committed -> release. Anything else -> retain.
+            reflected = [(e[0] == "add-splice") == (e[1] in active) for e in entries]
+            hashes_match = (cur_conf_hash is not None and cur_conf_hash == after_conf
+                            and fhash is not None and fhash == after_fleet)
+            if hashes_match:
+                if not all(reflected):
+                    retained += 1                       # after-hashes match but the ops are NOT reflected -> a
+                    continue                            # self-inconsistent/forged journal -> surface (retain)
+                lost, conflict = 0, []
+                for op, host, port, reqid, owner in entries:
+                    res = _finish_applied(p, dfd, efd, reqid, owner, op, host, port, bid, digest, after_conf)
+                    if res == "conflict":
+                        conflict.append(reqid)
+                    elif res == "lost":
+                        lost += 1
+                if conflict or lost:
+                    retained += 1
+                    continue
+                _remove_leases(p, reqids)
+                R._unlink_quiet(jfd, bid)
+                _release_batch(p, bid, reqids)          # leases already gone; drops the batch dir
+            elif not any(reflected) and not _any_terminal(p, dfd, efd, reqids):
+                _release_batch(p, bid, reqids)          # committed NOTHING + NO terminal -> release; rerun re-applies
+                R._unlink_quiet(jfd, bid)
+            else:
+                # partial reflect / drift, OR a rival/applied/rejected/malformed terminal exists on a
+                # not-committed batch -> inconsistent durable state -> RETAIN (surface), never erase evidence
+                retained += 1
+    finally:
+        os.close(dfd)
+        os.close(efd)
+        os.close(jfd)
+    return retained
+
+
+def _batch_present(p, bid):
+    bfd = p.opendir(L.NS_BATCHES)
+    try:
+        return _fd_lexists(bfd, bid)
+    finally:
+        os.close(bfd)
+
+
+# ---- commands ------------------------------------------------------------------------------------
+def cmd_list(p):
+    model = M.load_model(_load_fleet(p))
+    print("ACTIVE splice destinations:")
+    for h, port in model.splices:
+        print("  %s:%d" % (h, port))
+    print("PENDING requests:")
+    st = p.status()
+    if st == L.ABSENT:
+        print("  (egress store not initialized -- no pending requests)")
+        return 0
+    pfd = p.opendir(L.NS_PENDING)
+    dfd = p.opendir(L.NS_DECISIONS)
+    efd = p.opendir(L.NS_EXPIRY)
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        for n in _pending_names(p):
+            try:
+                r = R.read_request(pfd, n, expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+            except (R.EgressReqError, OSError):
+                print("  <malformed pending entry %s>" % n)
+                continue
+            try:
+                decided = bool(R.read_terminal(dfd, efd, n, root_uid=p.root_uid, svc_uid=p.svc_uid, svc_gid=p.svc_gid))
+            except R.EgressReqError:
+                decided = True
+            state = "decided" if decided else ("under-review" if _fd_lexists(cfd, n) else "pending")
+            print("  %-14s %-40s uid=%d reqid=%s [%s]"
+                  % (r["op"], "%s:%d" % (r["host"], r["port"]), r["owner_uid"], r["reqid"], state))
+    finally:
+        os.close(pfd)
+        os.close(dfd)
+        os.close(efd)
+        os.close(cfd)
+    return 0
+
+
+def cmd_reject(p, reqid, reason):
+    if not _REQID_RE.match(reqid):
+        print("reject: REQID must be 32 hex chars")
+        return 2
+    if not _REASON_RE.match(reason) or reason in ("applied", "already-active", "already-absent", "expired"):
+        print("reject --reason must be operator-declined or a lowercase validation code")
+        return 2
+    if p.status() == L.ABSENT:
+        print("egress store not initialized -- no such request")
+        return 2
+    slfd = _open_lock(p.session_lock)
+    _flock(slfd)
+    lockfd = _open_lock(p.lock)
+    _flock(lockfd)
+    dfd = p.opendir(L.NS_DECISIONS)
+    efd = p.opendir(L.NS_EXPIRY)
+    cfd = p.opendir(L.NS_CLAIMS)
+    try:
+        t = _terminal_exists(p, dfd, efd, reqid)
+        if t == "degraded":
+            print("already decided (degraded): %s" % reqid)
+            return 1
+        if t:
+            print("already decided: %s" % reqid)
+            return 1
+        if _fd_lexists(cfd, reqid):
+            print("cannot reject %s: it is CLAIMED (under review) -- resolve it via the running apply" % reqid)
+            return 3
+        pfd = p.opendir(L.NS_PENDING)
+        try:
+            req = R.read_request(pfd, reqid, expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+        except (R.EgressReqError, OSError):
+            req = {}
+        finally:
+            os.close(pfd)
+        if _reject_from_inbox(p, dfd, efd, reqid, reason,
+                              op=req.get("op"), host=req.get("host"), port=req.get("port")):
+            print("REJECTED %s (%s)" % (reqid, reason))
+            return 0
+        print("reject failed to record a durable decision")
+        return 3
+    finally:
+        os.close(dfd)
+        os.close(efd)
+        os.close(cfd)
+        os.close(lockfd)
+        os.close(slfd)
+
+
+def cmd_gc(p):
+    """Root-side retention GC of published/decisions (pending-aware). Runs recovery first (abort if any
+    journaled batch is unresolved). Operator- or root-cron-invoked; no root daemon."""
+    if p.status() == L.ABSENT:
+        print("egress store not initialized -- nothing to GC")
+        return 0
+    retention = int(os.environ.get("DR_VPS_EGRESS_RETENTION_S", "0") or "0")   # 0 -> no age GC (recovery only)
+    slfd = _open_lock(p.session_lock)
+    _flock(slfd)
+    lockfd = _open_lock(p.lock)
+    _flock(lockfd)
+    try:
+        if _recover(p):
+            print("egress recovery incomplete -- reconcile squid health / decision durability, then re-run")
+            return 4
+        removed = 0
+        if retention > 0:
+            dfd = p.opendir(L.NS_DECISIONS)
+            efd = p.opendir(L.NS_EXPIRY)
+            pfd = p.opendir(L.NS_PENDING)
+            try:
+                removed = R.gc_published_decisions(dfd, efd, pfd, retention, int(time.time()),
+                                                   expect_root_uid=p.root_uid, expect_svc_gid=p.svc_gid)
+            finally:
+                os.close(dfd)
+                os.close(efd)
+                os.close(pfd)
+        print("gc: recovered clean; removed %d retention-expired decision(s)" % removed)
+        return 0
+    finally:
+        os.close(lockfd)
+        os.close(slfd)
+
+
+def cmd_apply(p, selected):
+    if p.status() == L.ABSENT:
+        print("egress store not initialized -- no pending requests")
+        return 0
+    slfd = _open_lock(p.session_lock)                # ROOT SESSION lock: held for the WHOLE command
+    _flock(slfd)
+    lockfd = _open_lock(p.lock)                      # DATA lock: released during the YES pause
+    _flock(lockfd)
+    dfd = p.opendir(L.NS_DECISIONS)
+    efd = p.opendir(L.NS_EXPIRY)
+    try:
+        if _recover(p):
+            print("egress recovery incomplete -- reconcile squid health / decision durability, then re-run")
+            return 4
+        names = _pending_names(p)
+        if selected:
+            missing = [r for r in selected if r not in names]
+            if missing:
+                print("selected reqid(s) not pending: %s -- aborting (no partial apply)" % ", ".join(missing))
+                return 3
+            names = [r for r in names if r in selected]
+
+        # PRE-SCAN under the lock: skip already-decided; durably reject malformed BEFORE the snapshot.
+        pfd = p.opendir(L.NS_PENDING)
+        cfd = p.opendir(L.NS_CLAIMS)
+        valid, undurable = [], 0
+        try:
+            for n in names:
+                if not _REQID_RE.match(n):
+                    continue                          # a non-reqid pending name: the drvps reaper quarantines it
+                t = _terminal_exists(p, dfd, efd, n)
+                if t:
+                    continue                          # already decided (or degraded) -> the reaper clears pending
+                if _fd_lexists(cfd, n):
+                    continue                          # already leased by a concurrent batch (shouldn't happen under lock)
+                try:
+                    req = R.read_request(pfd, n, expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+                except (R.EgressReqError, OSError):
+                    if not _reject_from_inbox(p, dfd, efd, n, "malformed-storage"):
+                        undurable += 1
+                    continue
+                valid.append((n, req))
+        finally:
+            os.close(pfd)
+            os.close(cfd)
+
+        fbytes, fleet = _fleet_snapshot(p)
+        policy = _hash(fbytes)                       # the policy/fleet version bound into the batch digest
+        active = {e["host"] for e in (fleet.get("splice_allowlist") or [])}
+        byhost, conflicts = {}, set()
+        for reqid, req in valid:
+            host, why = M.canon_fqdn(req["host"])
+            if host is None:
+                undurable += 0 if _reject_from_inbox(p, dfd, efd, reqid, why,
+                                                     op=req.get("op"), host=req.get("host"), port=req.get("port")) else 1
+                continue
+            if req["port"] != 443:
+                undurable += 0 if _reject_from_inbox(p, dfd, efd, reqid, "bad-port",
+                                                     op=req["op"], host=host, port=req["port"]) else 1
+                continue
+            entry = byhost.setdefault(host, [req["op"], []])
+            if entry[0] != req["op"]:
+                conflicts.add(host)
+            entry[1].append(reqid)
+        if conflicts:
+            print("CONFLICT (add+remove in one batch) for: %s -- aborting; resolve first"
+                  % ", ".join(sorted(conflicts)))
+            return 3
+
+        ops, apply_reqids = [], []
+        for host in sorted(byhost):
+            op, reqids = byhost[host]
+            if op == "add-splice" and host in active:
+                for r in reqids:
+                    undurable += 0 if _reject_from_inbox(p, dfd, efd, r, "already-active",
+                                                         op=op, host=host, port=443) else 1
+                continue
+            if op == "remove-splice" and host not in active:
+                for r in reqids:
+                    undurable += 0 if _reject_from_inbox(p, dfd, efd, r, "already-absent",
+                                                         op=op, host=host, port=443) else 1
+                continue
+            ops.append((op, host, 443))
+            apply_reqids += [(op, host, 443, r) for r in reqids]
+
+        if not ops:
+            print("nothing to open (%d resolved without a change)%s"
+                  % (len(valid), "" if not undurable else "; %d undurable -- rerun" % undurable))
+            return 1 if not undurable else 3
+
+        # SNAPSHOT the actionable reqids into an immutable root-private batch + publish claim leases.
+        claimed_reqids = [r for (_o, _h, _p, r) in apply_reqids]
+        batch_id = R.new_batch_id()
+        claim_ts = int(time.time())
+        journal_retained = [False]
+        pdfd = p.opendir(L.NS_PENDING)
+        bfd = p.opendir(L.NS_BATCHES)
+        cfd = p.opendir(L.NS_CLAIMS)
+        try:
+            try:
+                _bid, digest = R.snapshot_batch(claimed_reqids, pdfd, bfd, cfd, batch_id, claim_ts,
+                                                claim_ts + LEASE_TTL, p.group_gid, policy=policy,
+                                                expect_uid=p.svc_uid, expect_gid=p.svc_gid)
+            except R.EgressReqError as e:
+                print("snapshot failed: %s" % e.reason)
+                return 3
+        finally:
+            os.close(pdfd)
+            os.close(bfd)
+            os.close(cfd)
+        try:
+            # AUTHORITATIVE ops re-derived from the SNAPSHOT (arch §4: no second read of the mutable inbox).
+            try:
+                snap_ops, snap_apply = _ops_from_snapshot(p, batch_id, claimed_reqids)
+            except R.EgressReqError as e:
+                print("snapshot re-derivation failed: %s -- aborting" % e.reason)
+                return 3
+            new_fleet = _apply_ops(fleet, snap_ops)
+            M.load_model(new_fleet)
+            max_active = DEFAULT_MAX_ACTIVE
+            _eg = fleet.get("egress")
+            if isinstance(_eg, dict) and isinstance(_eg.get("max_active"), int) and not isinstance(_eg.get("max_active"), bool):
+                max_active = _eg["max_active"]
+            if len(new_fleet.get("splice_allowlist", [])) > max_active:
+                print("REFUSED: batch would make %d active splice destinations (max_active=%d) -- reject or "
+                      "remove some first" % (len(new_fleet["splice_allowlist"]), max_active))
+                return 3
+            params, facts = _render_params(p)
+            new_conf = M.render_squid(M.load_model(new_fleet), params, facts)
+            good, err = _squid_parse(p, new_conf)
+            if not good:
+                print("REFUSED: generated squid.conf failed `squid -k parse`:\n" + err)
+                return 3
+            prior_fleet, prior_conf = _prior(p.fleet), _prior(p.squid_conf)
+            prior_params, prior_hostfacts = _prior(p.params), _prior(p.hostfacts)   # render inputs -> drift-checked
+            fmode, cmode = prior_fleet[2], prior_conf[2] if prior_conf[0] else 0o644
+            new_fleet_b = (json.dumps(new_fleet, indent=2) + "\n").encode("ascii")
+            after_conf_hash = _hash(new_conf)
+
+            print("=== DRY-RUN (snapshot batch %s) -- opens NOTHING until you confirm ===" % batch_id[:8])
+            for op, host, port in snap_ops:
+                print("  %-14s %s:%d" % (op, host, port))
+            print("--- resulting splice_allowlist: %s" % ", ".join(e["host"] for e in new_fleet["splice_allowlist"]))
+            print("--- new squid.conf sha256: %s (squid -k parse: OK)" % after_conf_hash[:16])
+
+            # RELEASE the data lock across the human confirmation (the immutable snapshot + leases protect the
+            # batch; the session lock stays held). Renew the leases throughout the pause; reacquire + revalidate.
+            sys.stdout.write("Type YES to open these sinks: ")
+            sys.stdout.flush()
+            stop, rt = _start_renewal(p, batch_id, digest, claimed_reqids)
+            fcntl.flock(lockfd, fcntl.LOCK_UN)
+            try:
+                answer = sys.stdin.readline().strip()
+            finally:
+                stop.set()
+                rt.join()                                 # WAIT for renewal to fully stop before ANY cleanup
+                fcntl.flock(lockfd, fcntl.LOCK_EX)         # (no timeout -> no lease recreate)
+            if answer != "YES":
+                print("aborted (no change; requests remain pending)")
+                return 1
+            if not _claim_live(p, batch_id, digest, claimed_reqids):
+                print("ABORT: the snapshot batch was released (recovery) -- re-run")
+                return 3
+            for _o2, _h2, _p2, _r2 in snap_apply:
+                if _terminal_exists(p, dfd, efd, _r2):
+                    print("ABORT: %s was decided during the confirmation pause -- re-run" % _r2)
+                    return 3
+            # re-verify EVERY render input under the lock -- fleet, squid.conf, AND the render params/hostfacts
+            # (a drift in any changes the resulting squid.conf)
+            if (_drifted(p.fleet, prior_fleet) or _drifted(p.squid_conf, prior_conf)
+                    or _drifted(p.params, prior_params) or _drifted(p.hostfacts, prior_hostfacts)):
+                print("ABORT: a render input (fleet/squid.conf/params/hostfacts) changed under the lock -- re-run")
+                return 3
+
+            # JOURNAL before opening anything (crash-recovery anchor; bound to batch_id + digest + after hash)
+            _write_journal(p, batch_id, digest, snap_apply, _hash(new_fleet_b), after_conf_hash)
+            journal_retained[0] = True
+            try:
+                healthy = _commit(p, new_fleet_b, new_conf, params, prior_fleet, prior_conf, fmode, cmode)
+            except ApplyDegraded as e:
+                print("DEGRADED: apply failed AND rollback failed (%s) -- reconcile squid manually" % e)
+                return 4
+            if not healthy:
+                _clear_journal(p, batch_id)
+                journal_retained[0] = False
+                print("FAILED: squid restart/health check failed -- rolled back, nothing opened")
+                return 3
+
+            # applied: publish OUR decision (the sink IS open -- arch: never skip it because a rival appeared),
+            # then remove leases, then journal, then batch (arch §7). A rival expiry/rejected/foreign decision
+            # is a hard-degraded CONFLICT -> RETAIN journal+batch+leases (journal_retained stays True), surface;
+            # never count it as completion.
+            lost, conflict = 0, []
+            for op, host, port, reqid in snap_apply:
+                owner = _owner_of_snapshot(p, batch_id, reqid)
+                if owner is None:
+                    lost += 1                             # frozen copy unreadable -> retain (no weak attribution)
+                    continue
+                res = _finish_applied(p, dfd, efd, reqid, owner, op, host, port, batch_id, digest, after_conf_hash)
+                if res == "conflict":
+                    conflict.append(reqid)
+                elif res == "lost":
+                    lost += 1
+            if conflict:
+                print("APPLIED (%d change(s)) but a RIVAL/foreign terminal exists for %d reqid(s) -- "
+                      "hard-degraded; retained for recovery, reconcile" % (len(snap_ops), len(conflict)))
+                return 4
+            if lost:
+                print("APPLIED (%d change(s)) but %d decision(s) not durable -- rerun to reconcile" % (len(snap_ops), lost))
+                return 3
+            _remove_leases(p, claimed_reqids)             # arch §7: decisions -> leases -> journal -> batch
+            _clear_journal(p, batch_id)
+            journal_retained[0] = False
+            print("APPLIED (%d change(s); squid restarted + healthy)" % len(snap_ops))
+            return 0
+        finally:
+            if not journal_retained[0]:
+                _release_batch(p, batch_id, claimed_reqids)   # drops leases (gone on success) + the batch dir
+    finally:
+        os.close(dfd)
+        os.close(efd)
+        os.close(lockfd)
+        os.close(slfd)
+
+
+def _ops_from_snapshot(p, batch_id, reqids):
+    """Re-derive (ops, apply_reqids) from the immutable SNAPSHOT (not the mutable inbox), grouping by canon
+    host. The frozen bytes were schema-validated at snapshot time, so this is the authoritative op set (arch
+    §4 snapshot authority). Uses the FROZEN port (not a hardcoded 443) and fails closed
+    on a same-host add/remove conflict among the frozen requests (defense-in-depth vs the pre-snapshot check)."""
+    bfd = p.opendir(L.NS_BATCHES)
+    byhost = {}
+    try:
+        for reqid in reqids:
+            req = R.read_snapshot_request(bfd, batch_id, reqid, expect_uid=p.root_uid)
+            host, _why = M.canon_fqdn(req["host"])
+            if host is None:
+                raise R.EgressReqError("snapshot-bad-host", reqid)
+            slot = byhost.setdefault(host, [req["op"], req["port"], []])
+            if slot[0] != req["op"] or slot[1] != req["port"]:
+                raise R.EgressReqError("snapshot-conflict", host)   # add+remove or port mismatch on one host
+            slot[2].append(reqid)
+    finally:
+        os.close(bfd)
+    ops, apply_reqids = [], []
+    for host in sorted(byhost):
+        op, port, rs = byhost[host]
+        ops.append((op, host, port))
+        apply_reqids += [(op, host, port, r) for r in rs]
+    return ops, apply_reqids
+
+
+def _dispatch(p, argv):
+    if argv[0] == "list":
+        return cmd_list(p)
+    if argv[0] == "apply":
+        return cmd_apply(p, argv[1:])
+    if argv[0] == "gc":
+        return cmd_gc(p)
+    if argv[0] == "reject":
+        if len(argv) != 4 or argv[2] != "--reason":
+            print("usage: reject REQID --reason R")
+            return 2
+        return cmd_reject(p, argv[1], argv[3])
+    print("unknown command: %s" % argv[0])
+    return 2
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: drvps-egress-approve list | apply [REQID...] | reject REQID --reason R | gc")
+        return 2
+    try:
+        p = Paths()                              # FIXED production paths -- no runtime seam
+    except KeyError as e:
+        print("egress: service user/group not found (%s) -- is drvps installed?" % e)
+        return 5
+    try:
+        return _dispatch(p, argv)
+    except L.LayoutError as e:
+        print("egress store is DAMAGED (%s) -- refusing; inspect %s before retrying." % (e, p.base))
+        return 5
+    except R.EgressReqError as e:
+        if e.reason == "namespace-overflow":
+            print("egress store namespace is over the safety cap (%s) -- refusing; the store is corrupt or "
+                  "under attack. Inspect %s before retrying." % (str(e), p.base))
+            return 5
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

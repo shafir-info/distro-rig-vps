@@ -54,9 +54,40 @@ _dr_vps_console_reap() {
   fi
 }
 
+# Egress-splice request maintenance (egress-splice task 1.6): under the egress global lock, EXPIRE
+# un-approved past-TTL requests (self-attributing `expired` terminal so the member learns it via
+# `rigctl egress status`), suppress expiry on leased/under-review reqids (surfacing malformed/stale root
+# claims as faults), clear decided pending, and retention-GC old expiry terminals. Runs only if the egress
+# store exists (feature in use). Bounded by
+# DR_VPS_EGRESS_TTL_MIN (request TTL) + DR_VPS_EGRESS_RETENTION_MIN (terminal retention; MUST exceed TTL --
+# the member module GCs only when retention > ttl). Failure is non-fatal to the rest of the sweep.
+_dr_vps_egress_reap() {
+  local base="${DR_VPS_EGRESS_BASE:-/var/lib/distro-rig-vps-egress}"   # v2 FIXED root-owned anchor (= L.ANCHOR)
+  [ -e "$base" ] || return 0
+  local py; py="$(dirname "${BASH_SOURCE[0]}")/../tools/drvps_egress_member.py"
+  [ -f "$py" ] || return 0
+  local ttl=$(( ${DR_VPS_EGRESS_TTL_MIN:-4320} * 60 )) ret=$(( ${DR_VPS_EGRESS_RETENTION_MIN:-10080} * 60 ))
+  # SURFACE root-zone faults: do NOT /dev/null the output. A non-empty lease_faults
+  # (a malformed/wrongly-owned root claim) or a damaged store (status=error) is logged to the journal for the
+  # operator; a clean sweep is silent. Failure stays non-fatal to the rest of the reaper.
+  local out rc
+  out="$(python3 "$py" expire --base "$base" --ttl "$ttl" --now "$(date +%s)" --retention "$ret" 2>&1)"; rc=$?
+  # Detect a root-zone fault WITHOUT depending on jq (grep is always present): a non-empty "lease_faults"
+  # array or a non-ok status. A clean sweep is silent; a fault is logged to the journal for the operator.
+  if [ "$rc" -ne 0 ] \
+     || printf '%s' "$out" | grep -qE '"lease_faults": ?\[[^]]' \
+     || printf '%s' "$out" | grep -qE '"status": ?"(error|abort)"'; then
+    logger -t drvps-egress "egress reaper fault (rc=$rc): ${out:0:400}" 2>/dev/null \
+      || echo "drvps-egress reaper fault (rc=$rc): ${out:0:400}" >&2
+  fi
+}
+
 # One sweep: destroy every expired VM, gate-checked. Idempotent + safe to interleave.
 dr_vps_reaper_sweep() {
   local id expired
+  # Egress-splice maintenance runs FIRST + is independent of the VM store, so a VM-DB read error (early
+  # return below) never starves egress expiry/GC/claim-recovery.
+  _dr_vps_egress_reap
   # M22: 'broken' VMs ARE reaped when expired (else their overlay + defined domain leak forever);
   # the gate still guards each id, so a stale row whose live domain mismatches is refused, not destroyed.
   # Distinguish a DB read ERROR from an empty result: `|| return 0` would silently no-op the TTL
