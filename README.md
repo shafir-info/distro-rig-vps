@@ -32,8 +32,8 @@ workload where "docker is not a real machine" bites.
 
 ## Status
 The core rig, the agent control loop, the guest-exec gate, the egress fence + cache, and snapshots
-with owner-scoping are **live-validated on real KVM**; the offline suite is **741 bats tests across
-22 suites**, green. Some features ship **gated off** pending operator decisions. The authoritative
+with owner-scoping are **live-validated on real KVM**; the offline suite is **767 bats tests across
+23 suites**, green. Some features ship **gated off** pending operator decisions. The authoritative
 per-subsystem table (LIVE / seam-tested / GATED), the trust-model boundaries, and every known
 limitation live in [STATUS.md](STATUS.md) — read it before relying on a specific guarantee.
 
@@ -185,11 +185,12 @@ Every limitation, trust boundary, and deferral is maintained in **one place**:
 - **One rig = one agent trust domain.** `drvpsctl` members are not isolated from each other
   at the VM plane (owner-scoping isolates snapshots/actions; results are per-owner-ACL private by
   default, group-readable only under the legacy `DR_VPS_RESULT_PRIVATE=0` opt-out).
-- **firewalld hosts need one extra step (DR-2, open):** firewalld's REJECT outranks the rig's
-  nft ACCEPT for guest->cache traffic, so on a firewalld-active host the package cache is
-  unreachable from guests until you add two scoped rich rules + persist the bridge's zone binding
-  -- the exact commands are in docs/INSTALL-RUNBOOK.md ("firewalld hosts"). Installer automation
-  for this is an open item (TODO.md DR-2).
+- **firewalld hosts are configured automatically (DR-2):** firewalld's REJECT outranks the rig's
+  nft ACCEPT for guest->cache traffic, so on a firewalld-active host the package cache would be
+  unreachable from guests. The installer's `step_firewalld` adds the scoped rich rules + persists
+  the bridge's zone binding for you (idempotent; a no-op when firewalld is inactive). Verified by a
+  mock-seam suite; a real firewalld-host run is still pending (STATUS.md). Fallback/manual commands
+  and the one remaining open item (a real https-through-proxy self-test) are in docs/INSTALL-RUNBOOK.md.
 - **The egress fence is a test-confinement tool, not a security boundary against a host root.**
   A root re-apply timer bounds (not eliminates) the nft-flush window.
 - **SSL-bump** means the rig's squid sees guest TLS to the allowlisted mirrors (accepted for a
@@ -208,7 +209,9 @@ shellcheck -x -s bash --exclude=SC2163,SC2012 bin/dr-vps-setup
 shellcheck -x -s bash --exclude=SC2034 src/dr_vps_domain.sh
 shellcheck -x -s bash --exclude=SC2016 src/dr_vps_snapshot.sh
 shellcheck -x -s bash --exclude=SC2016 src/dr_vps_image.sh
-shellcheck -x -s bash bin/dr-vps bin/rigctl bin/drvps-* bin/make-pack.sh tools/backup.sh src/dr_vps_api.sh src/dr_vps_doctor.sh src/dr_vps_gate.sh src/dr_vps_identity.sh src/dr_vps_net.sh src/dr_vps_netgroup.sh src/dr_vps_reaper.sh src/dr_vps_remote.sh src/dr_vps_storage.sh src/dr_vps_store.sh
+shellcheck -x -s bash bin/dr-vps bin/rigctl bin/drvps-rigctl bin/drvps-rigreaper bin/drvps-rigsubmit bin/drvps-top bin/drvps-top-operator bin/drvps-top-publish bin/make-pack.sh tools/backup.sh tools/reclaim-goldens.sh src/dr_vps_api.sh src/dr_vps_doctor.sh src/dr_vps_egress.sh src/dr_vps_gate.sh src/dr_vps_identity.sh src/dr_vps_net.sh src/dr_vps_netgroup.sh src/dr_vps_reaper.sh src/dr_vps_remote.sh src/dr_vps_storage.sh src/dr_vps_store.sh
+shellcheck -x -s bash --exclude=SC2034 tools/drvps-top   # read-target field vars (bash TUI)
+# the bin/ python entry points (drvps-egress-approve, drvps-egress-migrate, drvps-skill-install) are ast-checked, not shellchecked
 ```
 (`live-fedora44.sh` runs as the service user — the `-H` matters, the VM ssh key is found via HOME;
 `live-rigctl.sh` runs as a `drvpsctl` member. See USAGE §8.)
@@ -222,14 +225,18 @@ bin/rigctl           agent-side client (socket submit + result read; no sudo/KVM
 bin/drvps-rigsubmit  the ingress-accepter launcher (socket-activated, runs as drvps)
 bin/drvps-rigctl     the watcher launcher (systemd, runs as drvps)
 bin/drvps-rigreaper  the TTL reaper (timer, runs as drvps)
+bin/drvps-top        read-only rig dashboard: member viewer / -operator (bash TUI) / -publish (unit)
+bin/drvps-egress-approve   root operator: review + YES-gated open of a splice destination
+bin/drvps-egress-migrate   operator one-shot: egress request store v1 -> v2 migration
+bin/drvps-skill-install     install the drvps agent skills pack (self-documentation)
 src/dr_vps_api.sh    the LOCKED dr_vps_* signature + seam contract
-src/dr_vps_*.sh      identity store doctor image storage net domain gate remote reaper
-src/drvps_rigctl.py  the python watcher (privilege gateway: decide() + event loop)
+src/dr_vps_*.sh      identity store doctor image storage net domain gate remote reaper egress
+src/drvps_rigctl.py  the python watcher (privilege gateway: decide() + event loop; egress dispatch)
 src/drvps_rigsubmit.py  the ingress accepter (the ONLY agent write path into the spool)
 etc/recipes/         per-distro golden recipes (family-keyed)
-etc/fleet.json       egress inventory + mirror allowlist (config)
-tests/               seamed suite (741 tests) + acceptance/ + dogfood/
-tools/               maintainer utilities (backup.sh)
+etc/fleet.json       egress inventory + mirror/splice allowlist (config)
+tests/               seamed suite (767 tests / 23 suites) + acceptance/ + dogfood/ + container e2e
+tools/               drvps-top feed/publish/view + egress model/req/member/layout + maintainer utils
 .github/workflows/   CI (offline suite + shellcheck, no KVM needed)
 docs/                runbooks, agent/orchestrator guides, concept docs, provenance
 CONCEPT*.md STATUS.md CHANGELOG.md LESSONS-LEARNED.md

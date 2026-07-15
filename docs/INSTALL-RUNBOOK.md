@@ -317,15 +317,18 @@ sudo systemctl restart drvps-rigctl.service
 ! grep -q DR_VPS_ALLOW_SECRET_RESTORE /etc/distro-rig-vps/env && systemctl is-active --quiet drvps-rigctl.service && echo "SECRET-RESTORE: DISABLED"
 ```
 
-## firewalld hosts (DR-2, open): make the cache reachable from guests
+## firewalld hosts (DR-2): handled automatically by the installer
 
 On a firewalld-active host (Fedora/RHEL default), firewalld's zone REJECT (nft prio 10) outranks
 the rig's `drvps_sim` ACCEPT (prio 0) for guest->cache traffic -- nftables runs EVERY base chain on
-a hook, and an accept in one table does not compose past a reject in another. Symptom: guest
-`dnf install` fails with "proxy connect refused"; the cache/SSL-bump path is inert.
+a hook, and an accept in one table does not compose past a reject in another. Symptom (if unhandled):
+guest `dnf install` fails with "proxy connect refused"; the cache/SSL-bump path is inert.
 
-Workaround (verified live) -- allow the guest subnet to reach ONLY the cache endpoints, and persist
-the bridge's zone binding so a firewalld reload does not drop it:
+The installer's `step_firewalld` now does this FOR YOU: when firewalld is active it adds the scoped
+rich rules + the permanent `drvps0` zone binding and reloads (idempotent; a no-op when firewalld is
+inactive). The commands below are the equivalent MANUAL fallback -- run them only if you disabled
+that step, or to adjust after a non-default `DR_VPS_BRIDGE_IP`. They allow the guest subnet to reach
+ONLY the cache endpoints and persist the bridge's zone binding so a firewalld reload does not drop it:
 
 ```
 sudo firewall-cmd --permanent --zone=libvirt --add-rich-rule='rule family="ipv4" source address="10.123.0.0/24" destination address="10.123.0.1/32" port port="3128" protocol="tcp" accept'
@@ -336,9 +339,9 @@ sudo firewall-cmd --reload
 
 Adjust the zone (`firewall-cmd --get-zone-of-interface=drvps0`) and the subnet/bridge-ip if you
 installed with a non-default `DR_VPS_BRIDGE_IP`. GOTCHA: `--reload` drops drvps0's RUNTIME
-interface->zone binding -- that is why the `--add-interface` line above must be `--permanent`.
-Installer automation for this (plus a real guest-through-proxy self-test) is tracked as TODO.md
-DR-2; until it ships, this step is manual on every firewalld host.
+interface->zone binding -- that is why the `--add-interface` line above must be `--permanent`
+(`step_firewalld` already does this). The one remaining open DR-2 item is a real
+https-through-proxy self-test probe (TODO.md DR-2); the rule installation itself is automated.
 
 ## Gotchas (why the non-obvious steps exist)
 

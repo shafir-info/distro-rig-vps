@@ -342,7 +342,7 @@ dr_vps_console_admission() {  # [id]
   return 0
 }
 
-# ---- version / build identity (TODO version-verb: agent + operator introspection) ----------------
+# ---- version / build identity (the `version` verb: agent + operator introspection) ---------------
 # Emits the static VERSION + DR_VPS_DRIVER_VERSION AND a per-build FINGERPRINT (sha256 over the running
 # src/+bin/ trees) so a single `dr-vps version` / `rigctl version` tells you EXACTLY which build is live
 # and whether the daemon matches the on-disk tree -- closes the old/new-build confusion. Pure read; no seams.

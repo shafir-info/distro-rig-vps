@@ -256,6 +256,34 @@ _dr_vps_bake_attempt() {  # <overlay> <expected> <attemptroot> <bakelog> -- <vcn
 # (offline), then -- when packages are present (network needed) -- a TRANSACTIONAL passt->slirp bake runs on
 # a FRESH overlay per attempt, promoting ONLY the successful overlay (never a partial). A CA-only bake needs
 # no egress and runs once with --no-network. Seamed (DR_VIRT_CUSTOMIZE/DR_QEMU/DR_QEMU_IMG) for unit tests.
+# Pre-bake free-disk GUARD. An unguarded bake filling DR_VPS_TMP_DIR let a CONCURRENT system rewrite of
+# /etc/hosts (NetworkManager/cloud-init/systemd truncate-then-write) hit ENOSPC and leave it EMPTY -- the
+# reported "/etc/hosts truncated in place". Refuse a bake below DR_VPS_MIN_FREE_MB (default 10 GiB: a
+# growing per-attempt overlay + a promoted flat copy). An unreadable/malformed df reading FAILS CLOSED
+# (the guard's whole point is disk-full safety) unless DR_VPS_ALLOW_UNKNOWN_FREE=1; a low reading also fails.
+_dr_vps_bake_disk_ok() {  # <dir> [min_mb]  -- refuse if <dir>'s filesystem has < min_mb free (MiB)
+  local dir="$1" min="${2:-${DR_VPS_MIN_FREE_MB:-10240}}" avail
+  case "$min" in ''|*[!0-9]*) min=10240;; esac
+  avail=$(LC_ALL=C df -P -B1M -- "$dir" 2>/dev/null | awk 'NR==2{print $4}')
+  case "$avail" in ''|*[!0-9]*)
+    # unreadable/malformed df: FAIL CLOSED (the whole point is to prevent a disk-full truncation), unless
+    # the operator explicitly opts out. Fail-open would drop the guard exactly when accounting misbehaves.
+    [ "${DR_VPS_ALLOW_UNKNOWN_FREE:-0}" = 1 ] \
+      && { printf 'dr_vps_image_bake: WARNING -- free space for %s unreadable; DR_VPS_ALLOW_UNKNOWN_FREE=1 -> proceeding.\n' "$dir" >&2; return 0; }
+    dr_vps_die "$DR_VPS_E_CAP" "bake refused: cannot read free space for '$dir' (df failed/malformed). Free the disk, or set DR_VPS_ALLOW_UNKNOWN_FREE=1 to override."; return $? ;;
+  esac
+  [ "$avail" -ge "$min" ] \
+    || { dr_vps_die "$DR_VPS_E_CAP" "bake refused: only ${avail} MiB free in $dir (need >= ${min} MiB). A full disk DURING a bake can truncate host files (e.g. /etc/hosts). Free space on that filesystem, or lower the bake free-space floor deliberately (DR_VPS_MIN_FREE_MB for the package bake)."; return $?; }
+}
+
+# NOTE (appliance DNS): a systemd-resolved loopback stub (127.0.0.53) breaks the libguestfs bake
+# appliance's DNS. An earlier auto-fix that rewrote the GUEST image's /etc/resolv.conf was WITHDRAWN
+# libguestfs temporarily substitutes the appliance resolver while networked guest commands
+# run, and rewriting that path FAILED with EROFS on the tested stack -- so it is not a reliable appliance
+# DNS override. A candidate host-non-invasive fix (a per-process mount-namespace resolv.conf override for
+# virt-customize) needs a real KVM/libguestfs integration test before it lands; until then the operator
+# hint (_dr_vps_bake_hint) stands.
+
 dr_vps_image_bake() {  # <golden> <recipe.json>
   local golden="$1" recipe="$2" pkgs fam cadir cacmd mode bakelog rc
   # realpath canonicalizes the path (an absolute path can never be mistaken for a jq option, e.g. a file
@@ -283,8 +311,10 @@ dr_vps_image_bake() {  # <golden> <recipe.json>
   dr_vps_have "$DR_VIRT_CUSTOMIZE" \
     || { dr_vps_die "$DR_VPS_E_CAP" "virt-customize ($DR_VIRT_CUSTOMIZE) absent -- install guestfs-tools to bake"; return $?; }
   mkdir -p "$DR_VPS_TMP_DIR" || { dr_vps_die "$DR_VPS_E_GENERIC" "bake: cannot create tmp dir $DR_VPS_TMP_DIR"; return $?; }
+  local goldendir; goldendir=$(dirname -- "$golden")
   # --- CA-ONLY (no packages): no egress needed -> single --no-network run IN PLACE, no shims/probe/fallback.
   if [ -z "$pkgs" ]; then
+    _dr_vps_bake_disk_ok "$goldendir" 512 || return $?   # CA-only edits the golden IN PLACE -> only a modest floor
     bakelog=$(mktemp --tmpdir="$DR_VPS_TMP_DIR" bake.XXXXXX.log) || { dr_vps_die "$DR_VPS_E_GENERIC" "bake: mktemp bakelog failed"; return $?; }
     [ -t 2 ] && printf '[build] bake log (tail -f to watch): %s\n' "$bakelog" >&2
     LC_ALL=C LIBGUESTFS_BACKEND="${DR_VPS_LIBGUESTFS_BACKEND:-direct}" \
@@ -294,6 +324,8 @@ dr_vps_image_bake() {  # <golden> <recipe.json>
     rm -f -- "$bakelog"; return 0
   fi
   # --- PACKAGES: network needed -> OBSERVED, TRANSACTIONAL passt->slirp on fresh overlays -----------------
+  _dr_vps_bake_disk_ok "$DR_VPS_TMP_DIR" || return $?   # the per-attempt overlay + attempt root grow here (base is $golden)
+  _dr_vps_bake_disk_ok "$goldendir" || return $?        # + a promoted flat copy is created & atomically mv'd here
   mode=$(dr_vps_net_mode) || return $?                 # validates + requires the direct backend
   _dr_vps_libguestfs_ver_warn                          # warn on an untested libguestfs (observe/enforce risk)
   local -a vcnet=("${caargs[@]}" --run-command "$(_dr_vps_bake_probe_cmd "$fam")" --install "$pkgs")
@@ -314,7 +346,7 @@ dr_vps_image_bake() {  # <golden> <recipe.json>
     case "$result" in
       OK)
         # PROMOTE: flatten overlay -> a NEW standalone temp, verify no backing, atomically replace the base.
-        promoted=$(mktemp --tmpdir="$DR_VPS_TMP_DIR" bake.XXXXXX.qcow2) || { rm -rf "$aroot"; rm -f "$overlay" "$bakelog"; return 1; }
+        promoted=$(mktemp --tmpdir="$goldendir" bake.XXXXXX.qcow2) || { rm -rf "$aroot"; rm -f "$overlay" "$bakelog"; return 1; }  # same FS as $golden -> mv is atomic
         "$DR_QEMU_IMG" convert -O qcow2 "$overlay" "$promoted" >/dev/null 2>&1 \
           || { rm -f "$promoted" "$overlay" "$bakelog"; rm -rf "$aroot"; dr_vps_die "$DR_VPS_E_GENERIC" "bake: promote convert failed"; return $?; }
         # FAIL CLOSED: a failed qemu-img info / invalid JSON / jq error must NOT read as "no backing"
@@ -366,7 +398,7 @@ dr_vps_image_build() {  # <recipe.json>
   local recipe="$1" url sha sig pkgs distro family repoc repor rhash work aid gpath prov ts
   recipe=$(realpath -e -- "$recipe" 2>/dev/null) || { dr_vps_die "$DR_VPS_E_NOTFOUND" "recipe not found: $recipe"; return $?; }
   _dr_vps_recipe_ok "$recipe" || { dr_vps_die "$DR_VPS_E_USAGE" "recipe schema invalid -- need a single JSON object with distro/upstream_url/upstream_sha256 nonempty strings, family dnf|apt|zypper|apk (or absent), packages absent or an array of nonempty strings: $recipe"; return $?; }
-  # Ordering guard (TODO I6 -- deploy ordering: golden build vs fresh install): a golden built BEFORE
+  # Ordering guard (deploy ordering: golden build vs fresh install): a golden built BEFORE
   # `dr-vps-setup` wrote /etc/distro-rig-vps/env registers under the DEV DEFAULT store paths, so a later
   # `create` on the installed rig fails "no greened golden" though build returned rc=0. Warn LOUD to STDERR
   # (stdout stays the artifact_id contract) so goldens are built AFTER the fresh install. TTY-gated like the

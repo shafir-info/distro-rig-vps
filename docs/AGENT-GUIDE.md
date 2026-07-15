@@ -9,6 +9,19 @@ be group-readable, you never have to look at it).
 If a `rigctl` call says **"could not reach the submit socket"**, either you are not in `drvpsctl` yet
 (ask the operator to `usermod -aG drvpsctl <you>`, then log out and back in) or the service is down.
 
+## For AI agents: install the skill once
+
+If you are an AI agent (Claude Code), run this ONE command once so every future session auto-discovers how
+to drive the rig -- no re-reading this guide after a context clear:
+
+```
+drvps-skill-install                 # copies the drvps skill (this guide + the orchestrator guide) into ~/.claude/skills/drvps
+```
+
+It writes only your own `~/.claude`, needs no sudo, and is idempotent (re-run after a rig update to refresh).
+`drvps-skill-install --status` shows what is installed; `--uninstall` removes it. Start a new session to load
+the skill.
+
 ## The commands
 
 Discover the rig and what you can create from:
@@ -51,6 +64,19 @@ rigctl snap-ls                                      # list YOUR snapshots
 rigctl snap-show <snap-id|name>                     # render a snapshot's provenance
 rigctl snap-rm <snap-id|name> [--idem KEY]          # delete YOUR snapshot
 ```
+
+Egress splice destinations (drvpsvc members only -- register a CRM/callback host the operator opens end-to-end, never MITM'd):
+
+```
+rigctl egress add-splice <host> [port]              # request an end-to-end splice to <host> (default 443); a root operator opens it after a dry-run + YES
+rigctl egress remove-splice <host> [port]           # request removal of a splice you no longer need
+rigctl egress list                                  # list YOUR splice requests + each one's state
+rigctl egress status <reqid>                        # that request's outcome: pending | under-review | applied | rejected | expired (reqid printed by add/remove-splice)
+```
+
+- Egress verbs require membership in the `drvpsvc` group (a non-member is refused, exit 12). The submit
+  result is the request outcome (`pending`+reqid / `already-active` / `already-absent` / `refused`); the
+  operator's later decision (`applied` | `rejected` | `expired`) is learned by polling `egress status <reqid>`.
 
 - Every call prints the watcher's JSON result envelope, EXCEPT `pull` and `console-dump`: on success
   `pull` streams the guest file's raw bytes to stdout (like `cat`) and `console-dump` prints the decoded,

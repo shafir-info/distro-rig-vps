@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.3.0] — rig observability + egress self-service (in development)
+
+Three subsystems land on top of 0.2.0, plus a self-documentation install path. Everything new is
+offline-green (the full bats + python + shellcheck + ast gate) and wired into the installer; the
+live on-host verification of each is the operator's isolated-env step, still pending (see STATUS.md
+and the Deferred list below). No push until that passes.
+
+### Added
+
+- **drvps-top — read-only rig-wide live dashboard.** Two deliverables over one frozen feed contract
+  (`tools/drvps_top_feed.py` + byte-exact fixtures): (a) `drvps-top-operator`, the operator's direct
+  bash TUI (reconciled store-vs-libvirt VMs, owner uid, live CPU/RAM, golden+snapshot inventory),
+  hardened to a strict read-only, process-group-killed, output-capped acquisition; (b) a
+  publisher/viewer pair (`drvps-top-publish` unit + unprivileged `drvps-top` viewer) that lets any
+  `drvpsctl` member see a sanitized rig view through a hostile-file-safe `/run/drvps-top/feed`
+  (O_PATH dir + fstat trust anchor + capped NUL-checked read; the viewer does no sqlite/virsh/NSS).
+  Owner identity is off by default (`PublishOwner=no|uid|name-and-uid`; the unit refuses any other
+  value). Installer: `step_top`.
+- **Egress SPLICE self-service — wired end to end.** The drvpsvc splice-destination path is now a
+  first-class verb: `rigctl egress add-splice|remove-splice|status|list`, dispatched owner-scoped
+  (SO_PEERCRED-stamped) through the watcher to an owner-scoped, journaled v2 request store; the root
+  `drvps-egress-approve` tool stages → dry-run → YES-gated atomic commit + full restart + health,
+  with the outcome published back for `egress status`. `dr-vps-setup` provisions the root-owned store
+  + shared egress lock under the fixed `drvps` identity (refuses a mismatched service user) and
+  persists the reproducible render inputs so `approve` can re-render to open a splice on a real host.
+  A splice tunnels the origin cert end to end (never MITM'd by the rig CA). Off until an operator
+  opens a destination.
+- **Skills self-documentation.** `bin/drvps-skill-install` installs the drvps agent skills pack
+  (copy-default) so an operating agent can self-document the rig's verbs and contracts.
+- **DR-2 firewalld interop.** On firewalld-active hosts the zone REJECT outranked the rig's nft
+  ACCEPT, leaving the package cache unreachable from guests. `dr-vps-setup` now installs scoped
+  permanent rich-rules (guest /24 → cache_cidr:cache_port + mock ports, read from fleet.json), binds
+  drvps0 to its zone, and reloads — idempotent, query-before-add, a no-op when firewalld is inactive
+  (`step_firewalld`). Replaces the manual two-rule workaround from 0.2.0's runbook.
+
+### Changed
+
+- Egress request store migrated to the seam-free v2 layout (`drvps-egress-migrate`, an operator-run
+  idempotent one-shot). The approve tool and member path hardcode the fixed store anchor + service
+  identity (no runtime path/command seam — a root CLI must not take a path-or-command door).
+- `VERSION` → 0.3.0.
+
+### Tests
+
+- New offline suites: drvps-top feed contract / publisher / viewer / config / acquire (real sqlite +
+  canned virsh e2e), operator-TUI hardening, drvps-top installer wiring, firewalld DR-2 (mock seam),
+  and egress shell-wiring (store-free admit-gate + reaper-wiring, replacing the retired v1 store-seam
+  tests). The full offline gate stays green (767 bats + python at umask 0077 and 0022 + shellcheck + ast).
+- Container e2e (disposable rootless podman): the egress-splice matrix on 4 host families
+  (fedora/rocky9/ubuntu/debian) — config parse, the behavioral splice tunnel (origin cert end to end,
+  squid CA proves no MITM, non-allowlisted terminated), the full stage → approve → restart → tunnel
+  workflow, and a production-path check that `approve` reads the installer-persisted render inputs
+  (no test_root seam), all verified against a REAL squid; plus the split-UID v2-store DAC boundary.
+
+### Deferred (operator/live — tracked in STATUS.md)
+
+- Bare-metal on-host verification of every 0.3.0 subsystem in a disposable systemd/KVM env: the
+  drvps-top publisher unit + member viewer end to end; the egress-splice on-host run; the firewalld
+  rich-rules on a real firewalld host.
+- Egress-splice: the squid-capability gate + audit line and the release-gate integration harness
+  (egress-splice tasks 1.8 / 1.10) land with that on-host run.
+
 ## [0.2.0] — first public release (2026-07-12)
 
 distro-rig-vps: a local, host-simulated KVM/libvirt VM test rig — golden-image build plane,

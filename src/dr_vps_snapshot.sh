@@ -170,7 +170,7 @@ _dr_vps_snapshot_name() {  # <distro> <snap_id> <utc>
 # ======================================================================================================
 # CREATE: the hardened R3.4 sequence. STDOUT = the bare snapshot id.
 # ======================================================================================================
-# ---- install-path cmdlog (TODO I7): the commands the driver ran on the SOURCE VM, captured HOST-SIDE (the
+# ---- install-path cmdlog: the commands the driver ran on the SOURCE VM, captured HOST-SIDE (the
 # guest history is scrubbed for reproducible content-addressing). Recorded into the provenance SIDECAR, NOT the
 # content digest ($sid is the image digest, computed before this) -- two identical installs with different
 # cmdlogs keep the SAME id. Best-effort secret redaction (the caller owns what it logs) + a hard size/line cap;

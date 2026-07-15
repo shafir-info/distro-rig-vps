@@ -4,29 +4,23 @@ UX/quality backlog + operator-pending deploy steps. Feature-level deferrals and 
 boundaries live in STATUS.md ("Deferred"); DR-6 has its own design note
 (docs/ISSUE-per-net-isolation.md). Completed items are removed (history: CHANGELOG.md).
 
-Priority order: 1) DR-2 firewalld (gating on firewalld-active hosts), 2) DR-3 operator tail
-(CA regen + golden re-bake), 3) upgrade helper, 4) DR-4/DR-5 deploy tails, 5) the rest.
+Priority order: 1) DR-2 firewalld self-test (installer automation LANDED; a real proxy probe remains),
+2) DR-3 operator tail (CA regen + golden re-bake), 3) upgrade helper, 4) DR-4/DR-5 deploy tails, 5) the rest.
 
-## DR-2 (GATING on firewalld hosts): installer must configure firewalld for the cache proxy
+## DR-2 (firewalld hosts): installer automation LANDED; one self-test item + a live run remain
 On a firewalld-active host NO guest can reach the squid cache at `<bridge-ip>:3128` (or mock
 ports): nftables runs EVERY base chain on a hook, so `drvps_sim.guest_in`'s ACCEPT (prio 0)
-cannot override firewalld's REJECT (prio 10; drvps0 lands in a libvirt-style zone). The whole
-cache/SSL-bump egress design is inert at first live use -- guest `dnf install` gets proxy
-connect refused. Verified live: adding permanent rich rules to the `libvirt` zone (guest /24 ->
-bridge-ip/32, tcp 3128 + 8443) + `firewall-cmd --reload` unblocks it.
-- GOTCHA: `--reload` DROPS drvps0's runtime interface->zone binding; the permanent rules then
-  do not apply until drvps0 is re-bound. Persist with `--permanent --add-interface=drvps0`, OR
-  re-assert rules+binding in `drvps-egress.service`/`.timer` (mirrors the nft marker re-assert).
-- INSTALLER FIX: detect firewalld (`firewall-cmd --state`); derive the zone from the rig bridge
-  (`--get-zone-of-interface=drvps0`); install PERMANENT rich-rule allows for
-  `simulated_allow.cache_port` + `mock_ports` from the guest subnet to `cache_cidr`, all from
-  fleet.json (the same single source the fence renders from). Scoped source+dest+port, never a
-  blanket service open. Idempotent (query-before-add).
-- SELF-TEST FIX: extend `--gate-selftest` (or the egress apply) with a guest->cache
+cannot override firewalld's REJECT (prio 10; drvps0 lands in a libvirt-style zone).
+- DONE (INSTALLER FIX, `step_firewalld`): detect firewalld (`firewall-cmd --state`); derive the zone
+  (`--get-zone-of-interface=drvps0`); install PERMANENT scoped rich-rule allows for
+  `simulated_allow.cache_port` + `mock_ports` from the guest subnet to `cache_cidr` (all from
+  fleet.json), never a blanket service open; idempotent query-before-add; `--permanent
+  --add-interface=drvps0` so `--reload` cannot drop the binding. Offline: `tests/firewalld-dr2.sh`
+  (10 checks, mock seam). A real firewalld-host verification is still pending (STATUS.md).
+- DONE (DOC FIX): the base-chain composition note is next to `dr_vps_net_render`'s fence comment.
+- OPEN (SELF-TEST FIX): extend `--gate-selftest` (or the egress apply) with a guest->cache
   reachability probe that does a REAL https-through-proxy fetch (`dnf makecache`), not a bare
-  TCP connect -- a bare connect would have passed while DR-3 still broke every fetch.
-- DOC FIX: note the base-chain composition requirement next to dr_vps_net_render's fence
-  comment (accepts do NOT compose across tables; the host firewall must ALSO allow the path).
+  TCP connect -- a bare connect would pass while a real fetch still broke.
 
 *(The "deploy tail" items below are operations for an already-deployed instance -- not source
 defects; they matter to anyone upgrading a running rig in place.)*

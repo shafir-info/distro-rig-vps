@@ -2,7 +2,7 @@
 
 Current verification state of every subsystem, the load-bearing trust boundaries, and the open
 deferrals. History and per-cycle review narratives live in CHANGELOG.md; engineering lessons in
-LESSONS-LEARNED.md. Last updated: 2026-07-12.
+LESSONS-LEARNED.md. Last updated: 2026-07-15 (0.3.0 in development).
 
 ## Verification status
 
@@ -17,6 +17,10 @@ wired, and tested but disabled by default pending an operator decision.
 | Guest-exec gate (positive closed-shape proof of the domain XML) | LIVE | live guestexec + `--gate-selftest` positive control; faithful seam fixtures |
 | Egress fence (deny-by-default nft + periodic root re-apply timer) | LIVE | guest reach-controls (internet/DNS/IPv6/gateway blocked); timer re-asserts + refreshes the marker |
 | SSL-bump package cache (squid + name-constrained rig CA) | LIVE | guest dnf through the cache with DNS off; CA nameConstraints track the mirror allowlist |
+| Egress SPLICE destinations (CRM callback path: drvpsvc self-service register + root YES-gated open; end-to-end tunnel, never MITM'd) | WIRED, CONTAINER-VERIFIED (bare-metal pending) | Wired end to end: `rigctl egress add-splice/remove-splice/status/list` -> owner-scoped (SO_PEERCRED-stamped) dispatch in `drvps_rigctl.py` -> `dr-vps egress` -> the seam-free **v2** request store (`drvps_egress_member.py`); the root `drvps-egress-approve` stages -> dry-run -> YES-gated atomic commit + full restart + health, with the outcome published back for `egress status`. `dr-vps-setup` provisions the root-owned store + shared egress lock under the FIXED `drvps` identity (validate_env refuses a mismatched service user) AND persists the reproducible render inputs (`egress-render-params.json` + `egress-host-facts.json`) so `approve` can re-render to open a splice on a real host (egress-splice task 1.9). Renderer/store/req/approve converged to an external-review GO; store v2 reached two consecutive clean rounds. **Disposable rootless-podman e2e on 4 host families (fedora/rocky9/ubuntu/debian): parse + behavioral splice-tunnel (origin cert end-to-end, squid CA proves NO MITM, non-allowlisted terminated) + the full stage->approve->restart->tunnel workflow + a PRODUCTION-path check that approve reads the installer-persisted render inputs (no test_root seam), ALL-VERIFIED; the split-UID v2-store DAC boundary passes in a container.** NOT yet built: the squid-capability gate + audit line and the release-gate integration harness (egress-splice tasks 1.8/1.10). Bare-metal on-host run remains (Deferred). Feature stays OFF until an operator opens a destination. |
+| drvps-top rig dashboard (operator TUI + member publisher/viewer over one frozen feed contract) | SEAM (live pending) | Operator `drvps-top-operator` (hardened read-only bash TUI: process-group kill, ~1s sqlite deadline, output caps) + the `drvps-top-publish` unit / unprivileged `drvps-top` viewer, sharing `tools/drvps_top_feed.py` (validator+serializer, byte-exact fixtures). Viewer opens the feed hostile-file-safe (O_PATH dir + fstat trust anchor + capped NUL-checked read; no sqlite/virsh/NSS). Owner identity OFF by default. Installer: `step_top` (viewer.conf root:root 0644 + the publisher unit User=drvps Group=drvpsctl). Offline: feed contract 291, publisher 36, viewer 26, config 33, acquire 27 (real sqlite + canned virsh e2e), hardening 8, setup-wiring 17. Live publisher-unit + member-viewer run pending. |
+| DR-2 firewalld interop (guest->cache path on firewalld-active hosts) | SEAM (live pending) | `dr-vps-setup` `step_firewalld`: scoped permanent rich-rules (guest /24 -> cache_cidr:cache_port + mock ports from fleet.json), binds drvps0 to its zone, reloads; idempotent query-before-add; no-op when firewalld inactive. Offline: 10-check mock-seam suite. Replaces 0.2.0's manual two-rule runbook workaround. Real firewalld-host verification pending. |
+| Skills self-documentation (`drvps-skill-install`, copy-default) | SEAM | Installs the drvps agent skills pack so an operating agent can self-document the rig's verbs/contracts; offline-tested, converged to an external-review GO. |
 | Snapshots + per-client owner-scoping (SO_PEERCRED-stamped) | LIVE | owner-scoped snapshot built over the socket on a real host; TOCTOU re-checks under per-content locks |
 | S6 keep-secrets restore (secret-bearing snapshot → 1:1 restore) | LIVE + GATED | two-arm identity probe (machine-id preserved; app data both arms; host keys regenerate); `DR_VPS_ALLOW_SECRET_RESTORE` default OFF |
 | Service plane: landed stages (S0/S1 service-class+quota, S4 idempotency, S5 private result ACLs, S6 gated secrets-restore) | LIVE + GATED | 26-check nested matrix PASS; **0.2.0 live-deployed on bare-metal (Fedora 44); the class=service + drvpsvc-membership + per-account quota gate verified end-to-end** (`tests/acceptance/live-service-quota.sh`) |
@@ -25,7 +29,7 @@ wired, and tested but disabled by default pending an operator decision.
 | Collision/net-ownership preflight (structural, live-address-complete) | LIVE | non-dry-run positive + planted-drift negative controls (widened /16, deleted /24, foreign net XML) |
 | Multi-distro golden builds (dnf/apt/zypper/apk profiles) | fedora44 LIVE; others SEAM | family profiles seam-tested; per-family live acceptance is the remaining step (see Deferred) |
 | Console-log observability (drvps-readable, DoS-bounded) | LIVE | reaper tail-compaction bound; readability decoupled from virtlogd |
-| Offline suite | GREEN | **741 bats tests / 22 suites**; shellcheck clean except documented per-file suppressions (SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
+| Offline suite | GREEN | **767 bats tests / 23 suites**, plus offline python at umask 0077 AND 0022 (egress: layout/model/req/approve/migrate/verb; drvps-top: feed 291 / publisher / viewer / config / acquire) and offline sh (egress wiring + lock + render-noop; drvps-top unit/once/crossframe/hardening/setup; firewalld DR-2; image-bake guards) all green; shellcheck 0 errors (documented per-file suppressions: SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
 
 **0.2.0 live-deploy smoke (bare-metal Fedora 44, 2026-07-12) -- all PASS:** clean-install upgrade
 from 0.1.0; goldens rebuilt (fedora44, ubuntu22/24/26, centos9); basic agent loop
@@ -86,11 +90,18 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
   `ssh_deletekeys: false` on the restore seed.
 - **Held fence stages** (S2 stable-IP/service-ports #3a/#3b/#3c, S3 egress profiles / `--egress`):
   NOT built; the consumer guide marks them PROPOSED. Need their own build + live-dev run.
-- **DR-2 firewalld (open, affects firewalld-active hosts)**: firewalld's zone REJECT outranks the
-  rig's nft ACCEPT for guest->cache traffic, so the package cache is unreachable from guests until
-  the operator adds two scoped rich rules + persists the drvps0 zone binding (workaround commands:
-  docs/INSTALL-RUNBOOK.md "firewalld hosts"; installer automation: TODO.md DR-2). The cache/fence
-  LIVE rows above were verified on hosts with the workaround applied or firewalld inactive.
+- **Egress SPLICE — bare-metal run + two integration pieces.** The path is WIRED (verb 1.4, outcome
+  publication 1.6, and the `dr-vps-setup` store/lock 1.9 all landed) and CONTAINER-VERIFIED on 4 host
+  families (see the status row above). Still open: the squid-capability gate + audit line (1.8), the
+  release-gate integration harness (1.10), the doctor-side egress fleet<->config generation-mismatch
+  check (1.9 L -- the approver already re-verifies baseline drift; only the `doctor` surfacing is
+  missing), and the on-host bare-metal live-dev run. The feature stays OFF until an operator opens a destination.
+- **DR-2 firewalld (installer-automated; live + self-test pending)**: firewalld's zone REJECT
+  outranks the rig's nft ACCEPT for guest->cache traffic. `step_firewalld` now adds the scoped rich
+  rules + persists the drvps0 zone binding automatically (seam-tested, `tests/firewalld-dr2.sh`);
+  remaining OPEN is only a real firewalld-host run and the https-through-proxy self-test probe
+  (TODO.md DR-2). The 0.2.0 cache/fence LIVE rows were verified on hosts with the (then-manual)
+  workaround applied or firewalld inactive.
 - **Distro widening**: centos9/ubuntu22/ubuntu24 inner goldens need a mirror-allowlist edit or
   fetch-on-host + `file://` upstream; per-family live acceptance for zypper/apk.
 - **Bake-through-cache**: recipes with `packages` need mirror egress during the bake.
