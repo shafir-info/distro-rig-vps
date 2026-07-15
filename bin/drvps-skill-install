@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""drvps-skill-install -- one-time, per-user, NO-sudo installer that drops the drvps Claude Code skill into
+the caller's own ~/.claude/skills/drvps so an AI agent (a drvpsctl/drvpsvc member) auto-discovers how to
+drive the rig via `rigctl` -- no re-researching after a context clear.
+
+  drvps-skill-install            copy the skill into ~/.claude/skills/drvps (DEFAULT: self-contained; works
+                                 regardless of tree permissions; re-run to refresh after a rig update)
+  drvps-skill-install --link     symlink ~/.claude/skills/drvps -> the installed tree (auto-tracks operator
+                                 updates; requires the rig checkout to stay readable by you)
+  drvps-skill-install --uninstall   remove the skill (only if THIS tool installed it)
+  drvps-skill-install --status      show what is installed
+
+Operates only inside your own ~/.claude, needs no sudo, and never creates OS accounts. "Ours" is proven by a
+tool-written provenance marker (never by the skill's own name). A COPY marker records the SHA-256 of every
+file it installs; a LINK marker is bound to the published symlink's (st_dev, st_ino). A managed copy is reset
+ONLY when it holds EXACTLY the nodes this tool installed, each of the exact type, with bytes still matching the
+recorded hashes; a link is "ours" ONLY when its inode matches the marker -- so a foreign same-name skill, a
+file whose CONTENT differs from what we installed, user data hidden behind a managed name, or a user-created
+symlink (different inode, or no marker) is PRESERVED, never overwritten or deleted. An orphaned marker can
+never claim a different inode, so it is harmless. Every final-component operation on a managed node is
+type-checked (lstat) and no-follow, and the replacement is built first and published by an atomic rename with
+restore-on-caught-failure. Guarantee scope: this preserves anything whose BYTES differ from what we installed
+(a byte-identical replacement is indistinguishable and treated as ours; metadata-only changes are not tracked).
+It is NOT crash-atomic: a hard kill (SIGKILL/power loss) mid-publish may leave the prior version in an adjacent
+`.old-*` sibling you can rename back -- never silently destroyed. It is NOT a boundary against a concurrent
+same-UID process (there is none -- it already has your rights). Your own parent dirs (~/.claude,
+~/.claude/skills) are used as-is. ASCII only; Python 3.6+."""
+import hashlib
+import json
+import os
+import shutil
+import stat
+import sys
+
+SCHEMA = 1
+TOOL = "drvps-skill-install"
+MARKER = ".drvps-skill"                        # provenance marker -- ONLY this tool writes it
+REFS = ("AGENT-GUIDE.md", "ORCHESTRATOR-GUIDE.md")
+MAX_SRC = 1 << 20                              # a guide/skill doc is well under 1 MiB
+MARKER_MAX = 4096                             # a provenance marker is a few hundred bytes; reject anything larger
+
+
+def die(msg, code=1):
+    sys.stderr.write("%s: %s\n" % (TOOL, msg))
+    sys.exit(code)
+
+
+def _root():
+    # realpath resolves a symlinked SCRIPT too, so invoking the tool through a symlink still finds the tree.
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+SRC = os.path.join(_root(), "share", "skills", "drvps")
+
+
+def _dest():
+    home = os.environ.get("HOME", "")
+    if not home or not os.path.isabs(home):
+        die("HOME must be an absolute path (got %r) -- cannot locate your ~/.claude" % home, 2)
+    return os.path.join(home, ".claude", "skills", "drvps")
+
+
+def _is_regular(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)      # lstat -> a symlink is NOT a regular file
+    except OSError:
+        return False
+
+
+def _is_realdir(path):
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)      # lstat -> a symlink is NOT a real dir
+    except OSError:
+        return False
+
+
+def _read_src(path):
+    # read a source file from OUR tree; references are shipped as symlinks to handout/ -> follow intentionally.
+    with open(path, "rb") as fh:
+        data = fh.read(MAX_SRC + 1)
+    if len(data) > MAX_SRC:
+        die("source unexpectedly large: %s" % path)
+    return data
+
+
+def _file_sha(path):
+    """SHA-256 of a REGULAR non-symlink file's bytes (lstat-typed, opened O_NOFOLLOW). None if not a plain file."""
+    if not _is_regular(path):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        h = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    finally:
+        os.close(fd)
+    return h.hexdigest()
+
+
+def _marker_bytes(mode, shas):
+    return json.dumps({"tool": TOOL, "schema": SCHEMA, "mode": mode, "sha256": shas},
+                      separators=(",", ":"), sort_keys=True).encode("ascii")
+
+
+def _is_hex64(s):
+    return isinstance(s, str) and len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+
+def _is_uint64(x):
+    # a device/inode id os.lstat could actually return: a real, non-Boolean, non-negative, bounded integer.
+    return isinstance(x, int) and not isinstance(x, bool) and 0 <= x < (1 << 64)
+
+
+def _no_dup_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate key %r" % k)               # a marker the tool writes never repeats a key
+        d[k] = v
+    return d
+
+
+def _read_all(fd, cap):
+    """Read the WHOLE file up to cap+1 bytes, looping until EOF -- a single os.read may legally short-read a
+    regular file, so one read is not proof of EOF (a caller must detect > cap to reject a hidden trailer)."""
+    chunks = []
+    total = 0
+    while total <= cap:
+        chunk = os.read(fd, cap + 1 - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _read_marker(path, mode):
+    """Parse and STRICTLY VALIDATE a provenance marker for the given mode ("copy" or "link"). A REGULAR file
+    (lstat FIRST so a planted FIFO cannot block the open), read O_NOFOLLOW|O_NONBLOCK. The WHOLE file must fit
+    in MARKER_MAX and parse as our exact structure -- so a truncated valid prefix + trailing user bytes, or a
+    bare {tool,schema} file the tool never writes, is REJECTED (not mistaken for ours). Returns the dict or None:
+      copy: {tool, schema, mode:"copy", sha256:{SKILL.md + each guide -> 64-hex}}   (extras allowed: none)
+      link: {tool, schema, mode:"link", dev:int, ino:int}"""
+    if not _is_regular(path):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        data = _read_all(fd, MARKER_MAX)                        # loop to EOF -- a single read may short-read
+    finally:
+        os.close(fd)
+    if len(data) > MARKER_MAX:                                   # oversize -> a valid prefix must not hide a trailer
+        return None
+    try:
+        obj = json.loads(data.decode("ascii"), object_pairs_hook=_no_dup_keys)   # WHOLE file; reject duplicate keys
+    except (ValueError, UnicodeDecodeError):
+        return None
+    # schema must be a real JSON integer -- reject True/1.0/1e0 (Python's True==1 and 1.0==1 would otherwise pass)
+    if not (isinstance(obj, dict) and obj.get("tool") == TOOL
+            and type(obj.get("schema")) is int and obj.get("schema") == SCHEMA
+            and obj.get("mode") == mode):
+        return None
+    if mode == "copy":
+        if set(obj) != {"tool", "schema", "mode", "sha256"}:    # EXACT key set -> no extra user fields
+            return None
+        shas = obj.get("sha256")
+        if not isinstance(shas, dict) or set(shas) != ({"SKILL.md"} | set(REFS)):
+            return None
+        if not all(_is_hex64(v) for v in shas.values()):
+            return None
+    elif mode == "link":
+        if set(obj) != {"tool", "schema", "mode", "dev", "ino"}:
+            return None
+        if not (_is_uint64(obj.get("dev")) and _is_uint64(obj.get("ino"))):   # os.lstat never writes negative/huge ids
+            return None
+    else:
+        return None
+    return obj
+
+
+def _is_our_marker(dest):
+    return _read_marker(os.path.join(dest, MARKER), "copy") is not None
+
+
+def _link_marker(dest):
+    # a symlink has no "inside" to hold a marker, so link provenance is a companion file beside dest. It exists
+    # IFF dest is a link THIS tool created -- a user's own `ln -s <tree> dest` has no marker -> classified foreign.
+    return os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".drvps-link")
+
+
+def _write_link_marker(dest):
+    """Write the companion provenance marker, BOUND to the published symlink's (st_dev, st_ino). Because it is
+    tied to that exact inode, an ORPHANED marker (symlink later removed/replaced) can never match a DIFFERENT
+    symlink the user creates -- so a stale marker is harmless, not a claim on someone else's link. Call AFTER
+    the symlink is published at dest."""
+    st = os.lstat(dest)                                          # the published symlink's own inode
+    obj = {"tool": TOOL, "schema": SCHEMA, "mode": "link", "dev": st.st_dev, "ino": st.st_ino}
+    payload = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("ascii")
+    m = _link_marker(dest)
+    tmp = _fresh_sibling(m, "tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        os.replace(tmp, m)                                       # atomic publish (replaces any prior link marker)
+    except BaseException:
+        _try(os.unlink, tmp)
+        raise
+
+
+def _is_our_link(dest):
+    if not os.path.islink(dest):
+        return False
+    m = _read_marker(_link_marker(dest), "link")                         # provenance the tool wrote -- not just any symlink to SRC
+    if m is None or m.get("mode") != "link":
+        return False
+    try:
+        st = os.lstat(dest)
+    except OSError:
+        return False
+    if m.get("dev") != st.st_dev or m.get("ino") != st.st_ino:  # the marker must name THIS exact symlink inode
+        return False
+    try:
+        return os.path.realpath(dest) == os.path.realpath(SRC)   # and it points at our current source
+    except OSError:
+        return False
+
+
+def _lexists_strict(path):
+    """True/False whether path exists, deciding ONLY on ENOENT. A no-clobber decision must never read a
+    transient lstat error (EIO/EACCES) as 'absent' -- any non-ENOENT OSError propagates (fail closed)."""
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _classify(dest):
+    """absent | ours-copy | ours-link | foreign -- from a SINGLE authoritative lstat of dest (never follows it).
+    ONLY ENOENT is 'absent'; any other lstat error propagates so a no-clobber caller fails closed."""
+    try:
+        st = os.lstat(dest)
+    except FileNotFoundError:
+        return "absent"
+    if stat.S_ISLNK(st.st_mode):
+        return "ours-link" if _is_our_link(dest) else "foreign"
+    if stat.S_ISDIR(st.st_mode):
+        return "ours-copy" if _is_our_marker(dest) else "foreign"
+    return "foreign"                                             # a plain file (or other node) sitting at dest
+
+
+def _copy_is_pristine(dest):
+    """True iff an ours-copy dir holds EXACTLY the nodes this tool installed -- the EXACT entry SET (SKILL.md,
+    references, marker; references = SKILL guides), each of the EXACT type (regular non-symlink files; a real
+    references dir), AND every file's bytes still matching the SHA-256 the marker recorded at install. So a
+    foreign skill, a file the USER EDITED, a wrong-type node (a `SKILL.md/` dir), or user data hidden behind a
+    managed name is non-pristine -> PRESERVED on refresh and REFUSED for link-conversion, never removed."""
+    marker = _read_marker(os.path.join(dest, MARKER), "copy")
+    if marker is None:
+        return False
+    shas = marker.get("sha256")
+    if not isinstance(shas, dict):
+        return False
+    try:
+        if set(os.listdir(dest)) != {"SKILL.md", "references", MARKER}:      # EXACT set: no extras, none missing
+            return False
+    except OSError:
+        return False
+    refdir = os.path.join(dest, "references")
+    if not _is_realdir(refdir):
+        return False
+    try:
+        if set(os.listdir(refdir)) != set(REFS):                            # EXACT reference set
+            return False
+    except OSError:
+        return False
+    if _file_sha(os.path.join(dest, "SKILL.md")) != shas.get("SKILL.md"):    # bytes unchanged since install
+        return False
+    for g in REFS:
+        if _file_sha(os.path.join(refdir, g)) != shas.get(g):
+            return False
+    return True
+
+
+def _check_src():
+    # validate EVERY required source doc resolves to a readable regular file -- link mode does not copy, so a
+    # dangling reference symlink in the tree must fail HERE, not install a broken skill.
+    required = [os.path.join(SRC, "SKILL.md")] + [os.path.join(SRC, "references", g) for g in REFS]
+    for p in required:
+        if not _is_readable_file(p):                            # actually open+read -- isfile/access can lie (e.g. /proc/self/mem)
+            die("skill source incomplete: %s is missing/unreadable -- is the rig checkout intact and readable by you?" % p)
+
+
+def _write_new(path, data):
+    # into a staging dir WE just made and control -> O_EXCL|O_NOFOLLOW can never clobber/follow anything.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
+def _stage(mode):
+    """Build a COMPLETE staging tree beside dest; validate ALL sources FIRST (all-or-nothing: a missing/
+    unreadable source aborts before anything in dest is touched)."""
+    payload = {"SKILL.md": _read_src(os.path.join(SRC, "SKILL.md"))}
+    for g in REFS:
+        p = os.path.join(SRC, "references", g)
+        if not os.path.exists(p):
+            die("reference %s is missing from the skill source (%s)" % (g, p))
+        payload[g] = _read_src(p)
+    shas = {name: hashlib.sha256(data).hexdigest() for name, data in payload.items()}
+    staging = _fresh_sibling(_dest(), "new")
+    os.makedirs(staging, 0o700)
+    try:
+        _write_new(os.path.join(staging, "SKILL.md"), payload["SKILL.md"])
+        os.mkdir(os.path.join(staging, "references"), 0o700)
+        for g in REFS:
+            _write_new(os.path.join(staging, "references", g), payload[g])
+        _write_new(os.path.join(staging, MARKER), _marker_bytes(mode, shas))
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
+
+
+def _fresh_sibling(dest, tag):
+    # names returned here become overwrite-capable rename destinations -> the "is it free?" test must be
+    # ENOENT-strict, never reading a transient lstat error as "free" (which would clobber a foreign node).
+    for _ in range(64):
+        p = "%s.%s-%d-%s" % (dest, tag, os.getpid(), os.urandom(8).hex())
+        if not _lexists_strict(p):
+            return p
+    die("could not find a free temporary name beside %s" % dest)
+
+
+def _is_readable_file(path):
+    """Prove path is a REGULAR file we can actually READ (follows symlinks -- our refs are symlinks to handout).
+    os.path.isfile + os.access can both pass while a read fails (e.g. /proc/self/mem), so open + fstat-regular +
+    read one byte. Empty file (immediate EOF) counts as readable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.read(fd, 1)                                          # a path that stats as regular but cannot be read raises here
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _rmtree_warn(what, path):
+    problems = []
+    shutil.rmtree(path, onerror=lambda *a: problems.append(a))  # remove what we can; do NOT silently ignore failures
+    if problems:
+        sys.stderr.write("%s: WARNING: could not fully remove %s (%s)\n" % (TOOL, what, path))
+
+
+def _unlink(path):
+    # os.unlink never follows the FINAL component: a stray FILE/symlink is dropped, never its target. Absent
+    # (already gone) and a DIRECTORY at a managed name (user data -> never recursively removed) are tolerated;
+    # any OTHER error (e.g. a read-only parent) PROPAGATES so a caller can never report a false success.
+    try:
+        os.unlink(path)
+    except (FileNotFoundError, IsADirectoryError):
+        pass
+
+
+def _try(fn, *a):
+    try:
+        fn(*a)
+    except OSError:
+        pass
+
+
+def _try_warn(what, fn, *a):
+    # like _try, but a RECOVERY/CLEANUP failure is reported (not silently swallowed), so we never claim a clean
+    # transition while leaving a stranded artifact. Returns True on success.
+    try:
+        fn(*a)
+        return True
+    except OSError as e:
+        sys.stderr.write("%s: WARNING: %s failed (%s)\n" % (TOOL, what, e))
+        return False
+
+
+def _remove_our_copy(dest):
+    """Remove ONLY the nodes THIS tool installed AND left UNMODIFIED -- each guide/SKILL.md file is removed only
+    when its current type + SHA-256 still match what the marker recorded; a file the user EDITED or REPLACED (or
+    a wrong-type node, or a swapped-in symlinked references/) is left in place. The marker itself is ours and is
+    always removed. Returns True iff dest is then fully gone (a preserved user node keeps it -> rmdir fails -> False)."""
+    marker = _read_marker(os.path.join(dest, MARKER), "copy")
+    shas = marker.get("sha256") if isinstance(marker, dict) else None
+    if not isinstance(shas, dict):
+        shas = {}
+    refdir = os.path.join(dest, "references")
+    if _is_realdir(refdir) and not os.path.islink(refdir):     # a symlinked references/ is not ours -> never touched
+        for g in REFS:
+            gp = os.path.join(refdir, g)
+            if _file_sha(gp) == shas.get(g):                   # only OUR unmodified guide bytes
+                _unlink(gp)
+        _try(os.rmdir, refdir)                                 # only if now empty (user extras keep it)
+    sp = os.path.join(dest, "SKILL.md")
+    if _file_sha(sp) == shas.get("SKILL.md"):                  # only OUR unmodified SKILL.md
+        _unlink(sp)
+    _unlink(os.path.join(dest, MARKER))                        # provenance marker -> always ours
+    try:
+        os.rmdir(dest)
+        return True
+    except OSError:
+        return False                                           # user-modified/extra nodes remain -> keep them
+
+
+def _ensure_parent(dest):
+    os.makedirs(os.path.dirname(dest), 0o700, exist_ok=True)
+
+
+def cmd_copy():
+    _check_src()
+    dest = _dest()
+    kind = _classify(dest)
+    if kind == "foreign":
+        die("%s exists and was not installed by this tool -- refusing to replace it" % dest)
+    staging = _stage("copy")                                    # complete replacement built FIRST
+    published = False
+    backup = None
+    linkbak = None
+    pristine = True
+    try:
+        _ensure_parent(dest)
+        if kind == "absent":
+            os.rename(staging, dest)
+            published = True
+        elif kind == "ours-link":
+            linkbak = _fresh_sibling(dest, "oldlnk")
+            os.rename(dest, linkbak)                            # move the symlink aside, PRESERVING its inode (marker stays valid on restore)
+            try:
+                os.rename(staging, dest)
+                published = True
+            except BaseException:
+                if _try_warn("restoring the original link at %s" % dest, os.rename, linkbak, dest):
+                    linkbak = None                             # restored the ORIGINAL symlink inode -> its marker still matches
+                raise                                          # (if restore FAILED, linkbak still points at your old link)
+        else:                                                   # ours-copy: move aside, publish, restore on fail
+            pristine = _copy_is_pristine(dest)
+            backup = _fresh_sibling(dest, "old")
+            os.rename(dest, backup)
+            try:
+                os.rename(staging, dest)
+                published = True
+            except BaseException:
+                if _try_warn("restoring the previous copy at %s" % dest, os.rename, backup, dest):
+                    backup = None
+                raise
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
+    if linkbak is not None:
+        _try_warn("removing the superseded old link %s" % linkbak, os.unlink, linkbak)
+    if _read_marker(_link_marker(dest), "link") is not None:            # drop only OUR stale link marker (never a foreign file at that path)
+        _try_warn("removing the stale link marker %s" % _link_marker(dest), os.unlink, _link_marker(dest))
+    if backup is not None:
+        if pristine:
+            _rmtree_warn("the superseded old skill dir %s" % backup, backup)
+        else:
+            sys.stderr.write("%s: kept your extra files from the old skill dir at %s\n" % (TOOL, backup))
+    print("%s: installed the drvps skill into %s (SKILL.md + %d reference doc(s))" % (TOOL, dest, len(REFS)))
+    print("%s: re-run after a rig update to refresh; start a NEW Claude Code session to load it." % TOOL)
+
+
+def cmd_link():
+    _check_src()
+    dest = _dest()
+    kind = _classify(dest)
+    if kind == "foreign":
+        die("%s exists and is not ours -- refusing to replace it" % dest)
+    if kind == "ours-link":                                    # already our link to SRC -> idempotent no-op (never replace an already-correct link)
+        print("%s: already linked: %s -> %s" % (TOOL, dest, SRC))
+        return
+    if kind == "ours-copy" and not _copy_is_pristine(dest):     # check BEFORE touching anything -> never a half-state
+        die("%s holds files this tool did not install -- refusing to convert it to a link "
+            "(use --uninstall first, then --link)" % dest)
+    lm = _link_marker(dest)
+    if _lexists_strict(lm) and _read_marker(lm, "link") is None:        # the marker PATH must not clobber a foreign file (ENOENT-strict)
+        die("%s is occupied by a file this tool did not create -- refusing to write the link marker" % lm)
+    _ensure_parent(dest)
+    tmp = _fresh_sibling(dest, "lnk")
+    os.symlink(SRC, tmp)                                        # replacement symlink built first
+    linked = False
+    marked = False
+    backup = None
+    try:
+        if kind == "absent":
+            os.rename(tmp, dest)
+            linked = True
+        else:                                                  # ours-copy pristine: move aside, publish, restore
+            backup = _fresh_sibling(dest, "old")
+            os.rename(dest, backup)
+            os.rename(tmp, dest)
+            linked = True
+        _write_link_marker(dest)                               # marker LAST -> a failure never leaves a marker claiming a non-tool link
+        marked = True
+    except BaseException:
+        if not linked:
+            _try(os.unlink, tmp)
+            if backup is not None and _try_warn("restoring the previous copy at %s" % dest, os.rename, backup, dest):
+                backup = None                                  # restored the copy we moved aside
+        elif not marked:                                       # link published but marker failed -> undo, don't leave an unmarked residue
+            _try(os.unlink, dest)
+            if backup is not None and _try_warn("restoring the previous copy at %s" % dest, os.rename, backup, dest):
+                backup = None
+        raise
+    finally:
+        if not linked:
+            _try(os.unlink, tmp)
+    if backup is not None:
+        _rmtree_warn("the superseded old skill dir %s" % backup, backup)   # pristine -> safe to drop (warn if it lingers)
+    print("%s: linked %s -> %s (auto-tracks rig updates)" % (TOOL, dest, SRC))
+    print("%s: start a NEW Claude Code session to load the skill." % TOOL)
+
+
+def cmd_uninstall():
+    dest = _dest()
+    kind = _classify(dest)
+    lm = _link_marker(dest)
+    if kind == "absent":
+        if _read_marker(lm, "link") is not None:                       # reconcile an orphan link marker we may have left
+            _unlink(lm)
+            print("%s: removed a stale drvps link marker (%s absent)" % (TOOL, dest))
+        elif _lexists_strict(lm):                                      # ENOENT-strict: a true IO error propagates (fail closed)
+            print("%s: nothing of ours to remove (%s absent; a non-drvps file at %s was left untouched)" % (TOOL, dest, lm))
+        else:
+            print("%s: nothing to remove (%s absent)" % (TOOL, dest))
+        return
+    if kind == "foreign":
+        die("%s was not installed by this tool -- refusing to remove it" % dest)
+    if kind == "ours-link":
+        _unlink(lm)                                            # marker FIRST: a later link-unlink failure leaves an UNMARKED link (foreign, safe)
+        _unlink(dest)
+    elif not _remove_our_copy(dest):
+        print("%s: removed this tool's files from %s but kept it (it holds files this tool did not install)"
+              % (TOOL, dest))
+        return
+    print("%s: removed the drvps skill from %s" % (TOOL, dest))
+
+
+def cmd_status():
+    dest = _dest()
+    kind = _classify(dest)
+    if kind == "ours-link":
+        required = [os.path.join(dest, "SKILL.md")] + [os.path.join(dest, "references", g) for g in REFS]
+        if all(_is_readable_file(p) for p in required):        # every doc resolves + reads THROUGH the link
+            print("linked:  %s -> %s" % (dest, os.path.realpath(dest)))
+        else:
+            print("broken:  %s -> %s (link target/source doc is missing -- re-run to refresh)" % (dest, os.path.realpath(dest)))
+            sys.exit(3)
+    elif kind == "ours-copy":
+        if _copy_is_pristine(dest):
+            print("copied:  %s (self-contained)" % dest)
+        else:
+            # a managed copy whose files were edited/removed since install -> flagged, not reported as clean
+            print("modified: %s is a managed copy but its files were changed/incomplete since install "
+                  "(re-run to refresh)" % dest)
+            sys.exit(3)
+    elif kind == "foreign":
+        print("foreign: %s exists but was NOT installed by this tool (left untouched)" % dest)
+    else:
+        lm = _link_marker(dest)
+        if _read_marker(lm, "link") is not None:                       # absent dest, but a stale link marker lingers
+            print("absent:  no drvps skill at %s (a stale link marker is present; run --uninstall to clean it)" % dest)
+        elif _lexists_strict(lm):                                      # ENOENT-strict: a true IO error propagates (fail closed)
+            print("absent:  no drvps skill at %s (a non-drvps file is at the link-marker path %s)" % (dest, lm))
+        else:
+            print("absent:  no drvps skill installed for %s" % os.environ.get("USER", "you"))
+
+
+def main(argv):
+    arg = argv[0] if argv else ""
+    if len(argv) > 1:
+        die("too many arguments (see --help)", 2)
+    if arg in ("", "--copy"):
+        cmd_copy()
+    elif arg == "--link":
+        cmd_link()
+    elif arg == "--uninstall":
+        cmd_uninstall()
+    elif arg == "--status":
+        cmd_status()
+    elif arg in ("-h", "--help"):
+        sys.stdout.write((__doc__ or "").strip() + "\n")
+    else:
+        die("unknown argument %r (see --help)" % arg, 2)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except SystemExit:
+        raise
+    except OSError as e:                                        # a filesystem fault -> a clean diagnostic, not a traceback
+        die("filesystem error: %s" % e)
