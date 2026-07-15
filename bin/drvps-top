@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# drvps-top -- the unprivileged VIEWER (any drvpsctl member): a read-only rig dashboard rendered from the
+# shared feed the publisher writes. Does NO sqlite/virsh; validates the feed with the hostile-file protocol.
+# The OPERATOR's fuller direct live tool is `drvps-top-operator`. See docs/CONCEPT-DRVPS-TOP-SHARE.md.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+exec python3 "$HERE/tools/drvps_top_view.py" "$@"

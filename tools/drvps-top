@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# drvps-top -- read-only operator rig-wide live TUI for the distro-rig-vps rig.
+# Design + rationale: docs/CONCEPT-DRVPS-TOP.md (v5). Runs AS the `drvps` user
+# (`sudo -u drvps .../drvps-top`). Strictly read-only: sqlite3 -readonly (fail-fast,
+# hard ~1s kill), virsh -r; never mutates the store, a VM, a snapshot, or a golden.
+# ASCII only. Four layers: (1) pure reducers, (2) raw parsers, (3) seamed subprocess
+# adapters, (4) render + main loop. Sourcing this file (for tests) does NOT run main.
+set -uo pipefail
+
+# ---------- config + seams (from /etc/distro-rig-vps/env; NEVER source the store lib) ----------
+if [ "${DRVPS_TOP_NO_ENV:-0}" != 1 ] && [ -r /etc/distro-rig-vps/env ]; then
+  # shellcheck disable=SC1091
+  . /etc/distro-rig-vps/env 2>/dev/null || true
+fi
+: "${DR_VPS_STATE_DIR:=/var/lib/distro-rig-vps}"
+: "${DR_VPS_DB:=$DR_VPS_STATE_DIR/store.db}"
+: "${DR_SQLITE:=sqlite3}"          # seam
+: "${DR_VIRSH:=virsh}"             # seam
+: "${DR_LIBVIRT_URI:=qemu:///system}"
+: "${DR_GETENT:=getent}"           # seam
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+VMID_RE='^drvps-vm-[0-9a-f]{16}$'
+
+# ---------- CLOCK seam (monotonic + wall); overridable in tests ----------
+now_wall() { if [ -n "${DRVPS_TOP_NOW_WALL:-}" ]; then printf '%s\n' "$DRVPS_TOP_NOW_WALL"; else date -u +%s; fi; }
+now_mono_ns() {
+  if [ -n "${DRVPS_TOP_NOW_MONO_NS:-}" ]; then printf '%s\n' "$DRVPS_TOP_NOW_MONO_NS"; return; fi
+  # /proc/uptime field 1 is monotonic seconds (float) -> ns
+  awk '{printf "%.0f\n", $1*1000000000}' /proc/uptime 2>/dev/null || echo 0
+}
+
+# ============================================================================
+# LAYER 1 -- PURE reducers (no I/O; deterministic; unit-tested against fixtures)
+# ============================================================================
+
+# short_id <id> : first 8 chars of the final hash component after the last '-'
+short_id() { local id="$1" tail="${1##*-}"; printf '%s' "${tail:0:8}"; }
+
+# vm_shortname <name> : human prefix with a timestamp/hash tail elided.
+#   weftg-20260712T195935Z-fC4Ted-P05 -> weftg*P05 ; kcgold-...-27213 -> kcgold
+vm_shortname() {
+  local n="$1"
+  case "$n" in
+    *-*T*Z-*-*) printf '%s*%s' "${n%%-*}" "${n##*-}" ;;   # prefix ... -tail
+    *-*T*Z-*)   printf '%s'   "${n%%-*}" ;;
+    *-*T*Z)     printf '%s'   "${n%%-*}" ;;
+    *)          printf '%s'   "$n" ;;
+  esac
+}
+
+# owner_label <uid> <name-or-empty> : "name(uid)" ; "operator" for empty/NULL uid ; "uid" if no name
+owner_label() {
+  local uid="$1" name="${2:-}"
+  if [ -z "$uid" ] || [ "$uid" = NULL ]; then printf 'operator'; return; fi
+  if [ -n "$name" ]; then printf '%s(%s)' "$name" "$uid"; else printf '%s' "$uid"; fi
+}
+
+# base_label <kind> <provenance-json> <artifact_id> : distro@kind:8hex | orphan:8hex | distro?
+base_label() {
+  local kind="$1" prov="$2" aid="$3" k
+  if [ -z "$aid" ] || [ "$aid" = NULL ]; then printf 'orphan:none'; return; fi
+  case "$kind" in
+    golden) k=raw ;;
+    snapshot) k=snap ;;
+    ''|NULL) printf 'orphan:%s' "$(short_id "$aid")"; return ;;   # aid present but no images row
+    *) k="$kind" ;;
+  esac
+  if [ -z "$prov" ] || [ "$prov" = NULL ]; then printf 'distro?@%s:%s' "$k" "$(short_id "$aid")"; return; fi
+  printf '%s@%s:%s' "$prov" "$k" "$(short_id "$aid")"
+}
+
+# cpu_pct <cpu_prev_ns> <cpu_cur_ns> <mono_prev_ns> <mono_cur_ns> : aggregate top-style %, or --
+#   decrease -> -- (reset/wrap) ; equal -> 0.0 ; increase & dwall>0 -> 100*dcpu/dwall
+cpu_pct() {
+  local cp="$1" cc="$2" wp="$3" wc="$4"
+  case "$cp$cc$wp$wc" in *[!0-9]*) echo '--'; return ;; esac
+  [ -z "$cp" ] || [ -z "$cc" ] || [ -z "$wp" ] || [ -z "$wc" ] && { echo '--'; return; }
+  awk -v cp="$cp" -v cc="$cc" -v wp="$wp" -v wc="$wc" 'BEGIN{
+    dcpu=cc-cp; dw=wc-wp;
+    if (cc<cp) { print "--"; exit }        # reset/wrap
+    if (cc==cp) { print "0.0"; exit }       # idle (caller ensures >=2 samples)
+    if (dw<=0) { print "--"; exit }
+    printf "%.1f\n", 100.0*dcpu/dw;
+  }'
+}
+
+# ram_fmt <cur_kib> <max_kib> : "1.4G/1.5G" or --
+ram_fmt() {
+  local c="$1" m="$2"
+  case "$c" in ''|*[!0-9]*) echo '--'; return ;; esac
+  case "$m" in ''|*[!0-9]*) echo '--'; return ;; esac
+  awk -v c="$c" -v m="$m" 'BEGIN{printf "%.1fG/%.1fG\n", c/1048576, m/1048576}'
+}
+
+# fmt_age <created_at_epoch_or_iso> <now_epoch> : "4m12s" / "9m1s" / "2h3m" / ? for bad input
+fmt_age() {
+  local ca="$1" now="$2" t
+  case "$ca" in ''|NULL) echo '?'; return ;; esac
+  if [[ "$ca" =~ ^[0-9]+$ ]]; then t="$ca"; else t="$(date -u -d "$ca" +%s 2>/dev/null || echo '')"; fi
+  [ -z "$t" ] && { echo '?'; return; }
+  local d=$(( now - t ))
+  [ "$d" -lt 0 ] && { echo '?'; return; }
+  if   [ "$d" -lt 3600 ]; then printf '%dm%ds' $(( d/60 )) $(( d%60 ))
+  elif [ "$d" -lt 86400 ]; then printf '%dh%dm' $(( d/3600 )) $(( (d%3600)/60 ))
+  else printf '%dd%dh' $(( d/86400 )) $(( (d%86400)/3600 )); fi
+}
+
+# state_label <store_state> <live_state> : composite; single value when equal
+state_label() {
+  local s="${1:-?}" l="${2:-?}"
+  [ "$s" = "$l" ] && { printf '%s' "$s"; return; }
+  printf '%s/%s' "$s" "$l"
+}
+
+# color_ramp <pct_or_dashdash> : ANSI SGR code for a CPU% cell (aggregate scale)
+color_ramp() {
+  local p="$1"
+  [ "${DRVPS_TOP_COLOR:-1}" = 1 ] || { printf ''; return; }
+  case "$p" in --) printf '' ; return ;; esac
+  awk -v p="$p" 'BEGIN{ if(p>=300)print "31"; else if(p>=100)print "33"; else print "32" }'
+}
+
+# valid_uuid <s> : 0 if canonical libvirt uuid
+valid_uuid() { [[ "${1,,}" =~ $UUID_RE ]]; }
+# is_vmid_shape <name> : 0 if it matches the drvps VM id grammar
+is_vmid_shape() { [[ "$1" =~ $VMID_RE ]]; }
+
+# ============================================================================
+# LAYER 2 -- RAW parsers (string in -> records out; no subprocess)
+# ============================================================================
+
+# parse_list_uuid_name : stdin = `virsh list --all --uuid --name` output -> emit "uuid|name"
+#   virsh prints 3 columns: Id  Name  UUID for `list`; with --uuid --name it prints name then uuid
+#   lines. We accept the robust form: lines "<uuid> <name>" OR the table; we parse tokens.
+parse_list_uuid_name() {
+  awk '
+    /^[[:space:]]*$/ {next}
+    /^[[:space:]]*Id[[:space:]]/ {next}       # header
+    /^-+/ {next}                               # separator
+    {
+      uuid=""; name="";
+      for(i=1;i<=NF;i++){ if($i ~ /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/){uuid=tolower($i)} }
+      # name = the non-uuid, non-pure-integer token (skip the leading Id column and "-")
+      for(i=1;i<=NF;i++){ if($i!=uuid && $i !~ /^[0-9]+$/ && $i!="-"){ name=$i; break } }
+      if(uuid!="" ) printf "%s|%s\n", uuid, name;
+    }'
+}
+
+# parse_domstats <requested_uuid> : stdin = one `virsh domstats --raw <uuid>` record ->
+#   emit "state|cpu_time_ns|vcpu|balloon_cur|balloon_max" (empty field = absent). We attribute
+#   to the REQUESTED uuid regardless of the record's Domain name (TOCTOU-safe).
+parse_domstats() {
+  local req="$1"
+  awk -F= -v req="$req" '
+    /^[[:space:]]*$/ {next}
+    /^Domain:/ {next}
+    {
+      key=$1; val=$2; gsub(/^[ \t]+|[ \t]+$/,"",key); gsub(/^[ \t]+|[ \t]+$/,"",val);
+      if(key=="state.state") st=val;
+      else if(key=="cpu.time") cput=val;
+      else if(key=="vcpu.current") vc=val;
+      else if(key=="balloon.current") bc=val;
+      else if(key=="balloon.maximum") bm=val;
+    }
+    END{ printf "%s|%s|%s|%s|%s\n", st, cput, vc, bc, bm }'
+}
+
+# ============================================================================
+# LAYER 3 -- subprocess ADAPTERS (seamed; read-only; hard-bounded)
+# ============================================================================
+
+# q_db <sql> : one read-only sqlite3 call, fail-fast (silent `.timeout 0`, no busy-wait),
+# hard ~1s kill. `.timeout 0` is a dot-command (emits nothing, unlike `PRAGMA busy_timeout=0`
+# which echoes its value); mode=ro makes writes impossible; query_only=ON is defense-in-depth.
+# `timeout` wraps sqlite3 DIRECTLY (no shell pipe) so the KILL reaches sqlite3 itself.
+q_db() {
+  local sql="$1"
+  timeout --signal=TERM --kill-after=0.25 0.75 \
+    "$DR_SQLITE" -batch -noheader -separator '|' \
+      "file:${DR_VPS_DB}?mode=ro&cache=private" \
+    <<EOF | { head -c "${MAX_OUT:-1048576}"; cat >/dev/null; }
+.timeout 0
+PRAGMA query_only=ON;
+$sql
+EOF
+}
+# NB: the { head; cat >/dev/null; } drains sqlite fully so an OVER-CAP result caps the ECHO without SIGPIPE-
+# killing sqlite (which pipefail would misread as a read failure -> a false store:DOWN).
+
+# q_journal_mode : the live file's actual journal mode (delete|wal|...) -- probe only, never set.
+q_journal_mode() { q_db "PRAGMA main.journal_mode;" 2>/dev/null | head -1; }
+
+# q_ident : virsh list identity frame -> "uuid|name" lines (read-only, timeout-bounded)
+q_ident() { rvirsh list --all --uuid --name 2>/dev/null; }
+
+MAX_OUT=1048576   # cap any single adapter capture (bytes) -- an adversarial/huge output cannot exhaust memory
+
+# run_bounded <secs> <cmd...> : run <cmd> in a NEW SESSION (setsid) so a TERM-ignoring descendant is killed
+# via the WHOLE process GROUP on timeout (a plain `timeout` only signals the direct child, so a domstats
+# helper that re-parents/ignores TERM would survive). stdin is /dev/null; stdout is captured + capped to
+# MAX_OUT. Echoes stdout; returns the command's exit status (or the kill signal's 128+n).
+run_bounded() {
+  local secs="$1"; shift
+  local of; of="$(mktemp)" || return 1
+  setsid "$@" >"$of" 2>/dev/null </dev/null &
+  local pid=$!
+  # Poll in 0.1s steps up to `secs`; if the leader is still alive, TERM the whole GROUP, wait, then KILL the
+  # GROUP. The escalation is inline (no separate watcher to race/kill), so a TERM-ignoring group member is
+  # always reaped by the final SIGKILL even after the leader exits.
+  local n i; n=$(awk "BEGIN{print int($secs*10)}" 2>/dev/null); [ -n "$n" ] || n=40
+  for ((i = 0; i < n; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null; local rc=$?
+  head -c "$MAX_OUT" "$of" 2>/dev/null; rm -f "$of"
+  return "$rc"
+}
+
+# rvirsh <args...> : read-only, no-polkit, LC_ALL=C, hard per-call timeout with a whole-process-GROUP kill.
+rvirsh() {
+  LC_ALL=C run_bounded "${DR_VIRSH_TIMEOUT:-4}" \
+    "$DR_VIRSH" -r --no-pkttyagent -c "$DR_LIBVIRT_URI" "$@"
+}
+
+# owner_name <uid> : cached NSS lookup, bounded; echo the username or empty
+declare -A _OWNER_CACHE
+owner_name() {
+  local uid="$1"
+  [ -z "$uid" ] || [ "$uid" = NULL ] && { printf ''; return; }
+  if [ -n "${_OWNER_CACHE[$uid]+x}" ]; then printf '%s' "${_OWNER_CACHE[$uid]}"; return; fi
+  local n
+  n="$(timeout --signal=TERM --kill-after=0.25 1 "$DR_GETENT" passwd "$uid" 2>/dev/null | cut -d: -f1)"
+  _OWNER_CACHE[$uid]="$n"
+  printf '%s' "$n"
+}
+
+# schema_probe : read-only capability + integrity. Echoes "OK" or "SCHEMA:<detail>" /
+# "BUSY" / "LEDGER:<n>". Never migrates. Distinguishes a transient busy from a real absence.
+schema_probe() {
+  local out rc
+  # capability: required columns must all be present. A missing column -> old schema.
+  # Reproduce store_init's FULL refusal set read-only (dr_vps_store.sh L162-224): the required COLUMNS,
+  # plus the UNIQUE INDEXES + CHECK TRIGGERS that carry the store's uniqueness/NULL/range enforcement --
+  # TYPE-checked (a pre-planted TABLE named e.g. `images_kind_name_uq` must NOT satisfy the index check),
+  # so a store missing its enforcement (which store_init would refuse) is not shown as operational.
+  out="$(q_db "
+    SELECT 'vms:'||c FROM (WITH r(c) AS (VALUES('owner_uid'),('class'),('domain_uuid'),('artifact_id'),('state'),('name'),('created_at')) SELECT c FROM r)
+      WHERE c NOT IN (SELECT name FROM pragma_table_info('vms'))
+    UNION ALL SELECT 'images:'||c FROM (WITH r(c) AS (VALUES('kind'),('name'),('provenance'),('artifact_id')) SELECT c FROM r)
+      WHERE c NOT IN (SELECT name FROM pragma_table_info('images'))
+    UNION ALL SELECT 'snapshots:'||c FROM (WITH r(c) AS (VALUES('parent_golden_id'),('secret_bearing'),('validation_status'),('created_at'),('name')) SELECT c FROM r)
+      WHERE c NOT IN (SELECT name FROM pragma_table_info('snapshots'))
+    UNION ALL SELECT 'index:'||o FROM (WITH r(o) AS (VALUES('images_kind_name_uq'),('snapshots_name_uq')) SELECT o FROM r)
+      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='index')
+    UNION ALL SELECT 'trigger:'||o FROM (WITH r(o) AS (VALUES('images_kind_ins'),('images_kind_upd'),('snapshots_ins'),('snapshots_upd')) SELECT o FROM r)
+      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='trigger');" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then echo "BUSY"; return; fi           # fail-fast lock/timeout -> transient
+  if [ -n "$out" ]; then echo "SCHEMA:$(echo "$out" | tr '\n' ',' )"; return; fi
+  echo "OK"
+}
+
+# q_ledger : store integrity invariants (reproduce store_init's data checks read-only).
+# echoes the count of anomalies (0 = clean).
+q_ledger() {
+  q_db "SELECT
+    (SELECT count(*) FROM images WHERE kind NOT IN ('golden','snapshot'))
+  + (SELECT count(*) FROM images WHERE kind='snapshot' AND artifact_id NOT LIKE 'drvps-snap-%')
+  + (SELECT count(*) FROM images WHERE kind='golden'   AND artifact_id NOT LIKE 'drvps-raw-%')
+  + (SELECT count(*) FROM images i WHERE kind='snapshot' AND NOT EXISTS(SELECT 1 FROM snapshots s WHERE s.id=i.artifact_id))
+  + (SELECT count(*) FROM snapshots s WHERE NOT EXISTS(SELECT 1 FROM images i WHERE i.artifact_id=s.id AND i.kind='snapshot'));" 2>/dev/null
+}
+
+# q_vms : one read-only snapshot txn -> "VM|id|owner_uid|state|class|domain_uuid|name|created_at|kind|distro|artifact_id"
+q_vms() {
+  q_db "SELECT 'VM|'||v.id||'|'||coalesce(v.owner_uid,'NULL')||'|'||coalesce(v.state,'')||'|'||coalesce(v.class,'')
+        ||'|'||coalesce(v.domain_uuid,'')||'|'||coalesce(v.name,'')||'|'||coalesce(v.created_at,'')
+        ||'|'||coalesce(i.kind,'')
+        ||'|'||coalesce(CASE WHEN json_valid(i.provenance) THEN json_extract(i.provenance,'\$.distro') END,'')
+        ||'|'||coalesce(v.artifact_id,'')
+     FROM vms v LEFT JOIN images i ON i.artifact_id=v.artifact_id
+     ORDER BY v.created_at;"
+}
+
+# q_goldens / q_snaps : inventory rows
+q_goldens() { q_db "SELECT 'G|'||artifact_id||'|'||coalesce(CASE WHEN json_valid(provenance) THEN json_extract(provenance,'\$.distro') END,'?')||'|'||coalesce(created_at,'') FROM images WHERE kind='golden' ORDER BY created_at;"; }
+q_snaps()   { q_db "SELECT 'S|'||id||'|'||coalesce(name,'')||'|'||coalesce(parent_golden_id,'')||'|'||coalesce(secret_bearing,0)||'|'||coalesce(validation_status,'')||'|'||coalesce(created_at,'') FROM snapshots ORDER BY created_at;"; }
+
+# ============================================================================
+# main() runs only when executed, not when sourced.
+# ============================================================================
+
+usage() {
+  cat <<'EOF'
+drvps-top -- read-only operator rig-wide live TUI (run as the drvps user).
+Usage: drvps-top [--interval N] [--once] [--sort cpu|ram|age|owner]
+                 [--view top|inventory] [--no-color] [--help]
+  --interval N   hot-view refresh seconds (default 3, min 1)
+  --once         render a single frame and exit (offline/CI/watch entry point)
+  --sort KEY     initial TOP sort: cpu|ram|age|owner (default cpu)
+  --view V       initial view: top|inventory (default top)
+  --no-color     plain output (also implied on a non-tty)
+Keys (interactive): Tab switch view | s sort | r refresh | q quit
+EOF
+}
+
+# q_stats_one <uuid> : per-uuid domstats -> "state|cpu_ns|vcpu|bcur|bmax" (attributed to <uuid>).
+q_stats_one() { rvirsh domstats --raw --nowait --state --cpu-total --vcpu --balloon "$1" 2>/dev/null | parse_domstats "$1"; }
+
+# libvirt domstats state.state numeric -> label
+live_state() { case "$1" in 1) echo running;; 2) echo blocked;; 3) echo paused;; 4) echo shutdown;; 5) echo shutoff;; 6) echo crashed;; 7) echo pmsuspended;; ''|*) echo '?';; esac; }
+
+# acquire_top : build identity maps, classify each vms row (name<->uuid PAIR), run NORMAL-only
+# stats, emit normalized rows: class|owner_uid|id|store_state|live_state|vmclass|base|created_at|name|cpu|ram
+# Sets header-counter globals. CPU baseline (loop) is applied by the caller; --once shows '--'.
+# NOTE (design v5 sec 5.1): stats run SEQUENTIALLY here, each bounded by rvirsh's own hard timeout
+# (bounded per call). The bounded-parallel fan-out + single process-group pass-deadline is the
+# documented hardening for the code review; sequential is correct for a small rig.
+declare -gA _U2N _N2U _STCACHE
+A_absent=0; A_uuid=0; A_name=0; A_untracked=0; A_other=0; A_ledger=0
+SRC_DB=ok; SRC_LV=ok                     # acquisition source status -- a FAILURE is surfaced, never shown as empty
+acquire_top() {
+  local now; now="$(now_wall)"
+  _U2N=(); _N2U=(); A_absent=0; A_uuid=0; A_name=0; A_untracked=0; A_other=0; SRC_DB=ok; SRC_LV=ok
+  # libvirt identity: distinguish a FAILED acquisition (nonzero rvirsh rc -> SRC_LV=down, live state UNKNOWN)
+  # from a legitimately empty inventory (rc 0, 0 domains -> have_ident=1). A failed read is NEVER treated as
+  # an empty rig that mislabels every tracked VM `absent`.
+  local ident uuid name ident_rc; local -i have_ident=1
+  ident="$(q_ident)"; ident_rc=$?
+  if [ "$ident_rc" -ne 0 ]; then SRC_LV=down; have_ident=0; fi
+  while IFS='|' read -r uuid name; do
+    [ -z "$uuid" ] && continue
+    _U2N["$uuid"]="$name"; [ -n "$name" ] && _N2U["$name"]="$uuid"
+  done < <(printf '%s\n' "$ident" | parse_list_uuid_name)
+  A_ledger="$(q_ledger 2>/dev/null | head -1)"; [[ "$A_ledger" =~ ^[0-9]+$ ]] || A_ledger=0
+  # store read: capture q_vms's EXIT (process-substitution would hide a failure) -> SRC_DB=down surfaces a
+  # store read error as such, never as `(no tracked VMs)`.
+  local vf; vf="$(mktemp)" || return 1
+  q_vms >"$vf" 2>/dev/null || SRC_DB=down
+  # classify each vms row FIRST; collect NORMAL uuids for the stats pass
+  local -A claimed=()
+  local rid ruid rstate rclass ruuid rname rcreated rkind rdistro raid cls base lst cpu ram
+  local normals=()
+  while IFS='|' read -r _tag rid ruid rstate rclass ruuid rname rcreated rkind rdistro raid; do
+    [ "$_tag" = VM ] || continue
+    base="$(base_label "$rkind" "$rdistro" "$raid")"
+    cpu='--'; ram='--'; lst='?'
+    if [ -z "$ruuid" ] || ! valid_uuid "$ruuid"; then
+      cls=uuidbad; lst=store-uuid-invalid; A_ledger=$((A_ledger+1))
+    elif [ "$have_ident" -eq 1 ] && [ -n "${_U2N[$ruuid]+x}" ]; then
+      claimed["${_U2N[$ruuid]}"]=1
+      if [ "${_U2N[$ruuid]}" = "$rid" ]; then cls=normal; normals+=("$ruuid|$rid|$ruid|$rstate|$rclass|$base|$rcreated|$rname")
+      else cls=name; lst="name!=${_U2N[$ruuid]}"; A_name=$((A_name+1)); fi
+    elif [ "$have_ident" -eq 1 ] && [ -n "${_N2U[$rid]+x}" ]; then
+      claimed["$rid"]=1; cls=uuid; lst="uuid!=${_N2U[$rid]:0:8}"; A_uuid=$((A_uuid+1))
+    elif [ "$have_ident" -eq 1 ]; then
+      cls=absent; lst=absent; A_absent=$((A_absent+1))
+    else
+      cls=livedown; lst='live?'            # libvirt acquisition FAILED: live state UNKNOWN, NOT `absent`
+    fi
+    if [ "$cls" != normal ]; then
+      printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$cls" "$ruid" "$rid" "$rstate" "$lst" "$rclass" "$base" "$rcreated" "$rname" "$cpu" "$ram"
+    fi
+  done < "$vf"
+  rm -f "$vf"
+  # NORMAL-only stats pass (sequential, per-call bounded, with a WHOLE-PASS deadline so N VMs * per-call
+  # timeout can never make one frame unbounded).
+  local u sid srest st cpns vc bc bm
+  if [ "$have_ident" -eq 1 ]; then
+    local _stats_end=$(( SECONDS + ${DRVPS_TOP_STATS_DEADLINE:-20} ))
+    for entry in "${normals[@]}"; do
+      IFS='|' read -r u rid ruid rstate rclass base rcreated rname <<<"$entry"
+      if [ "$SECONDS" -ge "$_stats_end" ]; then      # whole-pass deadline: emit the row PRESENT with
+        # unavailable stats (live?/--/--) rather than DROPPING it -- a slow libvirt must not vanish VMs.
+        printf 'normal|%s|%s|%s|live?|%s|%s|%s|%s|%s|%s\n' "$ruid" "$rid" "$rstate" "$rclass" "$base" "$rcreated" "$rname" '--' '--'
+        continue
+      fi
+      IFS='|' read -r st cpns vc bc bm < <(q_stats_one "$u")
+      lst="$(live_state "$st")"
+      ram="$(ram_fmt "$bc" "$bm")"; cpu='--'
+      local mono_cur cpns_prev mono_prev; mono_cur="$(now_mono_ns)"
+      if [ -n "$cpns" ] && [ -n "${_STCACHE[$u]+x}" ]; then
+        IFS='|' read -r cpns_prev mono_prev <<<"${_STCACHE[$u]}"
+        cpu="$(cpu_pct "$cpns_prev" "$cpns" "$mono_prev" "$mono_cur")"
+      fi
+      [ -n "$cpns" ] && _STCACHE["$u"]="$cpns|$mono_cur"   # baseline for next tick
+      printf 'normal|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$ruid" "$rid" "$rstate" "$lst" "$rclass" "$base" "$rcreated" "$rname" "$cpu" "$ram"
+    done
+  fi
+  # untracked / other: live domains not consumed by any row
+  if [ "$have_ident" -eq 1 ]; then
+    for name in "${!_N2U[@]}"; do
+      [ -n "${claimed[$name]+x}" ] && continue
+      if is_vmid_shape "$name"; then A_untracked=$((A_untracked+1));
+        printf 'untracked|%s|%s|%s|untracked|%s|%s|%s|%s|%s|%s\n' '' "$name" '' '' '' '' "$(vm_shortname "$name")" '--' '--'
+      else A_other=$((A_other+1)); fi
+    done
+  fi
+}
+
+# ---- render helpers ----
+_c() { [ "${DRVPS_TOP_COLOR:-1}" = 1 ] && printf '\033[%sm' "$1" || printf ''; }
+_r() { [ "${DRVPS_TOP_COLOR:-1}" = 1 ] && printf '\033[0m' || printf ''; }
+hdr_line() {
+  local now nn; now="$(now_wall)"; nn="$(date -u -d "@$now" +%H:%M:%SZ 2>/dev/null || echo "${now}")"
+  local load mem; load="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"; mem="$(awk '/MemAvailable/{printf "%.1fG",$2/1048576}' /proc/meminfo 2>/dev/null)"
+  # SOURCE STATUS: a failed store/libvirt read is shown as `store:DOWN`/`libvirt:DOWN` -- an operator must
+  # never read a read failure as an empty rig.
+  local src=''
+  [ "${SRC_DB:-ok}" = down ] && src="$src $(_c '31')store:DOWN$(_r)"
+  [ "${SRC_LV:-ok}" = down ] && src="$src $(_c '31')libvirt:DOWN$(_r)"
+  printf '%sdrvps-top%s  %s  load %s/%s  memavail %s%s  anomalies: absent %s uuid! %s name! %s untracked %s other %s ledger %s\n' \
+    "$(_c '1')" "$(_r)" "$nn" "$load" "$(nproc 2>/dev/null||echo '?')" "$mem" "$src" "$A_absent" "$A_uuid" "$A_name" "$A_untracked" "$A_other" "$A_ledger"
+}
+
+render_top() {   # stdin = normalized rows
+  local now; now="$(now_wall)"
+  hdr_line
+  printf '%s%-14s %-11s %-8s %-15s %-9s %-22s %-7s %7s %-11s%s\n' "$(_c '1')" OWNER VM ID STATE CLASS BASE AGE CPU% RAM "$(_r)"
+  local cls ruid rid rstate lst rclass base rcreated rname cpu ram oname clabel age col
+  while IFS='|' read -r cls ruid rid rstate lst rclass base rcreated rname cpu ram; do
+    oname="$(owner_name "$ruid")"; clabel="$(owner_label "$ruid" "$oname")"
+    age="$(fmt_age "$rcreated" "$now")"; col="$(color_ramp "$cpu")"
+    printf '%-14.14s %-11.11s %-8.8s %-15.15s %-9.9s %-22.22s %-7.7s %s%7s%s %-11.11s\n' \
+      "$clabel" "$(vm_shortname "$rname")" "$(short_id "$rid")" "$(state_label "$rstate" "$lst")" \
+      "$rclass" "$base" "$age" "$([ -n "$col" ] && _c "$col")" "$cpu" "$([ -n "$col" ] && _r)" "$ram"
+  done
+}
+
+render_inventory() {
+  local now; now="$(now_wall)"; hdr_line
+  printf '%s-- GOLDENS --%s\n' "$(_c '1')" "$(_r)"
+  printf '%-10s %-12s %s\n' ID DISTRO BUILT
+  local _t id d c n p sec val
+  while IFS='|' read -r _t id d c; do [ "$_t" = G ] || continue; printf '%-10.10s %-12.12s %s\n' "$(short_id "$id")" "$d" "$c"; done < <(q_goldens)
+  printf '%s-- SNAPSHOTS --%s\n' "$(_c '1')" "$(_r)"
+  printf '%-10s %-16s %-10s %-6s %-8s %s\n' ID NAME PARENT SECRET VALID CREATED
+  while IFS='|' read -r _t id n p sec val c; do [ "$_t" = S ] || continue
+    printf '%-10.10s %-16.16s %-10.10s %-6s %-8s %s\n' "$(short_id "$id")" "$n" "$(short_id "$p")" "$([ "$sec" = 1 ] && echo yes || echo no)" "$val" "$c"
+  done < <(q_snaps)
+}
+
+sort_rows() {   # stdin rows, $1 = key ; sort NORMAL rows, keep anomalies on top
+  case "${1:-cpu}" in
+    cpu)   sort -t'|' -k10,10 -gr ;;
+    ram)   sort -t'|' -k11,11 -r ;;
+    age)   sort -t'|' -k8,8 ;;
+    owner) sort -t'|' -k2,2 ;;
+    *)     cat ;;
+  esac
+}
+
+frame_top() {   # acquire + render one TOP frame -- MUST stay in the main shell so acquire_top's
+  # global state (_STCACHE CPU baselines, _U2N/_N2U, A_* counters) and render_top's _OWNER_CACHE
+  # PERSIST across frames. A `$(acquire_top)` capture or a `... | render_top` pipeline would run
+  # them in a subshell and silently drop all of it.
+  local rf; rf="$(mktemp)" || return 1
+  acquire_top > "$rf"                                       # redirection: runs in THIS shell
+  render_top < <(sort_rows "${SORT_KEY:-cpu}" < "$rf")      # input-redir: render_top in THIS shell
+  rm -f "$rf"
+}
+
+# emit_inplace <file> : FLICKER-FREE redraw of a pre-rendered frame. Home the cursor (NO full
+# `\033[2J` clear -> no blank flash), overwrite each line and clear to end-of-line (so a shorter
+# new line doesn't leave old chars), then clear from cursor to end-of-screen (drops stale trailing
+# lines if the new frame is shorter). Reset SGR before each clear so `\033[K` erases with the
+# default background. This is what makes the screen STAY populated instead of blank-then-repaint.
+emit_inplace() {
+  printf '\033[H'
+  local ln
+  while IFS= read -r ln; do printf '%s\033[0m\033[K\n' "$ln"; done < "$1"
+  printf '\033[0m\033[J'
+}
+
+cleanup_tty() { local rc=$?; printf '\033[?25h\033[0m\n'; [ -n "${_FRAMEFILE:-}" ] && rm -f "$_FRAMEFILE"; trap - EXIT; exit "$rc"; }
+
+main() {
+  local interval=3 once=0 view=top
+  SORT_KEY=cpu
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) [ "$#" -ge 2 ] || { echo "drvps-top: --interval needs a value" >&2; return 2; }; interval="$2"; shift 2 ;;
+      --once)     once=1; shift ;;
+      --sort)     [ "$#" -ge 2 ] || { echo "drvps-top: --sort needs a value" >&2; return 2; }; SORT_KEY="$2"; shift 2 ;;
+      --view)     [ "$#" -ge 2 ] || { echo "drvps-top: --view needs a value" >&2; return 2; }; view="$2"; shift 2 ;;
+      --no-color) DRVPS_TOP_COLOR=0; shift ;;
+      --help|-h)  usage; return 0 ;;
+      *) echo "drvps-top: unknown arg: $1" >&2; usage; return 2 ;;
+    esac
+  done
+  case "$SORT_KEY" in cpu|ram|age|owner) ;; *) echo "drvps-top: bad --sort '$SORT_KEY' (cpu|ram|age|owner)" >&2; return 2 ;; esac
+  case "$view" in top|inventory) ;; *) echo "drvps-top: bad --view '$view' (top|inventory)" >&2; return 2 ;; esac
+  case "$interval" in ''|*[!0-9]*) interval=3 ;; esac
+  [ "$interval" -lt 1 ] && interval=1; [ "$interval" -gt 3600 ] && interval=3600
+  [ -t 1 ] || DRVPS_TOP_COLOR=0     # non-tty stdout -> plain (no ANSI)
+
+  if [ ! -r "$DR_VPS_DB" ]; then
+    echo "drvps-top: cannot read $DR_VPS_DB -- run as the drvps user (sudo -u drvps $0)" >&2; return 3
+  fi
+  # schema/capability gate: refuse an old/incomplete schema; retry a transient BUSY briefly.
+  local sp i=0
+  while :; do
+    sp="$(schema_probe)"
+    case "$sp" in
+      OK) break ;;
+      BUSY) i=$((i+1)); [ "$i" -ge 3 ] && { echo "drvps-top: store busy (schema probe); try again" >&2; return 4; } ;;
+      SCHEMA:*) echo "drvps-top: missing store columns: ${sp#SCHEMA:}" >&2
+                echo "drvps-top: store schema too old/incomplete; run the operator upgrade path" >&2; return 3 ;;
+      *) break ;;
+    esac
+  done
+
+  # --once or non-tty: single frame, no cursor/key modes; propagate render status
+  if [ "$once" = 1 ] || [ ! -t 1 ]; then
+    if [ "$view" = inventory ]; then render_inventory; else frame_top; fi
+    return $?
+  fi
+  # interactive needs a real terminal on BOTH stdin and stdout (else read -t EOFs -> a hot poll loop)
+  if [ ! -t 0 ]; then echo "drvps-top: interactive mode needs a terminal on stdin; use --once" >&2; return 2; fi
+
+  _FRAMEFILE="$(mktemp)" || return 1
+  trap cleanup_tty EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  printf '\033[?25l\033[2J'      # hide cursor + ONE-TIME clear on entry; frames redraw IN PLACE after
+  local key rc
+  while :; do
+    # Render the whole frame (table + footer) to a buffer IN THE MAIN SHELL (brace group, not a
+    # subshell -> acquire_top/render_top global state persists), then redraw it IN PLACE. No per-frame
+    # full-screen clear -> the screen stays populated instead of blank-flashing between frames.
+    { if [ "$view" = inventory ]; then render_inventory; else frame_top; fi
+      printf '[Tab] view  [s] sort:%s  [q] quit   interval=%ss\n' "$SORT_KEY" "$interval"
+    } > "$_FRAMEFILE"
+    emit_inplace "$_FRAMEFILE"
+    key=''
+    if read -rsn1 -t "$interval" key; then
+      case "$key" in
+        q|Q) break ;;
+        s|S) case "$SORT_KEY" in cpu) SORT_KEY=ram ;; ram) SORT_KEY=age ;; age) SORT_KEY=owner ;; *) SORT_KEY=cpu ;; esac ;;
+        $'\t') [ "$view" = top ] && view=inventory || view=top ;;
+      esac
+    else
+      rc=$?; [ "$rc" -le 128 ] && { echo "drvps-top: stdin closed" >&2; break; }   # <=128 = EOF/error, not a timeout
+    fi
+  done
+  return 0
+}
+
+# Guard: run main only when executed directly (sourcing for tests must not run it).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

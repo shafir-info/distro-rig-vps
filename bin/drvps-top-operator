@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# drvps-top-operator -- the OPERATOR's direct read-only live TUI (run AS the drvps user: sudo -u drvps ...).
+# Reads store.db (sqlite3 -readonly) + virsh -r and reconciles store-vs-libvirt. The member-facing viewer is
+# `drvps-top`; this is renamed so the member name never shadows the operator tool. See docs/CONCEPT-DRVPS-TOP.md.
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/tools/drvps-top" "$@"

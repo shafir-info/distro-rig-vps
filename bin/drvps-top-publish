@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# drvps-top-publish -- the PRIVILEGED feed publisher (runs AS drvps via drvps-top-publish.service). sqlite3
+# read-only + virsh -r -> one atomic feed snapshot in /run/drvps-top/feed. `--once` emits one to stdout.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck disable=SC1091
+[ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env 2>/dev/null || true
+exec python3 "$HERE/tools/drvps_top_publish.py" "$@"

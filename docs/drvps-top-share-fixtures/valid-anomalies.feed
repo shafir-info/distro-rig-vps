@@ -1,0 +1,8 @@
+H	1	pub-a1b2c3	42	1783960000	5300000000000	3000	ok	5300000000000	ok	5300000000000	ok	5300000000000	6	1	1	1	1	2	1	4880	39000000	8	no
+V	normal	drvps-vm-b71deae19298de23	weftg-x-P05	running	running	throwaway	golden:fedora44@bc07c9f7	1783959000	3123	1572864	1572864
+V	untracked	drvps-vm-15685c946b87396b	--	unknown	running	--	unknown	0	--	--	--
+V	absent	drvps-vm-a1a1a1a1a1a1a1a1	weftg-x-P05	running	--	throwaway	golden:fedora44@bc07c9f7	1783959000	--	--	--
+V	uuid	drvps-vm-b2b2b2b2b2b2b2b2	weftg-x-P05	running	--	throwaway	golden:fedora44@bc07c9f7	1783959000	--	--	--
+V	name	drvps-vm-c3c3c3c3c3c3c3c3	weftg-x-P05	running	--	throwaway	golden:fedora44@bc07c9f7	1783959000	--	--	--
+V	uuidbad	drvps-vm-d4d4d4d4d4d4d4d4	weftg-x-P05	running	--	throwaway	golden:fedora44@bc07c9f7	1783959000	--	--	--
+E	pub-a1b2c3	42	6
