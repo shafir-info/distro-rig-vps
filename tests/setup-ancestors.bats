@@ -366,7 +366,7 @@ _M1_VIRSH='virsh(){ case "$*" in *"net-list"*) echo simnet;; *"net-dumpxml"*) pr
 
 @test "preflight: the fleet lockstep guard runs on the LITERAL runtime path BEFORE _preflight_collision, with a symlink refusal" {
   # The early guard must mirror step_env EXACTLY (literal /etc/distro-rig-vps/fleet.json + symlink refusal),
-  # NOT a DR_VPS_FLEET_JSON override (r6 MAJOR: preflight and step_env would otherwise gate different files).
+  # NOT a DR_VPS_FLEET_JSON override (preflight and step_env would otherwise gate different files).
   local pblk; pblk=$(sed -n '/^step_preflight() {/,/^}/p' "$BIN")
   [[ "$pblk" == *'/etc/distro-rig-vps/fleet.json'* ]]             # the literal runtime path, not an override
   [[ "$pblk" == *'_dr_vps_fleet_cache_guard'* ]]

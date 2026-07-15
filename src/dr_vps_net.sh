@@ -29,6 +29,10 @@ dr_vps_net_generation() {
 # libvirt default-NAT. Guest-to-guest L2 is NOT filtered HERE (nft is L3) -- it is enforced at the
 # libvirt layer instead: every rig NIC is rendered with <port isolated='yes'/> (dr_vps_domain.sh), so
 # the bridge blocks guest<->guest traffic. (There is still no per-VM source-IP anti-spoof L3 rule.)
+# BASE-CHAIN COMPOSITION (DR-2): nft ACCEPTs do NOT compose across tables/base chains -- every base chain on a
+# hook runs and a REJECT anywhere wins. On a firewalld-ACTIVE host this guest_in ACCEPT is overridden by
+# firewalld's REJECT in drvps0's zone, so the host firewall must ALSO allow guest/24 -> cache_cidr:cache_port +
+# mock_ports. dr-vps-setup's step_firewalld installs that as scoped permanent rich-rules (no-op off firewalld).
 dr_vps_net_render() {  # [profile=simulated]
   local profile="${1:-simulated}" f cache_cidr cache_port mocks gen p
   [ "$profile" = simulated ] || { dr_vps_die "$DR_VPS_E_USAGE" "Phase 1 renders only 'simulated' (got '$profile')"; return $?; }

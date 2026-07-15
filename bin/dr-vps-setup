@@ -495,6 +495,11 @@ validate_env() {
   # the watcher/reaper units run As this user -- it must NOT be root/UID 0 (core model: never root).
   case "$DR_VPS_SERVICE_USER" in root) echo "[setup] FATAL: DR_VPS_SERVICE_USER must not be root (the watcher runs unprivileged)" >&2; exit 2;; esac
   [ "$(id -u "$DR_VPS_SERVICE_USER" 2>/dev/null || echo 1)" != 0 ] || { echo "[setup] FATAL: DR_VPS_SERVICE_USER resolves to UID 0 -- refusing" >&2; exit 2; }
+  # The v2 egress store's anchor + service identity are FIXED constants the seam-free approve tool hardcodes
+  # (/var/lib/distro-rig-vps-egress, user/group drvps). A custom DR_VPS_SERVICE_USER would split the store
+  # from the approve tool AND make the egress lock group wrong. Reject it HERE (validate_env runs before ANY
+  # mutation and before every dry-run return), so no egress lock/store is ever created under a wrong identity.
+  [ "$DR_VPS_SERVICE_USER" = drvps ] || { echo "[setup] FATAL: the egress store requires the fixed 'drvps' service identity (the seam-free approve tool hardcodes it); DR_VPS_SERVICE_USER='$DR_VPS_SERVICE_USER' is not supported" >&2; exit 2; }
   # ---- the rig bridge / guest-subnet knob: ONE source for every lockstep endpoint ---------------------
   # DR_VPS_BRIDGE_IP (default = the historical literal 10.123.0.1) drives: the simnet XML ip + dhcp range
   # (_dr_vps_net_xml), the squid bind ip + source ACL pins below, the persisted DR_VPS_GUEST_PROXY line
@@ -558,6 +563,8 @@ validate_env() {
   # An inherited env could point it at an arbitrary binary; constrain to a safe charset (a bare command
   # name like 'nft' or an absolute path), never metacharacters.
   case "${DR_NFT:-nft}" in *[!A-Za-z0-9_/.-]*) echo "[setup] FATAL: DR_NFT has unsafe characters (got: ${DR_NFT})" >&2; exit 2;; esac
+  # DR_FIREWALL_CMD is the firewall-cmd binary the ROOT step_firewalld execs (DR-2). Same charset fence as DR_NFT.
+  case "${DR_FIREWALL_CMD:-firewall-cmd}" in *[!A-Za-z0-9_/.-]*) echo "[setup] FATAL: DR_FIREWALL_CMD has unsafe characters (got: ${DR_FIREWALL_CMD})" >&2; exit 2;; esac
   # Observability console-log dir: the ROOT installer CREATES/CHOWNS/labels it -- SAME path-safety as
   # DR_VPS_SYS_STATE (absolute + safe charset + rig-namespace + root-owned ancestors, symlink-swap proof).
   # On the apt family detect_host relocates the DEFAULT under /var/lib (root:root ancestor) so this strict
@@ -621,8 +628,7 @@ run_sh() {  # <snippet-literal> [args...]
 have() { command -v "$1" >/dev/null 2>&1; }
 need_root() { [ "$DRY_RUN" -eq 1 ] || [ "$(id -u)" = 0 ] || { echo "must run as root (or --dry-run)" >&2; exit 12; }; }
 
-# ---- shared bounded-poll for post-mutation verify reads (verify-class hardening, TODO "AUDIT THE VERIFY
-# CLASS") -------------------------------------------------------------------------------------------------
+# ---- shared bounded-poll for post-mutation verify reads (verify-class hardening) ------------------------
 # A read-once postcondition that IMMEDIATELY follows a socket-activated libvirt/systemd mutation can race the
 # daemon reflecting the change (the net-autostart false-negative on fc44 was one instance of the CLASS). This
 # is the single primitive every such read routes through: poll PREDICATE (a command + args) until it succeeds
@@ -1029,8 +1035,8 @@ _preflight_collision() {
       else
         # An OWNED ACTIVE drvps0 must also CARRY the expected live address: a
         # DELETED or REPLACED <bip>/24 leaves the stored net XML correct (reconcile no-ops, net stays
-        # ACTIVE) and setup would report success with a bridge the guests cannot reach. Shared helper
-        # (r15 m folded the same check into the reapply light path).
+        # ACTIVE) and setup would report success with a bridge the guests cannot reach. Shared helper,
+        # used by both the full setup path and the reapply light path.
         hit=$(_live_bridge_addr_missing)
       fi
     else
@@ -1500,6 +1506,75 @@ step_proxy() {
     printf '  [dry-run] back up squid.conf; write src/method/port policy from mirror_allowlist; squid -k parse; restart; verify %s:3128\n' "$pip"
     return 0
   fi
+  # 1.9-lock: create the SHARED data lock (root:drvps 0660) + the approve/migration ROOT SESSION lock
+  # (root:root 0600) BEFORE the store setup below -- drvps-egress-migrate takes these locks and must not have
+  # to create them itself (a umask-masked create would yield a mode the drvps member/reaper cannot open). The
+  # inode is never recreated if present (a held flock must survive), but the exact owner/group/mode is ALWAYS
+  # re-enforced so a prior wrong-perm lock is corrected. FIXED path in the ROOT-owned /etc/distro-rig-vps, so
+  # the inode is tamper-proof (no chown of a service-user-controlled path).
+  local _EGLOCK="/etc/distro-rig-vps/egress.lock" _EGSESS="/etc/distro-rig-vps/egress-session.lock" _EGLOCKFD=""
+  # Enforce the CONTAINING dir as root:root 0755 FIRST (fd-safe: create-or-reuse, exact owner/group/mode/type)
+  # -- a non-root-owned /etc/distro-rig-vps would let a service user rename the lock inode + split a held flock.
+  # `install -d` does NOT correct an existing dir's owner, so use the fd guard.
+  _fs_guard_py dir /etc/distro-rig-vps root root 0755 \
+    || { echo "[setup] could not enforce /etc/distro-rig-vps as root:root 0755" >&2; exit 1; }
+  # fd-safe enforcement of each lock (create-or-reuse, no inode replacement -> a held flock survives): exact
+  # owner UID root, group, mode, and REGULAR-file type; fails closed on a symlink/non-regular/wrong-owner
+  # object (chgrp+chmod alone would leave a wrong UID or a planted non-regular lock).
+  _fs_guard_py file "$_EGLOCK" root drvps 0660 \
+    || { echo "[setup] could not enforce the egress data lock as root:drvps 0660" >&2; exit 1; }
+  _fs_guard_py file "$_EGSESS" root root 0600 \
+    || { echo "[setup] could not enforce the egress session lock as root:root 0600" >&2; exit 1; }
+  # 1.9a v2 EGRESS STORE (docs/EGRESS-STORE-ARCH-UPGRADE.md): set up the ROOT-OWNED store BEFORE acquiring the
+  # egress lock below (drvps-egress-migrate takes that same lock itself, so it must not run while we hold it).
+  # GREENFIELD (no v1 store): provision the FIXED v2 anchor -- root-owned anchor + drvps write leaves (pending/,
+  # expiry/) + root-private (batches/, journals/) + published root->drvps read interface (decisions/, claims/,
+  # setgid group=drvps) + schema marker LAST. UPGRADE (a v1 store at /var/lib/distro-rig-vps/egress AND no v2
+  # yet): run drvps-egress-migrate, which builds v2 from v1 via a private staging tree + atomic cutover. Both
+  # idempotent, root-only; the anchor + drvps identity are FIXED constants matching the seam-free approve tool.
+  # tests/egress-setup-lock.sh asserts this literal == L.ANCHOR.
+  # The v2 egress store's anchor + identity are FIXED constants the seam-free approve tool hardcodes
+  # (/var/lib/distro-rig-vps-egress, user/group drvps), so a custom DR_VPS_SERVICE_USER is unsupported for
+  # egress -- reject it rather than silently splitting the store from the approve tool. The v1 store, however,
+  # lives at the (possibly custom) 2.0 STATE_DIR/egress, which is passed to the migrator explicitly.
+  # (DR_VPS_SERVICE_USER == drvps is asserted in validate_env, before any mutation -- see there.)
+  local _EGANCHOR="/var/lib/distro-rig-vps-egress" _EGV1="${DR_VPS_SYS_STATE}/egress" _egst="" _egrc="" _u=""
+  if getent passwd drvps >/dev/null 2>&1; then
+    if [ -e "$_EGV1" ] && [ ! -e "$_EGANCHOR" ]; then
+      # QUIESCE the v1 store before migrating it (arch Stage 3): stop any RUNNING watcher/reaper (an upgrade
+      # from 2.0), then VERIFY every unit is positively inactive/failed via `systemctl show ActiveState`. This
+      # is FAIL-CLOSED: an active/transitioning/unknown state OR an indeterminate query (transport/timeout/
+      # non-zero) aborts the install (it would race the copy-out). A non-existent unit reports inactive.
+      # step_units restarts them later (now on v2).
+      for _u in drvps-rigctl.service drvps-rigreaper.timer drvps-rigreaper.service; do
+        run_sh 'systemctl stop "$1" 2>/dev/null || true' "$_u"
+      done
+      for _u in drvps-rigctl.service drvps-rigreaper.timer drvps-rigreaper.service; do
+        _egst="$(systemctl show -p ActiveState --value "$_u" 2>/dev/null)"; _egrc=$?
+        case "$_egrc:$_egst" in
+          0:inactive|0:failed) ;;
+          *) echo "[setup] FATAL: cannot confirm $_u is stopped (ActiveState='$_egst', rc=$_egrc) -- refusing to migrate the v1 egress store against a possibly-live writer; stop it and re-run" >&2; exit 1;;
+        esac
+      done
+      python3 "$HERE/../bin/drvps-egress-migrate" "$_EGV1" \
+        || { echo "[setup] egress v1->v2 migration failed (drain the v1 store, then re-run)" >&2; exit 1; }
+    else
+      python3 "$HERE/../tools/drvps_egress_layout.py" provision "$_EGANCHOR" \
+        || { echo "[setup] egress store provisioning failed for $_EGANCHOR" >&2; exit 1; }
+    fi
+  else
+    echo "[setup] WARNING: the 'drvps' service identity is absent -- skipping egress store setup" >&2
+  fi
+  # 1.9 SHARED EGRESS LOCK: step_proxy / --reapply-egress AND the root approve tool
+  # BOTH regenerate /etc/squid/squid.conf + restart squid from fleet.json. Take the SAME lock the approve
+  # holds so an in-flight reapply can never race the approve's crash-recovery (which classifies commit
+  # journals against the fleet). The lock lives in the ROOT-owned /etc/distro-rig-vps (see below) so root
+  # (setup/approve) and drvps (reaper/member) share it; held for this whole step, released on any exit.
+  # The lock (root:drvps 0660) was created + enforced in 1.9-lock above; here we only ACQUIRE it (after the
+  # store setup, so migrate/provision -- which take this same lock -- have already run + released it).
+  exec {_EGLOCKFD}>>"$_EGLOCK" || { echo "[setup] cannot open egress lock $_EGLOCK (fail-closed)" >&2; exit 1; }
+  flock -w "${DR_VPS_EGRESS_LOCK_WAIT:-120}" -x "$_EGLOCKFD" \
+    || { echo "[setup] could not acquire the egress lock within ${DR_VPS_EGRESS_LOCK_WAIT:-120}s (an approve/reapply in flight?) -- retry" >&2; exit 1; }
   mirrors=""
   while IFS= read -r d; do
     case "$d" in ''|*[!A-Za-z0-9.-]*) echo "[setup] bad mirror domain in fleet: '$d'" >&2; exit 1;; esac
@@ -1607,48 +1682,53 @@ step_proxy() {
   install -m 0644 /etc/squid/drvps-ca.crt /etc/distro-rig-vps/cache-ca.crt \
     || { echo "[setup] publishing cache CA failed (goldens would lack a trust anchor)" >&2; exit 1; }   # for golden baking
   conf=$(mktemp)
-  { printf '%s -- regenerated by dr-vps-setup; edit /etc/distro-rig-vps/fleet.json + --reapply-egress, NOT this file\n' "$drvps_marker"
-    printf 'http_port %s:3128 ssl-bump cert=/etc/squid/drvps-ca.pem generate-host-certificates=on dynamic_cert_mem_cache_size=4MB\n' "$pip"
-    printf 'sslcrtd_program %s -s /var/lib/ssl_db -M 4MB\n' "$certgen"
-    printf 'acl drvps_guests src %s\n' "${DR_VPS_PROXY_SRC:-10.123.0.0/24}"
-    # AUTHORIZE on the real destination (dstdomain), NOT the guest-controlled SNI: a guest can set
-    # CONNECT host and SNI independently, so SNI-based http_access would let `CONNECT evil:443` with
-    # a mirror SNI reach the internet. SNI is used ONLY as the bump selector.
-    printf 'acl mirror_sni ssl::server_name %s\n' "$mirrors"
-    printf 'acl mirror_dst dstdomain %s\n' "$mirrors"
-    printf 'acl mirror_methods method GET HEAD\n'
-    printf 'acl drvps_connect method CONNECT\n'
-    printf 'acl drvps_https port 443\n'
-    printf 'acl drvps_http port 80 443\n'   # GET on http(80) or the bumped https(443)
-    printf 'acl step1 at_step SslBump1\n'
-    printf 'ssl_bump peek step1\n'
-    printf 'ssl_bump bump mirror_sni\n'     # bump (decrypt+cache) only when the SNI is a mirror
-    printf 'ssl_bump terminate all\n'       # any other TLS host: terminate (nothing else leaves)
-    printf 'http_access deny !drvps_guests\n'
-    printf 'http_access allow drvps_connect mirror_dst drvps_https\n'    # CONNECT only to mirror HOST :443 (-> bumped+cached)
-    printf 'http_access allow mirror_methods mirror_dst drvps_http\n'    # GET/HEAD only to mirror host :80|443
-    printf 'http_access deny all\n'
-    printf 'coredump_dir /var/spool/squid\n'
-    # PERSISTENT on-demand content cache: distro packages fetched once are stored + reused across
-    # VMs (a compact base + a warm cache, not a TB mirror). SSL-bump makes the HTTPS repo cacheable.
-    printf 'cache_dir ufs /var/spool/squid %s 16 256\n' "${DR_VPS_CACHE_MB:-8192}"
-    printf 'maximum_object_size %s MB\n' "${DR_VPS_CACHE_MAXOBJ_MB:-2048}"
-    printf 'cache_mem 256 MB\n'
-    printf 'refresh_pattern -i \\.(rpm|drpm|xml|gz|xz|bz2|sqlite)$ 10080 90%% 43200\n'
-  } >"$conf"
+  # Render the squid.conf BODY via the ONE pure renderer (tools/drvps_egress_model.py) -- the single
+  # source of truth shared with drvps-egress-approve; NO inline ACL/ssl_bump text here. Byte-identical
+  # to the former inline block (proven by tests/egress-render-noop.sh). AUTHORIZE on dstdomain (not the
+  # guest-controlled SNI: a guest sets CONNECT host and SNI independently); SNI is only the bump
+  # selector; `terminate all` kills every non-mirror TLS -- all enforced inside the renderer.
+  local _rp _rhf
+  _rp=$(mktemp); _rhf=$(mktemp)
+  printf '{"proxy_ip":"%s","proxy_src":"%s","cache_mb":%s,"maxobj_mb":%s,"certgen_path":"%s"}\n' \
+    "$pip" "${DR_VPS_PROXY_SRC:-10.123.0.0/24}" "${DR_VPS_CACHE_MB:-8192}" "${DR_VPS_CACHE_MAXOBJ_MB:-2048}" "$certgen" >"$_rp"
+  printf '{}\n' >"$_rhf"
+  if ! python3 "$SRC/../tools/drvps_egress_model.py" render --fleet "$fleet" --params "$_rp" --host-facts "$_rhf" >"$conf"; then
+    rm -f "$conf" "$_rp" "$_rhf"
+    echo "[setup] egress renderer (tools/drvps_egress_model.py) failed -- NOT installing squid.conf (live config preserved)" >&2
+    exit 1
+  fi
+  # KEEP _rp/_rhf until squid.conf is validated + installed: drvps-egress-approve re-renders the config
+  # from these EXACT inputs (+ fleet.json) when it opens a splice, so they are persisted below (BLOCKER:
+  # without them a real-host `drvps-egress-approve apply` crashes in _render_params before it can run).
   # PARSE THE TEMP FIRST: validate the generated config before it clobbers the live squid.conf, so a
   # render regression can't leave the proxy with a broken config it then can't restart from. Capture the
   # parser's stderr (M4): a squid BUILD without the needed ssl-bump options fails here with a real
   # message that a bare >/dev/null 2>&1 would have hidden.
   local _perr
   if ! _perr=$(squid -f "$conf" -k parse 2>&1 >/dev/null); then
-    rm -f "$conf"
+    rm -f "$conf" "$_rp" "$_rhf"
     echo "[setup] generated squid.conf failed 'squid -k parse' -- NOT installing (live config preserved). squid says:" >&2
     printf '%s\n' "$_perr" | sed 's/^/    squid| /' >&2
     exit 1
   fi
-  install -m 0644 "$conf" /etc/squid/squid.conf || { rm -f "$conf"; echo "[setup] write squid.conf failed" >&2; exit 1; }
+  install -m 0644 "$conf" /etc/squid/squid.conf || { rm -f "$conf" "$_rp" "$_rhf"; echo "[setup] write squid.conf failed" >&2; exit 1; }
   rm -f "$conf"
+  # Persist the EXACT render inputs (same-dir atomic rename, root:root 0644) so drvps-egress-approve can
+  # reproduce this config to open a splice. fleet.json already lives at /etc/distro-rig-vps; these two
+  # complete the reproducible RenderParams (PLAN Task 1.9). host-facts is `{}` here -- it MATCHES what this
+  # step rendered with (a stronger SSRF fact set is a separate, tracked hardening item), so approve re-renders
+  # a config that differs from live only by the newly-approved splice.
+  _dr_atomic_install_root() {   # <src-tmp> <dest> : atomic same-fs rename, 0644 root:root
+    local _t; _t=$(mktemp -p /etc/distro-rig-vps ".$(basename "$2").XXXXXX") || return 1
+    cat "$1" >"$_t" && chmod 0644 "$_t" && chown root:root "$_t" && mv -f "$_t" "$2" || { rm -f "$_t"; return 1; }
+  }
+  if ! _dr_atomic_install_root "$_rp" /etc/distro-rig-vps/egress-render-params.json \
+     || ! _dr_atomic_install_root "$_rhf" /etc/distro-rig-vps/egress-host-facts.json; then
+    rm -f "$_rp" "$_rhf"
+    echo "[setup] failed to persist egress render inputs -- drvps-egress-approve would be unable to open a splice" >&2
+    exit 1
+  fi
+  rm -f "$_rp" "$_rhf"
   run squid -k parse
   run_sh 'squid -z 2>/dev/null; true'        # initialize the cache_dir structure (idempotent)
   # Reboot-safety (advisor): squid binds the bridge IP 10.123.0.1, which only exists once
@@ -1713,6 +1793,7 @@ step_proxy() {
       exit 1
     }
   fi
+  [ -n "$_EGLOCKFD" ] && exec {_EGLOCKFD}>&-   # release the shared egress lock (also released on process exit)
 }
 
 step_nft() {
@@ -1725,6 +1806,48 @@ step_nft() {
       bash -c '. "$1/dr_vps_api.sh"; . "$1/dr_vps_net.sh"; dr_vps_net_apply' _ "$SRC" \
         || { echo "[setup] nft apply failed (fail-closed)" >&2; exit 1; }
   fi
+}
+
+# DR-2: on a firewalld-ACTIVE host, nftables runs EVERY base chain on a hook, so firewalld's REJECT (in
+# drvps0's zone) overrides drvps_sim.guest_in's ACCEPT -> the WHOLE SSL-bump cache/egress path is inert (guest
+# `dnf install` gets proxy-connect refused). We install SCOPED permanent rich-rules (guest /24 -> cache_cidr,
+# tcp cache_port + each mock_port -- the SAME fleet.json the nft fence renders from), idempotent, and bind
+# drvps0 to the zone. No-op if firewalld is inactive (the nft fence alone suffices). LOUD on failure (a
+# firewalld host stays blocked until fixed) but non-fatal (the operator can re-run / fix firewalld).
+step_firewalld() {
+  local fcmd="${DR_FIREWALL_CMD:-firewall-cmd}"
+  command -v "$fcmd" >/dev/null 2>&1 || return 0
+  "$fcmd" --state >/dev/null 2>&1 || return 0            # firewalld installed but not running -> nothing to do
+  say "firewalld active: opening guest->cache in drvps0's zone (DR-2, else the cache is unreachable)"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] firewalld rich-rules guest/24 -> cache_cidr:cache_port + mock_ports on drvps0 zone\n'; return 0; fi
+  local fleet="${DR_VPS_SYS_STATE}/fleet.json"; [ -r "$fleet" ] || fleet="$HERE/../etc/fleet.json"
+  local cache port guest zone; local -a ports=()
+  cache=$(jq -r '.simulated_allow.cache_cidr // empty' "$fleet" 2>/dev/null)
+  port=$(jq -r '.simulated_allow.cache_port // empty' "$fleet" 2>/dev/null)
+  guest="${DR_VPS_BRIDGE_IP%.*}.0/24"                    # the isolated guest /24 (bridge is its .1)
+  case "$cache" in ''|null) echo "[setup] firewalld: no simulated_allow.cache_cidr in $fleet -- skipping (fix fleet.json)" >&2; return 0;; esac
+  case "$port"  in ''|null|*[!0-9]*) echo "[setup] firewalld: bad cache_port '$port' -- skipping" >&2; return 0;; esac
+  ports+=("$port")
+  local mp; while IFS= read -r mp; do case "$mp" in ''|*[!0-9]*) continue;; *) ports+=("$mp");; esac; done < <(jq -r '.simulated_allow.mock_ports[]?' "$fleet" 2>/dev/null)
+  # the zone drvps0 lands in (a libvirt-style zone by default); fall back to the 'libvirt' zone or the default.
+  zone=$("$fcmd" --get-zone-of-interface=drvps0 2>/dev/null)
+  [ -n "$zone" ] || { "$fcmd" --info-zone=libvirt >/dev/null 2>&1 && zone=libvirt || zone=$("$fcmd" --get-default-zone 2>/dev/null); }
+  [ -n "$zone" ] || { echo "[setup] firewalld: could not determine drvps0's zone -- skipping" >&2; return 0; }
+  local rc=0 p rule
+  for p in "${ports[@]}"; do
+    rule="rule family=ipv4 source address=$guest destination address=$cache port port=$p protocol=tcp accept"
+    if "$fcmd" --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1; then continue; fi   # idempotent
+    "$fcmd" --permanent --zone="$zone" --add-rich-rule="$rule" >/dev/null 2>&1 || { echo "[setup] firewalld: add-rich-rule failed (port $p)" >&2; rc=1; }
+  done
+  # persist drvps0<->zone binding (a --reload drops the RUNTIME binding, leaving the permanent rules unapplied)
+  "$fcmd" --permanent --zone="$zone" --query-interface=drvps0 >/dev/null 2>&1 \
+    || "$fcmd" --permanent --zone="$zone" --add-interface=drvps0 >/dev/null 2>&1 || rc=1
+  "$fcmd" --reload >/dev/null 2>&1 || rc=1
+  if [ "$rc" -ne 0 ]; then
+    echo "[setup] WARNING (DR-2): firewalld config incomplete -- guests may not reach the cache at $cache:$port." >&2
+    echo "[setup]   re-run setup, or manually: $fcmd --permanent --zone=$zone --add-rich-rule='...' ; $fcmd --reload" >&2
+  fi
+  return 0
 }
 
 step_spool() {                     # Phase-2: the agent control-loop spool + the drvpsctl group
@@ -1918,6 +2041,62 @@ EOF
   run systemctl enable --now drvps-rigreaper.timer
 }
 
+step_top() {                       # drvps-top: viewer trust config (/etc/drvps-top/viewer.conf) + the feed
+  # publisher service (User=drvps). ANCILLARY read-only dashboard -- every failure here WARNs + returns 0 so
+  # a publisher hiccup never fails the core rig install; the viewer just shows an absent/stale feed.
+  say "drvps-top: viewer.conf + drvps-top-publish.service (read-only rig dashboard)"
+  local root; root="$(cd -P "$HERE/.." && pwd -P)"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] install /etc/drvps-top/viewer.conf + drvps-top-publish.service\n'; return 0; fi
+  local _uid _gid
+  _uid="$(id -u "$DR_VPS_SERVICE_USER" 2>/dev/null)"
+  _gid="$(getent group "$DR_VPS_CTL_GROUP" | cut -d: -f3)"
+  if [ -z "$_uid" ] || [ -z "$_gid" ]; then
+    echo "[setup] drvps-top: cannot resolve $DR_VPS_SERVICE_USER:$DR_VPS_CTL_GROUP ids -- skipping the dashboard" >&2; return 0
+  fi
+  # viewer trust anchor: a ROOT-owned NUMERIC config (root:root 0644) -- the viewer's ONLY trust source.
+  install -d -m 0755 -o root -g root /etc/drvps-top 2>/dev/null || true
+  local _cf; _cf="$(mktemp)" || return 0
+  cat >"$_cf" <<EOF
+feed_dir=/run/drvps-top
+feed_name=feed
+feed_uid=$_uid
+feed_gid=$_gid
+feed_mode=0640
+dir_mode=0710
+max_bytes=262144
+EOF
+  install -m 0644 -o root -g root "$_cf" /etc/drvps-top/viewer.conf 2>/dev/null || echo "[setup] drvps-top: could not install viewer.conf" >&2
+  rm -f "$_cf"
+  # publisher: long-running (Type=simple), User=drvps Group=drvpsctl; RuntimeDirectory -> /run/drvps-top owned
+  # drvps:drvpsctl 0710 (matches the viewer trust anchor). Reads store.db (mode=ro) + virsh -r only.
+  cat >/etc/systemd/system/drvps-top-publish.service <<EOF || { echo "[setup] write drvps-top-publish unit failed" >&2; return 0; }
+[Unit]
+Description=drvps-top read-only feed publisher (rig snapshot for the drvps-top viewer)
+After=$LIBVIRT_UNIT
+[Service]
+Type=simple
+User=$DR_VPS_SERVICE_USER
+Group=$DR_VPS_CTL_GROUP
+RuntimeDirectory=drvps-top
+RuntimeDirectoryMode=0710
+Environment=DRVPS_TOP_FEED_DIR=/run/drvps-top DRVPS_TOP_FEED_UID=$_uid DRVPS_TOP_FEED_GID=$_gid
+ExecStart=$root/bin/drvps-top-publish
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  run systemctl daemon-reload
+  systemctl enable --now drvps-top-publish.service 2>/dev/null || {
+    echo "[setup] drvps-top-publish.service did not start (non-fatal -- the viewer shows an absent/stale feed):" >&2
+    journalctl -u drvps-top-publish.service -n 12 --no-pager 2>&1 | sed 's/^/    top-publish| /' >&2 || true
+  }
+  return 0
+}
+
 step_verify() {
   # INFORMATIONAL sanity preview only -- NOT an install postcondition.
   # The hard postconditions (net Active+isolated+DHCP+DNS-off, nft applied, squid -k parse)
@@ -1946,7 +2125,7 @@ do_install() {
   fi
   # &&-chained inside an if so a step that returns nonzero (without exiting) halts BEFORE
   # the DONE banner.
-  if step_preflight && step_deps && step_user && step_sshkey && step_libvirt && step_state && step_console && step_env && step_proxy && step_nft && step_spool && step_units && step_verify; then
+  if step_preflight && step_deps && step_user && step_sshkey && step_libvirt && step_state && step_console && step_env && step_proxy && step_nft && step_firewalld && step_spool && step_units && step_top && step_verify; then
     :
   else
     echo "[setup] install failed (fail-closed)" >&2; exit 1
@@ -1968,6 +2147,8 @@ do_install() {
     say "  To let the AGENT drive it, add the agent user to '$DR_VPS_CTL_GROUP' then re-login:"
     say "    usermod -aG $DR_VPS_CTL_GROUP <agent-user>"
     say "  then the agent runs: $HERE/rigctl create|exec|recreate|destroy ... (no sudo, no KVM)."
+    say "  AI agent? run once (no sudo) so it auto-discovers rigctl after any context clear:"
+    say "    $HERE/drvps-skill-install"
   fi
 }
 
@@ -2007,9 +2188,10 @@ do_uninstall() {
     say "  (uninstall) '$DR_VPS_NET_NAME' is not drvps-owned (no marker) -- leaving it (use --adopt-simnet to force)"
   fi
   run_sh 'nft delete table inet drvps_sim 2>/dev/null; true'
-  run_sh 'systemctl disable --now drvps-rigctl.service drvps-rigreaper.timer drvps-rigreaper.service drvps-rigsubmit.socket drvps-egress.timer drvps-egress.service 2>/dev/null; true'
+  run_sh 'systemctl disable --now drvps-rigctl.service drvps-rigreaper.timer drvps-rigreaper.service drvps-rigsubmit.socket drvps-egress.timer drvps-egress.service drvps-top-publish.service 2>/dev/null; true'
   run_sh 'systemctl stop "drvps-rigsubmit@*.service" 2>/dev/null; true'   # any live per-connection ingress handlers
-  run rm -f /etc/systemd/system/drvps-rigctl.service /etc/systemd/system/drvps-rigreaper.service /etc/systemd/system/drvps-rigreaper.timer /etc/systemd/system/drvps-rigsubmit.socket /etc/systemd/system/drvps-rigsubmit@.service /etc/systemd/system/drvps-egress.timer /etc/systemd/system/drvps-egress.service
+  run rm -f /etc/systemd/system/drvps-rigctl.service /etc/systemd/system/drvps-rigreaper.service /etc/systemd/system/drvps-rigreaper.timer /etc/systemd/system/drvps-rigsubmit.socket /etc/systemd/system/drvps-rigsubmit@.service /etc/systemd/system/drvps-egress.timer /etc/systemd/system/drvps-egress.service /etc/systemd/system/drvps-top-publish.service
+  run rm -rf /etc/drvps-top
   run_sh 'groupdel "$1" 2>/dev/null; true' "$DR_VPS_CTL_GROUP"
   # squid: STOP the SSL-bump proxy, restore-or-remove its config, and DESTROY the cache CA secret +
   # ssl_db (a CA every golden trusts must not survive uninstall); reset the sysctl + drop-in.
@@ -2038,7 +2220,10 @@ do_uninstall() {
   # /etc/distro-rig-vps is removed LAST -- it holds the persisted env (the custom paths). If a later
   # removal FAILS CLOSED (a detected swap, a too-deep tree, an fs error), the env is still present so a
   # re-run can still resolve the remaining state to clean up.
-  for _p in "$DR_VPS_SYS_STATE" "$DR_VPS_SPOOL_BASE" "$DR_VPS_CONSOLE_LOG_DIR" /run/distro-rig-vps /etc/distro-rig-vps; do
+  # /var/lib/distro-rig-vps-egress is the v2 egress store (a FIXED root-owned anchor = L.ANCHOR, a SIBLING of
+  # the state dir, not under it), so it is NOT removed by the SYS_STATE delete -- list it explicitly. safe-rm
+  # is fd-relative + O_NOFOLLOW, so the drvps-owned leaves (pending/, expiry/) cannot redirect the delete.
+  for _p in "$DR_VPS_SYS_STATE" /var/lib/distro-rig-vps-egress "$DR_VPS_SPOOL_BASE" "$DR_VPS_CONSOLE_LOG_DIR" /run/distro-rig-vps /etc/distro-rig-vps; do
     _fs_rm_rf_safe "$_p" || { echo "[setup] uninstall: safe-rm refused/failed (symlink-swap?): $_p" >&2; exit 1; }
   done
   run_sh 'rmdir "$1" 2>/dev/null || true' "$(dirname "$DR_VPS_CONSOLE_LOG_DIR")"
