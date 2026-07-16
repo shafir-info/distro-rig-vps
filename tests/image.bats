@@ -79,6 +79,27 @@ EOF
   for f in $flags; do printf '%s\n' "$valid" | grep -qx -- "$f" || { echo "INVALID virt-customize flag in bake: $f"; false; }; done
 }
 
+@test "build: recipe disk_size grows the virtual disk before digest -> golden id encodes the bigger size" {
+  # A recipe `disk_size` resizes the fetched image's VIRTUAL disk BEFORE bake+digest (after the sha
+  # verify, so the upstream pin still checks the ORIGINAL download -- no re-pinning). This is the
+  # supported way to give a distro (e.g. the ubuntu cloud goldens, ~2-3.5GB) enough room for the rig
+  # install: cloud-init growpart expands the guest root to fill the bigger disk on first boot.
+  jq '.disk_size="8M"' "$BATS_TEST_TMPDIR/recipe.json" > "$BATS_TEST_TMPDIR/big.json"
+  run dr_vps_image_build "$BATS_TEST_TMPDIR/big.json"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^drvps-raw-v1-8388608-[0-9a-f]{64}$ ]]              # 8 MiB virtual, not the 2 MiB base
+  aid="$output"
+  vs=$("$DR_QEMU_IMG" info --output=json "$DR_VPS_POOL_DIR/$aid.qcow2" | jq -r '."virtual-size"')
+  [ "$vs" -eq 8388608 ]                                              # the registered golden really is bigger
+}
+
+@test "build: a malformed disk_size is refused at recipe validation (fail closed, nothing built)" {
+  jq '.disk_size="12 gigs"' "$BATS_TEST_TMPDIR/recipe.json" > "$BATS_TEST_TMPDIR/bad.json"
+  run dr_vps_image_build "$BATS_TEST_TMPDIR/bad.json"
+  [ "$status" -ne 0 ]
+  run dr_vps_image_ls; [ -z "$output" ]                              # nothing registered
+}
+
 @test "TAMPERED-UPSTREAM control: wrong checksum -> verify refused (18)" {
   sed 's/"upstream_sha256":"[0-9a-f]*"/"upstream_sha256":"0000000000000000000000000000000000000000000000000000000000000000"/' \
     "$BATS_TEST_TMPDIR/recipe.json" >"$BATS_TEST_TMPDIR/bad.json"

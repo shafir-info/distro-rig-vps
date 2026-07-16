@@ -122,9 +122,18 @@ Each references a minimal cloud image + an `upstream_sha256` (fail-closed): some
 placeholders -- the **operator must pin** the vendor sha before building (the build refuses until
 `sha256sum` matches).
 
-To add a distro: drop a recipe with its `family`, minimal image URL + sha, and (for dnf/zypper
-mirrorlist distros) a `repo_content` pinning the official master; then add that master to
-`etc/fleet.json` `mirror_allowlist` and re-apply the egress (below). No code change.
+An optional `disk_size` (a qemu-img size like `"12G"`) **grows the golden's virtual disk** at build
+time — resized after the sha verify (so `upstream_sha256` still checks the original download, no
+re-pinning) and before bake/digest, so every VM cloned from the golden gets the bigger disk and
+cloud-init `growpart` expands the guest root on first boot. The three `ubuntu*` recipes set
+`"disk_size": "12G"` because the stock ubuntu cloud image (~2–3.5 GB root) is too small for the rig
+install; `fedora44`/`centos9` ship a big enough disk already. Ubuntu's cloud-image URLs are
+**rolling**, so `upstream_sha256` drifts when the vendor republishes — if a build fails on a sha
+mismatch, re-pin it from the vendor `SHA256SUMS` in the same directory as `upstream_url`.
+
+To add a distro: drop a recipe with its `family`, minimal image URL + sha, an optional `disk_size`,
+and (for dnf/zypper mirrorlist distros) a `repo_content` pinning the official master; then add that
+master to `etc/fleet.json` `mirror_allowlist` and re-apply the egress (below). No code change.
 
 ## The cache (compact base + warm cache, not a TB mirror)
 The guest reaches **only** the squid proxy. squid runs the rig's own **cache CA** (baked into every

@@ -136,7 +136,9 @@ dr_vps_net_shims() {  # <dir> <expected: passt|slirp>
 # evaluate EVERY value (exit status = the LAST result; field reads emit multiple lines), which would fail
 # the recipe/packages validators OPEN and produce multi-line field reads. Gate it ONCE, up front. (CODE r4.)
 _dr_vps_recipe_ok() {  # <recipe> -- exactly ONE JSON object with the required field TYPES
-  jq -es 'length==1 and (.[0]|type=="object") and (.[0] as $r | ($r.distro|type=="string" and length>0) and ($r.upstream_url|type=="string" and length>0) and ($r.upstream_sha256|type=="string" and length>0) and (($r.family|type=="null") or (["dnf","apt","zypper","apk"]|index($r.family)!=null)) and (($r.packages|type=="null") or (($r.packages|type=="array") and ($r.packages|map(type=="string" and length>0)|all))) and ($r.upstream_sig|(type=="null") or (type=="string")) and ($r.repo_content|(type=="null") or (type=="string")) and ($r.repo_remove|(type=="null") or (type=="string")))' \
+  # disk_size (optional): a qemu-img size, digits + optional K/M/G/T suffix (e.g. "12G"). GROWS the
+  # golden's virtual disk (see the build resize step); absent = keep the upstream image's size.
+  jq -es 'length==1 and (.[0]|type=="object") and (.[0] as $r | ($r.distro|type=="string" and length>0) and ($r.upstream_url|type=="string" and length>0) and ($r.upstream_sha256|type=="string" and length>0) and (($r.family|type=="null") or (["dnf","apt","zypper","apk"]|index($r.family)!=null)) and (($r.packages|type=="null") or (($r.packages|type=="array") and ($r.packages|map(type=="string" and length>0)|all))) and ($r.upstream_sig|(type=="null") or (type=="string")) and ($r.repo_content|(type=="null") or (type=="string")) and ($r.repo_remove|(type=="null") or (type=="string")) and (($r.disk_size|type=="null") or (($r.disk_size|type=="string") and ($r.disk_size|test("^[0-9]+[KMGT]?$")))))' \
     -- "$1" >/dev/null 2>&1
 }
 
@@ -414,6 +416,7 @@ dr_vps_image_build() {  # <recipe.json>
   repoc=$(jq -r '.repo_content // ""' "$recipe") # mirrorlist families (dnf/zypper): the pinned .repo body
   repor=$(jq -r '.repo_remove // ""' "$recipe")  # glob of default repo files to drop (avoid mirror sprawl)
   pkgs=$(jq -c '.packages // []' "$recipe")
+  local dsize; dsize=$(jq -r '.disk_size // ""' "$recipe")   # optional: GROW the golden's virtual disk (e.g. "12G")
   { [ -n "$url" ] && [ "$url" != null ] && [ -n "$sha" ] && [ "$sha" != null ] && [ -n "$distro" ] && [ "$distro" != null ]; } \
     || { dr_vps_die "$DR_VPS_E_USAGE" "recipe needs distro, upstream_url, upstream_sha256"; return $?; }
   case "$family" in dnf|apt|zypper|apk) ;; *) dr_vps_die "$DR_VPS_E_USAGE" "unknown distro family '$family' (dnf|apt|zypper|apk)"; return $?;; esac
@@ -434,6 +437,16 @@ dr_vps_image_build() {  # <recipe.json>
   dr_vps_image_fetch "$url" "$work"          || { rc=$?; rm -f "$work"; return "$rc"; }
   [ -t 2 ] && printf '[build %s] 2/5 verify sha256\n' "$(date -u +%H:%M:%SZ)" >&2
   dr_vps_image_verify "$work" "$sha" "$sig"  || { rc=$?; rm -f "$work"; return "$rc"; }
+  # OPTIONAL disk GROW: resize the VIRTUAL disk AFTER the sha verify (so upstream_sha256 still checks
+  # the ORIGINAL vendor download -- no re-pinning) and BEFORE bake/digest (so the golden, and every VM
+  # overlay cloned from it, carries the bigger size; cloud-init growpart expands the guest root on
+  # first boot). GROW-only: qemu-img resize refuses to shrink without --shrink, so a disk_size smaller
+  # than the base image fails CLOSED here with qemu's own message rather than silently truncating.
+  if [ -n "$dsize" ]; then
+    [ -t 2 ] && printf '[build %s] 2b/5 grow virtual disk -> %s\n' "$(date -u +%H:%M:%SZ)" "$dsize" >&2
+    "$DR_QEMU_IMG" resize "$work" "$dsize" >/dev/null 2>&1 \
+      || { rm -f "$work"; dr_vps_die "$DR_VPS_E_USAGE" "disk_size resize to '$dsize' failed (must be LARGER than the upstream image's virtual size; qemu-img refuses to shrink)"; return $?; }
+  fi
   [ -t 2 ] && printf '[build %s] 3/5 bake (virt-customize -- this is the slow phase)\n' "$(date -u +%H:%M:%SZ)" >&2
   dr_vps_image_bake "$work" "$recipe"        || { rc=$?; rm -f "$work"; return "$rc"; }
   # A golden MUST be standalone -- a backing chain makes its digest depend on external

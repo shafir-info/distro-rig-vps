@@ -1,8 +1,15 @@
 {
-  "_comment": "Ubuntu 22.04 LTS (jammy) cloud image -- apt FAMILY, debian-family (the consumer-supported). Mirrors the consumer ubuntu:22.04 container. PIN upstream_sha256 before building (fails closed until it matches): sha256 is published at https://cloud-images.ubuntu.com/releases/22.04/release/SHA256SUMS. Guest apt routes through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com are allowlisted. Base packages only -- the consumer own installer pulls its deps.",
+  "_comment": "Ubuntu 22.04 LTS (jammy) cloud image -- apt FAMILY, debian-family (the consumer-supported). Mirrors the consumer ubuntu:22.04 container. PIN upstream_sha256 before building (fails closed until it matches): sha256 is published at https://cloud-images.ubuntu.com/releases/22.04/release/SHA256SUMS. Guest apt routes through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com are allowlisted. Base packages only -- the consumer own installer pulls its deps. DISK: disk_size grows the golden's virtual disk at build time -- the stock ubuntu cloud image (~2-3.5GB) is too small for the rig install; cloud-init growpart expands the guest root to fill it on first boot. SHA NOTE: this cloud-image URL is ROLLING, so upstream_sha256 drifts when the vendor republishes -- if a build fails on a sha mismatch, re-pin it from the vendor SHA256SUMS (the same directory as upstream_url).",
   "distro": "ubuntu22",
   "family": "apt",
   "upstream_url": "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img",
   "upstream_sha256": "ec3cdc1bf496078f645ccc8ac823e17609658753477ebc4e5fb730729ac5b434",
-  "packages": ["systemd", "openssh-server", "cloud-init", "tmux", "ca-certificates"]
+  "packages": [
+    "systemd",
+    "openssh-server",
+    "cloud-init",
+    "tmux",
+    "ca-certificates"
+  ],
+  "disk_size": "12G"
 }

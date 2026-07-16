@@ -1,8 +1,15 @@
 {
-  "_comment": "Golden recipe for Ubuntu 24.04 LTS (noble) cloud image -- apt FAMILY, debian-family (a supported consumer family). OPERATOR must PIN upstream_sha256 to the vendor value before building (the build FAILS CLOSED until sha256sum matches): Ubuntu publishes it at https://cloud-images.ubuntu.com/noble/current/SHA256SUMS (GPG-verify SHA256SUMS.gpg against the Ubuntu Cloud Image signing key first). The seed routes the guest's apt through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com must be in fleet.json mirror_allowlist (they are). Base packages only -- consumer installers pull their own deps.",
+  "_comment": "Golden recipe for Ubuntu 24.04 LTS (noble) cloud image -- apt FAMILY, debian-family (a supported consumer family). OPERATOR must PIN upstream_sha256 to the vendor value before building (the build FAILS CLOSED until sha256sum matches): Ubuntu publishes it at https://cloud-images.ubuntu.com/noble/current/SHA256SUMS (GPG-verify SHA256SUMS.gpg against the Ubuntu Cloud Image signing key first). The seed routes the guest's apt through the SSL-bump cache proxy; archive.ubuntu.com + security.ubuntu.com must be in fleet.json mirror_allowlist (they are). Base packages only -- consumer installers pull their own deps. DISK: disk_size grows the golden's virtual disk at build time -- the stock ubuntu cloud image (~2-3.5GB) is too small for the rig install; cloud-init growpart expands the guest root to fill it on first boot. SHA NOTE: this cloud-image URL is ROLLING, so upstream_sha256 drifts when the vendor republishes -- if a build fails on a sha mismatch, re-pin it from the vendor SHA256SUMS (the same directory as upstream_url).",
   "distro": "ubuntu24",
   "family": "apt",
   "upstream_url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
-  "upstream_sha256": "5fa5b05e5ec239858c4531485d6023b0896448c2df7c63b34f8dae6ea6051a44",
-  "packages": ["systemd", "openssh-server", "cloud-init", "tmux", "ca-certificates"]
+  "upstream_sha256": "ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6",
+  "packages": [
+    "systemd",
+    "openssh-server",
+    "cloud-init",
+    "tmux",
+    "ca-certificates"
+  ],
+  "disk_size": "12G"
 }
