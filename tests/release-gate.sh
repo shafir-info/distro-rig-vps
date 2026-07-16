@@ -30,7 +30,13 @@ OFFLINE_SH="egress-setup-lock egress-render-noop egress-shell-wiring setup-rende
 CONTAINER_SH="egress-splituid egress-squid-run"                              # run DIRECTLY; they spawn their own podman
 CONTAINER_INNER_SH="egress-approve-prodpath egress-squid-approve-container egress-squid-container egress-squid-live egress-splituid-inner setup-atomic-install"  # invoked INSIDE a container by a runner below (verified)
 NONTEST_SH="build-matrix-goldens mk-share-review-bundle release-gate"        # operator utilities + this runner, not tests
-OFFLINE_PY="drvps-egress-layout-test drvps-egress-model-test drvps-egress-req-test egress-approve-test egress-migrate-test egress-verb-test drvps-top-config-test drvps-top-feed-test drvps-top-publish-test drvps-top-view-test drvps-top-acquire-test"
+OFFLINE_PY="drvps-egress-layout-test drvps-egress-model-test drvps-egress-req-test egress-approve-test egress-migrate-test egress-verb-test drvps-top-config-test drvps-top-feed-test drvps-top-publish-test drvps-top-view-test drvps-top-acquire-test drvps-common-caps-test drvps-write-result-test"
+# LIVE/nested scripts (tests/dogfood/ + tests/acceptance/): tier 3 runs the dogfood; the acceptance
+# scripts are invoked by the dogfood (live-fedora44) or run by the OPERATOR on a real rig
+# (live-rigctl, live-service-quota). They are classified so a new/renamed/removed nested test can
+# never be silently unrun -- the same completeness contract the offline lists get.
+DOGFOOD_SH="dogfood/nested-selftest"
+ACCEPT_SH="acceptance/live-fedora44 acceptance/live-rigctl acceptance/live-service-quota"
 
 pass=0; failn=0; skip=0; FAILED=""
 run1(){ # <label> <command...> : run a suite, tally, keep going on failure (collect ALL failures, not just the first)
@@ -55,8 +61,13 @@ run1 "every tests/*.sh is classified" bash -c '
   for f in tests/*.sh; do b=$(basename "$f" .sh); case "$known" in *" $b "*) ;; *) bad="$bad $b";; esac; done
   [ -z "$bad" ] || { echo "UNCLASSIFIED tests/*.sh (classify in release-gate.sh):$bad"; exit 1; }'
 run1 "every classified test still exists (removal detected)" bash -c '
-  bad=""; for b in '"$OFFLINE_SH $CONTAINER_SH $CONTAINER_INNER_SH $NONTEST_SH"'; do [ -f "tests/$b.sh" ] || bad="$bad $b"; done
+  bad=""; for b in '"$OFFLINE_SH $CONTAINER_SH $CONTAINER_INNER_SH $NONTEST_SH $DOGFOOD_SH $ACCEPT_SH"'; do [ -f "tests/$b.sh" ] || bad="$bad $b"; done
   [ -z "$bad" ] || { echo "classified but MISSING tests/*.sh (remove from release-gate.sh, or restore):$bad"; exit 1; }'
+run1 "every tests/dogfood/*.sh + tests/acceptance/*.sh is classified (nested tests can't be silently unrun)" bash -c '
+  known=" '"$DOGFOOD_SH $ACCEPT_SH"' "; bad=""
+  for f in tests/dogfood/*.sh tests/acceptance/*.sh; do [ -e "$f" ] || continue
+    b="${f#tests/}"; b="${b%.sh}"; case "$known" in *" $b "*) ;; *) bad="$bad $b";; esac; done
+  [ -z "$bad" ] || { echo "UNCLASSIFIED nested/acceptance test (classify in release-gate.sh):$bad"; exit 1; }'
 run1 "CONTAINER_INNER static invoke pre-filter (best-effort; tier-2 runtime coverage is authoritative)" bash -c '
   # verify an EXECUTABLE `tests/<b>.sh` invocation on a NON-comment line of a runner (egress-squid-run.sh,
   # egress-splituid.sh, or THIS gate for setup-atomic-install) -- a bare substring match would accept a
@@ -143,8 +154,12 @@ else echo "  SKIP  tier 2: pass --container to run it"; skip=$((skip+1)); fi
 echo "================ TIER 3: NESTED live 'really works' (needs KVM) ================"
 if [ "$WANT_LIVE" = 1 ]; then
   if [ -e /dev/kvm ]; then
-    run1 "nested dogfood (real installer + egress + drvps-top in an L1 VM)" \
-      env DRVPS_LIVE=1 bash tests/dogfood/nested-selftest.sh
+    # ONE distro per gate run (fedora44, stated explicitly -- not an implicit default). Portability
+    # to a second family is a SEPARATE operator run (`DRVPS_LIVE=1 tests/dogfood/nested-selftest.sh
+    # ubuntu26`); this gate's PASS never claims multi-distro nested coverage.
+    run1 "nested dogfood fedora44 (installer + doctor + define + MEMBER egress + drvps-top in an L1 VM)" \
+      env DRVPS_LIVE=1 bash tests/dogfood/nested-selftest.sh fedora44
+    echo "  NOTE  tier-3 covers the fedora44 L1 only; run the dogfood with 'ubuntu26' for a second family."
   else markfail "tier 3 REQUESTED but /dev/kvm is absent (run on a KVM host)"; fi
 else echo "  SKIP  tier 3: pass --live to run it (needs KVM; touches a real rig)"; skip=$((skip+1)); fi
 

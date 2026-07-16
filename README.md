@@ -32,7 +32,7 @@ workload where "docker is not a real machine" bites.
 
 ## Status
 The core rig, the agent control loop, the guest-exec gate, the egress fence + cache, and snapshots
-with owner-scoping are **live-validated on real KVM**; the offline suite is **767 bats tests across
+with owner-scoping are **live-validated on real KVM**; the offline suite is **774 bats tests across
 23 suites**, green. Some features ship **gated off** pending operator decisions. The authoritative
 per-subsystem table (LIVE / seam-tested / GATED), the trust-model boundaries, and every known
 limitation live in [STATUS.md](STATUS.md) — read it before relying on a specific guarantee.
@@ -235,7 +235,7 @@ src/drvps_rigctl.py  the python watcher (privilege gateway: decide() + event loo
 src/drvps_rigsubmit.py  the ingress accepter (the ONLY agent write path into the spool)
 etc/recipes/         per-distro golden recipes (family-keyed)
 etc/fleet.json       egress inventory + mirror/splice allowlist (config)
-tests/               seamed suite (767 tests / 23 suites) + acceptance/ + dogfood/ + container e2e
+tests/               seamed suite (774 tests / 23 suites) + acceptance/ + dogfood/ + container e2e
 tools/               drvps-top feed/publish/view + egress model/req/member/layout + maintainer utils
 .github/workflows/   CI (offline suite + shellcheck, no KVM needed)
 docs/                runbooks, agent/orchestrator guides, concept docs, provenance

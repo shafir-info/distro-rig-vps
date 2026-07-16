@@ -80,7 +80,7 @@ main() {
   unset _DR_VPS_CREATE_AID _DR_VPS_CREATE_KIND
   local cmd="${1:-}"; [ "$#" -gt 0 ] && shift
   case "$cmd" in
-    doctor)            dr_vps_doctor "$@" ;;
+    doctor)            dr_vps_store_init && dr_vps_doctor "$@" ;;   # store_init: the console-admission check reads the store -- a VIRGIN install's first doctor must not die "no such table: vms" (live nested finding)
     version)           need_eq 0 "$@"; dr_vps_version ;;
     build)             need_eq 1 "$@"; dr_vps_store_init && dr_vps_image_build "$1" ;;   # exact arity: surplus argv must not be silently dropped
     verify)            need 2 "$@"; dr_vps_image_verify "$@" ;;

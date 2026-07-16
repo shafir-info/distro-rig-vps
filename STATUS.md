@@ -2,7 +2,7 @@
 
 Current verification state of every subsystem, the load-bearing trust boundaries, and the open
 deferrals. History and per-cycle review narratives live in CHANGELOG.md; engineering lessons in
-LESSONS-LEARNED.md. Last updated: 2026-07-15 (0.3.0 in development).
+LESSONS-LEARNED.md. Last updated: 2026-07-16 (0.3.0 in development).
 
 ## Verification status
 
@@ -25,11 +25,11 @@ wired, and tested but disabled by default pending an operator decision.
 | S6 keep-secrets restore (secret-bearing snapshot → 1:1 restore) | LIVE + GATED | two-arm identity probe (machine-id preserved; app data both arms; host keys regenerate); `DR_VPS_ALLOW_SECRET_RESTORE` default OFF |
 | Service plane: landed stages (S0/S1 service-class+quota, S4 idempotency, S5 private result ACLs, S6 gated secrets-restore) | LIVE + GATED | 26-check nested matrix PASS; **0.2.0 live-deployed on bare-metal (Fedora 44); the class=service + drvpsvc-membership + per-account quota gate verified end-to-end** (`tests/acceptance/live-service-quota.sh`) |
 | Service plane: held stages (S2 stable-IP/service-ports, S3 egress profiles incl. `--egress`) | NOT BUILT (design PROPOSED) | held pending their own build + live-dev run (see Deferred) |
-| Installer (Fedora/RHEL + Debian/Ubuntu families) | LIVE | fedora44 nested end-to-end incl. renumbered bridge (`DR_VPS_BRIDGE_IP`); ubuntu26 proven on an outer guest |
+| Installer (Fedora/RHEL + Debian/Ubuntu families) | LIVE (fedora44 nested; ubuntu26 outer-guest) | **What is actually proven, by tier:** container tier (real squid, 4 host families) GREEN; **0.3.0 nested L1 (2026-07-16, agent-driven over rigctl):** fresh fedora44 L1 -> tree staged root-owned under `/opt` -> installer with the renumbered bridge (`DR_VPS_BRIDGE_IP=10.199.0.1` + fleet `cache_cidr` patch + `--force-squid`) rc=0 -> `doctor` PASS **as the drvps user** (capacity knobs scoped for the small L1; found+fixed: a virgin install's first doctor died on an uninitialized store) -> a rendered domain XML **really defined** (`virsh define --validate`) as drvps -> **MEMBER-level isolation exercised** (a non-root drvpsctl+drvpsvc account staged an egress splice over the socket: SO_PEERCRED/DAC/result-ACL on the path) -> root YES-gated approve applied the SPECIFIC host into the live squid policy -> drvps-top publisher (as drvps, live sources, advancing seq) + MEMBER viewer PASS. The committed `tests/dogfood/nested-selftest.sh` encodes this exact bar; a verbatim operator run (`tests/release-gate.sh --live`) and an ubuntu-L1 second-family run remain operator steps. ubuntu26 installer path previously proven on an outer guest (0.2.0). |
 | Collision/net-ownership preflight (structural, live-address-complete) | LIVE | non-dry-run positive + planted-drift negative controls (widened /16, deleted /24, foreign net XML) |
 | Multi-distro golden builds (dnf/apt/zypper/apk profiles) | fedora44 LIVE; others SEAM | family profiles seam-tested; per-family live acceptance is the remaining step (see Deferred) |
 | Console-log observability (drvps-readable, DoS-bounded) | LIVE | reaper tail-compaction bound; readability decoupled from virtlogd |
-| Offline suite | GREEN | **767 bats tests / 23 suites**, plus offline python at umask 0077 AND 0022 (egress: layout/model/req/approve/migrate/verb; drvps-top: feed 291 / publisher / viewer / config / acquire) and offline sh (egress wiring + lock + render-noop; drvps-top unit/once/crossframe/hardening/setup; firewalld DR-2; image-bake guards) all green; shellcheck 0 errors (documented per-file suppressions: SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
+| Offline suite | GREEN | **774 bats tests / 23 suites**, plus offline python at umask 0077 AND 0022 (egress: layout/model/req/approve/migrate/verb; drvps-top: feed 291 / publisher / viewer / config / acquire) and offline sh (egress wiring + lock + render-noop; drvps-top unit/once/crossframe/hardening/setup; firewalld DR-2; image-bake guards) all green; shellcheck 0 errors (documented per-file suppressions: SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
 
 **0.2.0 live-deploy smoke (bare-metal Fedora 44, 2026-07-12) -- all PASS:** clean-install upgrade
 from 0.1.0; goldens rebuilt (fedora44, ubuntu22/24/26, centos9); basic agent loop
@@ -128,6 +128,9 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
 - **DR-6 per-net / per-tenant isolation**: open design issue (docs/ISSUE-per-net-isolation.md).
 - **Live-only test gaps** (need a disposable systemd env): S6 enable→watcher-restart→disable env
   lifecycle; concurrent create/destroy; an `--idem` replay around an S6 refusal.
+- **Nested tier, operator-verbatim**: the 0.3.0 nested bar passed agent-driven over rigctl
+  (2026-07-16, see the Installer row); the verbatim `tests/release-gate.sh --live` run on the rig
+  host and the second-family L1 (`nested-selftest.sh ubuntu26`) are the operator's remaining steps.
 - **M8 wording**: host `owner_uid` appears in agent-visible quota/admission error text; reword
   to "requesting account" (uid stays in daemon-private diagnostics).
 - **v2 features** (specified, not coded): snap export/import, promote-to-golden, restore/

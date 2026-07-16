@@ -46,6 +46,34 @@ and the Deferred list below). No push until that passes.
   outage the container gate caught). `step_proxy` derives + persists the real host-facts (fail-closed)
   and publishes squid.conf + both render inputs atomically with a fail-closed, non-deleting rollback.
 
+### Fixed (whole-tree consistency review, 2026-07-16 — every finding closed RED-first)
+
+- **CRITICAL — snapshot owner-scopes its SOURCE VM.** `snapshot <vm>` parsed `--owner` but stamped
+  only the RESULT: a member who learned a peer's VM id could shut it down, flatten its disk, and
+  register the copy under their own uid. `dr_vps_vm_assert_owned` now guards the create flow before
+  lock/gate/shutdown (not-found, no existence leak), the same contract as every other VM-acting verb.
+- **`rigctl exec-errors <job>` — a detached job's stderr is finally reachable.** The launcher always
+  captured `2>${tag}.err` but no verb served it, so a failed detached install showed an empty
+  `exec-output` with the FATAL line stranded in the guest. Owner-scoped, symmetric with
+  `exec-output`; wired through the client, watcher allow-list, CLI, and AGENT-GUIDE.
+- rigctl submit taxonomy: a send failure AFTER the stream started is now INDETERMINATE (exit 4,
+  reconcile first) — it was mislabeled "not submitted, safe to retry", inviting double-applied
+  mutations. Exit 3 is connect/setup-only.
+- Shared env parsing (`drvps_common.cap_int/cap_float`): the accepter/watcher spool caps and the
+  accepter read-timeout no longer crash-loop the Restart=always daemons on a malformed override, and
+  a zero/negative cap can no longer unbound the request read or wedge the flood cap.
+- `snap-show` propagates a failed sidecar read/render (it returned the fd-close 0, masking garbage).
+- The egress generation marker publishes atomically (same-dir temp + `mv -Tf`, 0644 before
+  visibility) — the unlocked reader could see an empty/partial/0600 marker mid-rewrite and falsely
+  refuse creates as "stale".
+- `write_result`'s last-resort trim now emits a minimal VALID truncated envelope instead of byte-cut
+  (invalid) JSON; fixed-argv `dr-vps` verbs reject surplus argv (`status vm1 --typo` no longer
+  silently succeeds); `dr-vps doctor` initializes the store, so a VIRGIN install's first doctor no
+  longer dies "no such table: vms" (found live in the 2026-07-16 nested run).
+- Docs reconciled to the enforced isolation model (see STATUS "Trust model" — the canonical
+  statement): VM mutations + guest content are owner-scoped per SO_PEERCRED NOW; the old "any member
+  can act on every rig VM / per-VM ownership is v2" prose is gone from STATUS/USAGE/ORCHESTRATOR-GUIDE.
+
 ### Changed
 
 - Egress request store migrated to the seam-free v2 layout (`drvps-egress-migrate`, an operator-run
@@ -58,7 +86,23 @@ and the Deferred list below). No push until that passes.
 - New offline suites: drvps-top feed contract / publisher / viewer / config / acquire (real sqlite +
   canned virsh e2e), operator-TUI hardening, drvps-top installer wiring, firewalld DR-2 (mock seam),
   and egress shell-wiring (store-free admit-gate + reaper-wiring, replacing the retired v1 store-seam
-  tests). The full offline gate stays green (767 bats + python at umask 0077 and 0022 + shellcheck + ast).
+  tests); plus the shared-caps and write_result unit suites from the consistency review. The full
+  offline gate stays green (774 bats + python at umask 0077 and 0022 + shellcheck + ast).
+- **The nested dogfood is now honest and was executed (2026-07-16, agent-driven over rigctl on a
+  fresh fedora44 L1).** `tests/dogfood/nested-selftest.sh` previously ran every check as root@L1 and
+  gated on a doctor bar a 4GB L1 could never meet, while its committed form omitted the renumber the
+  real run needed and printed a "define" claim it never tested. It now: stages root-owned under
+  `/opt` with the nested renumber baked in (`DR_VPS_BRIDGE_IP=10.199.0.1` + fleet `cache_cidr` patch
+  + `--force-squid`); runs doctor AS drvps with the capacity policy scoped to the small L1; REALLY
+  defines a rendered domain XML (`virsh define --validate` + undefine); drives the member surface as
+  a NON-root drvpsctl+drvpsvc account (egress add-splice with SO_PEERCRED/socket-DAC/result-ACL on
+  the path; the drvps-top viewer); and its PASS line claims exactly the mandatory bar (L2 boot +
+  firewalld stay labeled best-effort; one distro per run — an ubuntu L1 is a second invocation).
+  Every step of that bar passed on the live L1; the verbatim operator invocation is
+  `tests/release-gate.sh --live`.
+- `tests/release-gate.sh` inventories `tests/dogfood/` + `tests/acceptance/` (an unclassified or
+  removed nested/acceptance script now fails the gate) and states that its live tier covers the
+  fedora44 L1 only.
 - Container e2e (disposable rootless podman): the egress-splice matrix on 4 host families
   (fedora/rocky9/ubuntu/debian) — config parse, the behavioral splice tunnel (origin cert end to end,
   squid CA proves no MITM, non-allowlisted terminated), the full stage → approve → restart → tunnel
@@ -67,9 +111,13 @@ and the Deferred list below). No push until that passes.
 
 ### Deferred (operator/live — tracked in STATUS.md)
 
+- A verbatim OPERATOR run of the nested tier (`tests/release-gate.sh --live`) on the rig host — the
+  2026-07-16 execution of the same bar was agent-driven step-by-step over rigctl — and the
+  second-family L1 (`DRVPS_LIVE=1 tests/dogfood/nested-selftest.sh ubuntu26`).
 - Bare-metal on-host verification of every 0.3.0 subsystem in a disposable systemd/KVM env: the
   drvps-top publisher unit + member viewer end to end; the egress-splice on-host run; the firewalld
-  rich-rules on a real firewalld host.
+  rich-rules on a real firewalld host (the nested L1 ships firewalld inactive, so DR-2 stayed a
+  correctly-labeled no-op there).
 - Egress-splice: the squid-capability gate + audit line and the release-gate integration harness
   (egress-splice tasks 1.8 / 1.10) land with that on-host run.
 

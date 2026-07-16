@@ -47,6 +47,22 @@ setup() {
   [ "$status" -eq 0 ]; [ "$output" = "state=missing" ]
 }
 
+@test "dr-vps doctor on a VIRGIN install (store never initialized) -> no 'cannot read the VM store' refusal" {
+  # Live nested-dogfood finding (2026-07-16): a fresh install's FIRST `dr-vps doctor` died E_CAP
+  # "no such table: vms" -- doctor was the only store-reading dispatch without dr_vps_store_init,
+  # so the installer's own documented sanity command failed on a virgin host (non-gating, unnoticed).
+  export DR_VPS_FACT_KVM=ok DR_VPS_FACT_LIBVIRT=ok DR_VPS_FACT_RAM_MB=60000 DR_VPS_FACT_DISK_MB=80000
+  export DR_VPS_FACT_NESTED=Y DR_VPS_FACT_TOOLS='{"cloud_localds":true,"nft":true,"qemu_img":true}'
+  export DR_VPS_FACT_CONSOLE=ok DR_VPS_FACT_CONSOLE_REAPER=fresh
+  # DR_VPS_FACT_CONSOLE_ADMIT deliberately NOT seamed: the REAL admission path must read the store,
+  # which on a virgin state dir exists only if the dispatch initializes it. Only the console LOG DIR
+  # is redirected (its free-space probe needs an existing dir in the sandbox).
+  export DR_VPS_CONSOLE_LOG_DIR="$BATS_TEST_TMPDIR"
+  run "$BIN/dr-vps" doctor
+  [[ "$output" != *"cannot read the VM store"* ]]
+  [ "$status" -eq 0 ]
+}
+
 @test "dr-vps verify: matching sha256 -> 0; mismatch -> 18 (binary validation, fail-closed)" {
   echo "a binary blob" >"$BATS_TEST_TMPDIR/blob"
   sha=$(sha256sum "$BATS_TEST_TMPDIR/blob" | awk '{print $1}')
