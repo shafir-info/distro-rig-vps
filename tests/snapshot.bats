@@ -43,15 +43,25 @@ EOF
 }
 
 # a registered golden + a VM overlay backed by it + a vms row (with a domain_uuid) -> ready to snapshot.
-_mk_golden_and_vm() {
+# [owner_uid]: stamp the vms row with a CLIENT owner (S1a source-VM scoping tests); default = NULL (operator).
+_mk_golden_and_vm() {  # [owner_uid]
   dr_vps_mk_qcow2 "${DR_VPS_POOL_DIR}/g.qcow2" 1048576 65536 base
   GAID=$(dr_vps_golden_digest "${DR_VPS_POOL_DIR}/g.qcow2")
   cp "${DR_VPS_POOL_DIR}/g.qcow2" "${DR_VPS_POOL_DIR}/${GAID}.qcow2"
   dr_vps_store_image_register "$GAID" '{"distro":"fedora44","family":"dnf","built_at":"2026-07-01T00:00:00Z"}' "${DR_VPS_POOL_DIR}/${GAID}.qcow2"
   VID="drvps-vm-testsnap01"
   qemu-img create -f qcow2 -b "${DR_VPS_POOL_DIR}/${GAID}.qcow2" -F qcow2 "${DR_VPS_POOL_DIR}/${VID}.qcow2" >/dev/null 2>&1
-  dr_vps_store_vm_create_from_golden "$VID" "$GAID" "${DR_VPS_POOL_DIR}/${VID}.qcow2" "0" "24" "testsnap" "default"
+  dr_vps_store_vm_create_from_golden "$VID" "$GAID" "${DR_VPS_POOL_DIR}/${VID}.qcow2" "0" "24" "testsnap" "default" "${1:-}"
   dr_vps_store_vm_set_uuid "$VID" "11111111-1111-1111-1111-111111111111"
+}
+# a SECOND VM backed by the SAME golden (fresh empty overlay -> the flatten yields byte-identical content,
+# so the SAME content id), owned by [owner_uid]. The cross-owner IDENTICAL-CONTENT tests need it now that
+# create owner-scopes the SOURCE VM (a client can no longer snapshot another owner's VM to collide content).
+_mk_vm2() {  # [owner_uid]
+  VID2="drvps-vm-testsnap02"
+  qemu-img create -f qcow2 -b "${DR_VPS_POOL_DIR}/${GAID}.qcow2" -F qcow2 "${DR_VPS_POOL_DIR}/${VID2}.qcow2" >/dev/null 2>&1
+  dr_vps_store_vm_create_from_golden "$VID2" "$GAID" "${DR_VPS_POOL_DIR}/${VID2}.qcow2" "0" "24" "testsnap2" "default" "${1:-}"
+  dr_vps_store_vm_set_uuid "$VID2" "22222222-2222-2222-2222-222222222222"
 }
 
 @test "snapshot --install-log: records a REDACTED install_path SIDECAR; content id stays the IMAGE digest" {
@@ -502,6 +512,24 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   run dr_vps_resolve_snapshot "$sb" "$A"; [ "$status" -ne 0 ]
 }
 
+@test "owner-scoping: snapshot of ANOTHER client's SOURCE VM is refused (E_NOTFOUND) before any lifecycle step; the owner passes" {
+  local A=4001 B=4002
+  _mk_golden_and_vm "$B"                                    # the SOURCE VM belongs to client B
+  # client A snapshots B's VM -> E_NOTFOUND (14), indistinguishable from a nonexistent id (no existence
+  # leak). Without this gate A could shut B's VM down, flatten its disk, and register the copy under A
+  # (data theft + DoS) -- the --owner stamp alone scopes only the RESULT snapshot, not the source.
+  run dr_vps_snapshot_create "$VID" --owner "$A"
+  [ "$status" -eq 14 ]
+  [ ! -s "$DR_VPS_SNAP_ORDERLOG" ]                          # NOTHING ran: no provenance/shutdown/flatten
+  [ ! -f "$FAKEVIRSH_DESTROYED" ]                           # never force-off'd
+  run dr_vps_sql "SELECT COUNT(*) FROM snapshots;"; [ "$output" = 0 ]
+  run dr_vps_sql "SELECT state FROM vms WHERE id='$VID';"; [ "$output" != "stopped" ]   # source untouched
+  # positive control: the OWNER (B) passes the source gate and the create succeeds end-to-end.
+  run dr_vps_snapshot_create "$VID" --owner "$B"
+  [ "$status" -eq 0 ]; local sid="$output"
+  run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sid';"; [ "$output" = "$B" ]   # result owner-stamped
+}
+
 @test "owner-scoping: the operator (no --owner) can rm ANY client's snapshot -- admin recovery is always possible" {
   local A=4001 sa; sa=$(_sid a)
   _reg_snap "$sa" snap-a "$A"
@@ -534,7 +562,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # TOCTOU: resolve is owner-scoped but happens BEFORE the lock; the store delete is by id (unscoped).
   # Simulate a delete+re-register under a DIFFERENT owner in the window: resolve (call 1) sees A's row, the
   # under-lock re-check (call 2) sees it no longer owned by A. rm must ABORT, not delete.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   cnt="${BATS_TEST_TMPDIR}/rmtoctou"; printf 0 >"$cnt"
   eval "$(declare -f dr_vps_store_snapshot_id | sed '1s/^dr_vps_store_snapshot_id/_real_ssid/')"
@@ -553,7 +581,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
 @test "owner-scoping: snap-show re-verifies ownership UNDER the lock (TOCTOU) -- aborts if the row changed owner, never reads another's" {
   # Same TOCTOU on the read side (resolve then read sidecars). The under-lock re-check must
   # abort if ownership changed in the window, so a caller never reads another owner's refreshed metadata.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   cnt="${BATS_TEST_TMPDIR}/showtoctou"; printf 0 >"$cnt"
   eval "$(declare -f dr_vps_store_snapshot_id | sed '1s/^dr_vps_store_snapshot_id/_real_ssid/')"
@@ -571,7 +599,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # id equals the new name -- so a delete+re-register under a different owner, or a concurrent artifact_id==name
   # registration, in the resolve..write window yields changes()=0 (refused), never a cross-owner rename or a
   # name==id ambiguity. Test the store layer directly (the atomic guard, independent of the verb pre-checks).
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   run dr_vps_store_snapshot_rename "$sid" newname 4002; [ "$status" -ne 0 ]                 # cross-owner refused
   run dr_vps_sql "SELECT name FROM snapshots WHERE id='$sid';"; [ "$output" != newname ]     # unchanged
@@ -585,7 +613,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # TOCTOU: resolve is owner-scoped, but the secret-bearing read + VM clone act on the id unscoped.
   # Simulate a delete+re-register under a different owner in the window: resolve (call 1) sees A, the under-lock
   # re-check (call 2) sees it no longer owned by A -> use must ABORT before creating the VM.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   cnt="${BATS_TEST_TMPDIR}/usetoctou"; printf 0 >"$cnt"
   eval "$(declare -f dr_vps_store_snapshot_id | sed '1s/^dr_vps_store_snapshot_id/_real_ssid/')"
@@ -614,7 +642,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
 }
 
 @test "owner-scoping: create --owner stamps owner_uid + scopes the snapshot; a non-numeric owner is E_USAGE (2)" {
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4007
   run dr_vps_snapshot_create "$VID" --owner 4007; [ "$status" -eq 0 ]; sid="$output"
   run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sid';"; [ "$output" = 4007 ]
   run dr_vps_snapshot_ls --owner 4007; [[ "$output" == *"$sid"* ]]     # owner sees it
@@ -628,10 +656,11 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # Snapshots are content-addressed + SINGLE-OWNER in v1. If client B snapshots byte-identical content that
   # client A already owns, the idempotent short-circuit must NOT fire for B (which would silently hand B A's id
   # under A's ownership); it falls through to publish and surfaces an explicit E_CONFLICT.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sa=$(dr_vps_snapshot_create "$VID" --owner 4001)
   run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sa';"; [ "$output" = 4001 ]
-  run dr_vps_snapshot_create "$VID" --owner 4002               # B: identical content -> conflict, not A's id
+  _mk_vm2 4002                                                  # B's OWN VM, byte-identical content
+  run dr_vps_snapshot_create "$VID2" --owner 4002              # B: identical content -> conflict, not A's id
   [ "$status" -eq 15 ]
   run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sa';"; [ "$output" = 4001 ]   # A's row untouched
   run dr_vps_sql "SELECT COUNT(*) FROM snapshots WHERE id='$sa';"; [ "$output" = 1 ]        # still exactly one
@@ -644,11 +673,12 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # NOT fire (image absent), so without a guard B would publish a fresh bundle and register's INSERT-WHERE-NOT-
   # EXISTS would silently no-op -> B receives A's id under A's ownership + A's bundle overwritten by B. The
   # cross-owner guard must refuse BEFORE publish.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sa=$(dr_vps_snapshot_create "$VID" --owner 4001)
   rm -rf "${DR_VPS_SNAP_DIR}/${sa}"                             # simulate a deleted/stale bundle (DB rows remain)
   [ ! -e "${DR_VPS_SNAP_DIR}/${sa}" ]
-  run dr_vps_snapshot_create "$VID" --owner 4002               # B: identical content, A's bundle missing
+  _mk_vm2 4002                                                  # B's OWN VM, byte-identical content
+  run dr_vps_snapshot_create "$VID2" --owner 4002              # B: identical content, A's bundle missing
   [ "$status" -eq 15 ]                                          # E_CONFLICT, not a silent rebuild into A's row
   run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sa';"; [ "$output" = 4001 ]   # still A's
   run dr_vps_sql "SELECT COUNT(*) FROM snapshots WHERE id='$sa';"; [ "$output" = 1 ]
@@ -661,7 +691,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # `-f image.qcow2` follows symlinks; a bundle dir replaced by a symlink to outside would let a
   # same-owner re-create report SUCCESS for an unfenced/corrupt bundle. The short-circuit must require a REAL
   # (non-symlink) dir + regular image, else fall through to the publish `-L` guard -> E_CONFLICT.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sa=$(dr_vps_snapshot_create "$VID" --owner 4001)
   mv "${DR_VPS_SNAP_DIR}/${sa}" "${BATS_TEST_TMPDIR}/moved-sa"    # real bundle aside
   ln -s "${BATS_TEST_TMPDIR}/moved-sa" "${DR_VPS_SNAP_DIR}/${sa}" # symlink at the canonical path (image resolves via it)
@@ -672,7 +702,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
 }
 
 @test "owner-scoping: a MALFORMED --owner on the direct CLI fails CLOSED (E_USAGE), never silently admin/hang" {
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   run dr_vps_snapshot_ls --owner;            [ "$status" -eq 2 ]   # --owner with no value -> usage, not "list all"
   run dr_vps_snapshot_ls --owner abc;        [ "$status" -eq 2 ]   # non-numeric -> usage
@@ -687,7 +717,7 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   # A transient SQLite lock/error during the ownership lookup must NOT look like "no row" and
   # slip past the idempotent + cross-owner guards. Fault-inject ONLY the owner-lookup SELECT (all other SQL
   # still works) and assert create refuses with a db-read error and registers nothing.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   eval "$(declare -f dr_vps_sql | sed '1s/^dr_vps_sql/_real_dr_vps_sql/')"
   dr_vps_sql() { case "$1" in *"COALESCE(owner_uid"*) return 1;; *) _real_dr_vps_sql "$1";; esac; }
   run dr_vps_snapshot_create "$VID" --owner 4001
@@ -699,11 +729,12 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
 @test "owner-scoping: a CLIENT cannot ADOPT a crash-orphan bundle (operator-only adoption); the operator still self-heals" {
   # A crash-orphan (present bundle, no DB row) has NO recorded owner. A client must not adopt it
   # (it could be ANOTHER client's in-flight content -> B would claim A's). Adoption is operator-only.
-  _mk_golden_and_vm
+  _mk_golden_and_vm 4001
   sid=$(dr_vps_snapshot_create "$VID" --owner 4001)
   dr_vps_sql "DELETE FROM snapshots WHERE id='$sid'; DELETE FROM images WHERE artifact_id='$sid';"   # crash between mv and register
   [ -d "${DR_VPS_SNAP_DIR}/${sid}" ] && [ -z "$(dr_vps_store_snapshot_golden_path "$sid")" ]
-  run dr_vps_snapshot_create "$VID" --owner 4002            # client B, identical content
+  _mk_vm2 4002                                              # B's OWN VM, byte-identical content
+  run dr_vps_snapshot_create "$VID2" --owner 4002           # client B, identical content
   [ "$status" -eq 15 ]                                      # E_CONFLICT -- refused, NOT adopted into B's ownership
   [ -d "${DR_VPS_SNAP_DIR}/${sid}" ]                        # orphan untouched
   run dr_vps_sql "SELECT COUNT(*) FROM snapshots WHERE id='$sid';"; [ "$output" = 0 ]   # not registered to B

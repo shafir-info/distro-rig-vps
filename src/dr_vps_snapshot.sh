@@ -216,6 +216,12 @@ dr_vps_snapshot_create() {  # <vm> [--keep-secrets] [--notes STR] [--profile NAM
   # to a plain identifier so it can't inject a function name OR forge Markdown structure .
   case "$profile" in ''|*[!A-Za-z0-9_-]*) dr_vps_die "$DR_VPS_E_USAGE" "bad --profile (allowed [A-Za-z0-9_-]): $profile"; return $?;; esac
   _dr_vps_safe_id "$vm" || return $?
+  # S1a: the CALLER must own the SOURCE VM (empty owner = direct operator, no check -- helper contract).
+  # The --owner stamped into the RESULT above scopes only the produced snapshot; without this gate a
+  # member who learns a peer's VM id could shut it down, flatten its disk, and register the copy under
+  # their own uid. Same guard as exec/pull/push (dr_vps_remote.sh); dies E_NOTFOUND (no existence leak)
+  # BEFORE the lock/gate/shutdown, so a foreign caller changes nothing.
+  dr_vps_vm_assert_owned "$vm" "$owner" || return $?
 
   # 1. LOCK (per-VM): the gate proves identity, it does NOT serialize. Non-blocking -> busy is a CONFLICT.
   local lockdir="${DR_VPS_STATE_DIR}/locks" lockf lfd
