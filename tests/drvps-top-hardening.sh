@@ -24,7 +24,7 @@ CREATE TABLE images(artifact_id TEXT PRIMARY KEY, kind TEXT, name TEXT, provenan
 CREATE TABLE vms(id TEXT PRIMARY KEY, owner_uid TEXT, class TEXT, domain_uuid TEXT, artifact_id TEXT, state TEXT, name TEXT, created_at TEXT, net TEXT, contract TEXT);
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, name TEXT, parent_golden_id TEXT, secret_bearing INT, validation_status TEXT, created_at TEXT, bundle_relpath TEXT);
 $([ "$idx" = 1 ] && printf 'CREATE UNIQUE INDEX images_kind_name_uq ON images(kind,name); CREATE UNIQUE INDEX snapshots_name_uq ON snapshots(name);')
-$([ "$trg" = 1 ] && printf 'CREATE TRIGGER images_kind_ins BEFORE INSERT ON images BEGIN SELECT 1; END; CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images BEGIN SELECT 1; END; CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots BEGIN SELECT 1; END; CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots BEGIN SELECT 1; END;')
+$([ "$trg" = 1 ] && printf "CREATE TRIGGER images_kind_ins BEFORE INSERT ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END; CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END; CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END; CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END;")
 SQL
   echo "$db"
 }

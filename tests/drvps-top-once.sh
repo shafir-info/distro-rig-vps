@@ -16,10 +16,10 @@ CREATE TABLE snapshots(id TEXT PRIMARY KEY, vm_id TEXT, artifact_id TEXT, source
 -- store always has them (no-op trigger bodies here -- the gate checks existence + type, not the body).
 CREATE UNIQUE INDEX images_kind_name_uq ON images(kind,name);
 CREATE UNIQUE INDEX snapshots_name_uq ON snapshots(name);
-CREATE TRIGGER images_kind_ins BEFORE INSERT ON images BEGIN SELECT 1; END;
-CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images BEGIN SELECT 1; END;
-CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots BEGIN SELECT 1; END;
-CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots BEGIN SELECT 1; END;
+CREATE TRIGGER images_kind_ins BEFORE INSERT ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'invalid images.kind'); END;
+CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'invalid images.kind'); END;
+CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'invalid snapshots row'); END;
+CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'invalid snapshots row'); END;
 INSERT INTO images VALUES('drvps-snap-v1-99-a9f0e966caafc7e4','/g/s','snapshot','u26','{"distro":"ubuntu26"}','2026-07-12T13:01:39Z');
 INSERT INTO vms VALUES('drvps-vm-b71deae19298de23','drvps-snap-v1-99-a9f0e966caafc7e4','running','weftg-20260712T195935Z-fC4Ted-P05','p','b71deae1-9298-de23-4a5b-0011deadbeef','net','c','1007','throwaway','2026-07-12T20:00:00Z');
 SQL

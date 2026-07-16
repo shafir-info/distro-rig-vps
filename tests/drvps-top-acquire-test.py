@@ -39,9 +39,13 @@ def build_db(path, *, full=True, drop_index=False, drop_trigger=False, bad_invar
         con.executescript("CREATE UNIQUE INDEX images_kind_name_uq ON images(kind,name);"
                           "CREATE UNIQUE INDEX snapshots_name_uq ON snapshots(name);")
     if not drop_trigger:
-        for t in ("images_kind_ins", "images_kind_upd", "snapshots_ins", "snapshots_upd"):
-            tbl = "images" if t.startswith("images") else "snapshots"
-            con.execute("CREATE TRIGGER %s BEFORE INSERT ON %s BEGIN SELECT 1; END" % (t, tbl))
+        # real enforcement (RAISE) triggers -- the hardened store gate refuses a same-named no-op body; the WHEN
+        # guards keep them from firing on the valid rows inserted below.
+        con.executescript(
+            "CREATE TRIGGER images_kind_ins BEFORE INSERT ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END;"
+            "CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END;"
+            "CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END;"
+            "CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END;")
     gold = "drvps-raw-v1-10-" + "a" * 8
     snap = "drvps-snap-v1-" + "b" * 8
     con.execute("INSERT INTO images VALUES(?,?,?,?)", (gold, "golden", "g1", '{"distro":"fedora44"}'))

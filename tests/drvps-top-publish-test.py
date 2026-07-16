@@ -141,6 +141,31 @@ hd, rd = build_ok("db-down status-only", dict(OKSRC, db_status="down", db_bootti
                   [rec(ID[0]), rec(ID[1])])
 ok(hd and len(rd) == 0, "db down -> no rows (status-only)")
 
+# ---- store_gate SEMANTIC enforcement: a same-named NON-unique index / no-op (RAISE-free) trigger must be
+# REFUSED, not blessed by name (a corrupt/half-migrated store store_init would reject must not run) ----
+import sqlite3  # noqa
+def _mkstore(idx, trg_ins):
+    c = sqlite3.connect(":memory:"); c.text_factory = bytes   # production connect_ro uses text_factory=bytes
+    c.executescript(
+        "CREATE TABLE vms(owner_uid TEXT,class TEXT,domain_uuid TEXT,artifact_id TEXT,state TEXT,name TEXT,created_at TEXT);"
+        "CREATE TABLE images(kind TEXT,name TEXT,provenance TEXT,artifact_id TEXT);"
+        "CREATE TABLE snapshots(id TEXT,parent_golden_id TEXT,secret_bearing INT,validation_status TEXT,created_at TEXT,name TEXT);"
+        + idx + "CREATE UNIQUE INDEX snapshots_name_uq ON snapshots(name);" + trg_ins +
+        "CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END;"
+        "CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END;"
+        "CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots WHEN NEW.name IS NULL BEGIN SELECT RAISE(ABORT,'x'); END;")
+    return c
+_UNIQ = "CREATE UNIQUE INDEX images_kind_name_uq ON images(kind,name);"
+_NON = "CREATE INDEX images_kind_name_uq ON images(kind,name);"
+_RA = "CREATE TRIGGER images_kind_ins BEFORE INSERT ON images WHEN NEW.kind NOT IN ('golden','snapshot') BEGIN SELECT RAISE(ABORT,'x'); END;"
+_NO = "CREATE TRIGGER images_kind_ins BEFORE INSERT ON images BEGIN SELECT 1; END;"
+def _gate_ok(idx, trg):
+    try: P.store_gate(_mkstore(idx, trg)); return True
+    except P.StoreGateError: return False
+ok(_gate_ok(_UNIQ, _RA), "store_gate ACCEPTS correct enforcement objects")
+ok(not _gate_ok(_NON, _RA), "store_gate REJECTS a same-named NON-unique index")
+ok(not _gate_ok(_UNIQ, _NO), "store_gate REJECTS a no-op (RAISE-free) trigger")
+
 print("-------------------------------------------")
 print("drvps-top-publish: PASS=%d FAIL=%d" % (npass[0], nfail[0]))
 sys.exit(1 if nfail[0] else 0)

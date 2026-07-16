@@ -209,12 +209,22 @@ def store_gate(con):
         if miss:
             raise StoreGateError("schema:%s missing %s" % (tbl, ",".join(miss)))
     idx, trg = _names(con, "index"), _names(con, "trigger")
+    # Verify SEMANTICS, not just names: a same-named NON-unique index or a NO-OP trigger (RAISE-free body) would
+    # otherwise pass and let duplicate names / invalid rows through -- store_init creates real ones, but a
+    # corrupt/half-migrated store must be REFUSED, not run against. Read-only (PRAGMA + sqlite_master.sql), no writes.
+    _idx_table = {"images_kind_name_uq": "images", "snapshots_name_uq": "snapshots"}
     for o in REQUIRED_INDEXES:
         if o not in idx:
             raise StoreGateError("enforcement: unique index %s missing" % o)
+        if not any(_b2s(r[1]) == o and int(r[2]) == 1                     # PRAGMA index_list: col 2 = unique flag
+                   for r in con.execute("PRAGMA index_list(%s)" % _idx_table[o])):
+            raise StoreGateError("enforcement: index %s exists but is NOT unique" % o)
     for o in REQUIRED_TRIGGERS:
         if o not in trg:
             raise StoreGateError("enforcement: check trigger %s missing" % o)
+        _row = con.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (o,)).fetchone()
+        if "RAISE(" not in (_b2s(_row[0]) if _row and _row[0] else "").upper():
+            raise StoreGateError("enforcement: trigger %s has no RAISE -- a no-op body enforces nothing" % o)
     inv = con.execute(
         "SELECT (SELECT count(*) FROM images WHERE kind NOT IN ('golden','snapshot'))"
         " + (SELECT count(*) FROM images WHERE (kind='golden' AND artifact_id NOT GLOB 'drvps-raw-v1-*')"

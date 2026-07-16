@@ -242,8 +242,9 @@ schema_probe() {
   # capability: required columns must all be present. A missing column -> old schema.
   # Reproduce store_init's FULL refusal set read-only (dr_vps_store.sh L162-224): the required COLUMNS,
   # plus the UNIQUE INDEXES + CHECK TRIGGERS that carry the store's uniqueness/NULL/range enforcement --
-  # TYPE-checked (a pre-planted TABLE named e.g. `images_kind_name_uq` must NOT satisfy the index check),
-  # so a store missing its enforcement (which store_init would refuse) is not shown as operational.
+  # verified by SEMANTICS not just name/type: the index SQL must be UNIQUE (a same-named NON-unique index is
+  # refused) and the trigger SQL must contain RAISE( (a same-named no-op `SELECT 1` body enforces nothing and is
+  # refused), so a corrupt/half-migrated store that store_init would refuse is not shown as operational.
   out="$(q_db "
     SELECT 'vms:'||c FROM (WITH r(c) AS (VALUES('owner_uid'),('class'),('domain_uuid'),('artifact_id'),('state'),('name'),('created_at')) SELECT c FROM r)
       WHERE c NOT IN (SELECT name FROM pragma_table_info('vms'))
@@ -252,9 +253,9 @@ schema_probe() {
     UNION ALL SELECT 'snapshots:'||c FROM (WITH r(c) AS (VALUES('parent_golden_id'),('secret_bearing'),('validation_status'),('created_at'),('name')) SELECT c FROM r)
       WHERE c NOT IN (SELECT name FROM pragma_table_info('snapshots'))
     UNION ALL SELECT 'index:'||o FROM (WITH r(o) AS (VALUES('images_kind_name_uq'),('snapshots_name_uq')) SELECT o FROM r)
-      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='index')
+      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='index' AND upper(sql) LIKE '%UNIQUE INDEX%')
     UNION ALL SELECT 'trigger:'||o FROM (WITH r(o) AS (VALUES('images_kind_ins'),('images_kind_upd'),('snapshots_ins'),('snapshots_upd')) SELECT o FROM r)
-      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='trigger');" 2>/dev/null)"; rc=$?
+      WHERE o NOT IN (SELECT name FROM sqlite_master WHERE type='trigger' AND upper(sql) LIKE '%RAISE(%');" 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then echo "BUSY"; return; fi           # fail-fast lock/timeout -> transient
   if [ -n "$out" ]; then echo "SCHEMA:$(echo "$out" | tr '\n' ',' )"; return; fi
   echo "OK"
