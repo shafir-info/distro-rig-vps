@@ -36,6 +36,13 @@ that -- it runs the real `dr-vps-setup` and then the real egress + drvps-top flo
 unit test (with a positive control) pins the atomic-publish helper behind that persistence. Keep new features
 honest by adding their live assertions to `tests/dogfood/nested-selftest.sh` (tier 3), not just an offline seam.
 
+The gate also guards against a test being silently unrun: every `tests/*.sh` must be classified and still exist,
+and every container-inner test must ACTUALLY EXECUTE -- verified at runtime by a `RELEASE-GATE-RAN: <name>`
+marker each inner test emits, which tier 2 asserts is present (a static "is it invoked" grep is only a
+best-effort pre-filter, since no grep can prove a line runs). Settled review decisions and areas still worth
+scrutiny are recorded in `docs/REVIEW-NOTES.md` -- paste its "Accepted" list into a review prompt so a fresh
+review does not re-litigate them.
+
 ## Cut a release
 
 1. `tests/release-gate.sh --container` on your dev box -> `RELEASE-GATE: PASS`.

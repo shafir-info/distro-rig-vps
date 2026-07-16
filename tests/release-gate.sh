@@ -37,6 +37,7 @@ run1(){ # <label> <command...> : run a suite, tally, keep going on failure (coll
   local label="$1"; shift
   if "$@" >"/tmp/rg.$$.out" 2>&1; then echo "  PASS  $label"; pass=$((pass+1))
   else echo "  FAIL  $label"; failn=$((failn+1)); FAILED="$FAILED\n    $label"; sed 's/^/      | /' "/tmp/rg.$$.out" | tail -8; fi
+  [ -n "${CAPTURE:-}" ] && cat "/tmp/rg.$$.out" >> "$CAPTURE"   # accumulate for the tier-2 runtime-coverage grep
   rm -f "/tmp/rg.$$.out"
 }
 markfail(){ echo "  FAIL  $1"; failn=$((failn+1)); FAILED="$FAILED\n    $1"; }
@@ -56,7 +57,7 @@ run1 "every tests/*.sh is classified" bash -c '
 run1 "every classified test still exists (removal detected)" bash -c '
   bad=""; for b in '"$OFFLINE_SH $CONTAINER_SH $CONTAINER_INNER_SH $NONTEST_SH"'; do [ -f "tests/$b.sh" ] || bad="$bad $b"; done
   [ -z "$bad" ] || { echo "classified but MISSING tests/*.sh (remove from release-gate.sh, or restore):$bad"; exit 1; }'
-run1 "every CONTAINER_INNER test is INVOKED (non-comment) by a runner" bash -c '
+run1 "CONTAINER_INNER static invoke pre-filter (best-effort; tier-2 runtime coverage is authoritative)" bash -c '
   # verify an EXECUTABLE `tests/<b>.sh` invocation on a NON-comment line of a runner (egress-squid-run.sh,
   # egress-splituid.sh, or THIS gate for setup-atomic-install) -- a bare substring match would accept a
   # commented-out or disabled invocation, so drop comment lines first, then require the invocation path.
@@ -123,9 +124,19 @@ run1 "residue gate (handle + provider shorthand + review-label class)" bash -c '
 echo "================ TIER 2: CONTAINER e2e (disposable rootless podman) ================"
 if [ "$WANT_CONTAINER" = 1 ]; then
   if command -v podman >/dev/null 2>&1; then
+    CAPTURE="/tmp/rg.$$.t2"; : > "$CAPTURE"                     # accumulate tier-2 output for the coverage grep
     run1 "atomic-install unit (root-in-container + positive control)" \
       podman run --rm -v "$ROOT":/repo:ro,Z registry.fedoraproject.org/fedora:latest bash /repo/tests/setup-atomic-install.sh
     for b in $CONTAINER_SH; do run1 "$b.sh" bash "tests/$b.sh"; done
+    # RUNTIME COVERAGE -- the REAL execution guarantee (the offline "invoked" check above is only a best-effort
+    # STATIC pre-filter; no grep of source can prove a line runs). Each CONTAINER_INNER test emits
+    # `RELEASE-GATE-RAN: <name>` on stderr WHEN IT ACTUALLY EXECUTES; that marker propagates up through the
+    # runners into the captured tier-2 output. So an inner test whose invocation is disabled ANY way (commented,
+    # `false &&`, `echo`, deleted from a runner) leaves NO marker here and FAILS -- this checks what happened.
+    miss=""; for b in $CONTAINER_INNER_SH; do grep -q "RELEASE-GATE-RAN: $b" "$CAPTURE" || miss="$miss $b"; done
+    if [ -z "$miss" ]; then echo "  PASS  tier-2 runtime coverage: every CONTAINER_INNER test actually executed"; pass=$((pass+1))
+    else markfail "tier-2 runtime coverage: CONTAINER_INNER tests that never executed (invocation disabled?):$miss"; fi
+    unset CAPTURE; rm -f "/tmp/rg.$$.t2"
   else markfail "tier 2 REQUESTED but podman is not available"; fi
 else echo "  SKIP  tier 2: pass --container to run it"; skip=$((skip+1)); fi
 

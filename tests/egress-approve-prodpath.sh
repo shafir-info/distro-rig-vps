@@ -8,6 +8,7 @@
 # a squid-VALID config through its PRODUCTION Paths. Run as root in a disposable ssl-bump-squid container:
 #   podman run --rm -v <repo>:/repo:ro localhost/drvps-squid-test bash /repo/tests/egress-approve-prodpath.sh
 set -uo pipefail
+echo "RELEASE-GATE-RAN: egress-approve-prodpath" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 APPROVE=/repo/bin/drvps-egress-approve; CLI=/repo/tools/drvps_egress_model.py; fail=0
 ok(){ if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi; }
 CG=""; for c in /usr/lib64/squid/security_file_certgen /usr/lib/squid/security_file_certgen /usr/libexec/squid/security_file_certgen; do [ -x "$c" ] && { CG="$c"; break; }; done

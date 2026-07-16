@@ -8,6 +8,7 @@
 # test_root=T)); the Paths default restart hook is <T>/restart-hook. Production squid paths (/etc/squid/...)
 # are used inside the container (which we own); the test-root holds the egress store + params + restart hook.
 set -uo pipefail
+echo "RELEASE-GATE-RAN: egress-squid-approve-container" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 CLI=/repo/tools/drvps_egress_model.py; APPROVE=/repo/bin/drvps-egress-approve
 T="$(mktemp -d)"; fail=0
 cleanup(){ [ -f "$T/sqpid" ] && kill "$(cat "$T/sqpid")" 2>/dev/null; }

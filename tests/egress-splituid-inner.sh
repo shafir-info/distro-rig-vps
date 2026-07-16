@@ -3,6 +3,7 @@
 # real drvps user/group, copies the tools + check to a world-readable path (the repo tools are 0600), then
 # runs the provision + assertions as root and the cross-UID assertions as the real drvps user.
 set -uo pipefail
+echo "RELEASE-GATE-RAN: egress-splituid-inner" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 command -v python3 >/dev/null 2>&1 || dnf install -y python3 >/dev/null 2>&1 || true
 command -v useradd >/dev/null 2>&1 || dnf install -y shadow-utils >/dev/null 2>&1 || true
 command -v runuser >/dev/null 2>&1 || dnf install -y util-linux >/dev/null 2>&1 || true

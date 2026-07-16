@@ -5,6 +5,7 @@
 # BUMP a mirror (client sees the squid CA). Fully isolated in the container's netns. No shared-rig touch.
 # Invoke: podman run --rm -v <repo>:/repo:ro localhost/drvps-squid-test bash /repo/tests/egress-squid-container.sh
 set -uo pipefail
+echo "RELEASE-GATE-RAN: egress-squid-container" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 CLI="/repo/tools/drvps_egress_model.py"
 T="$(mktemp -d)"; PIDS=(); fail=0
 cleanup(){ for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }

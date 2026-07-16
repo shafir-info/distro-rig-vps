@@ -7,6 +7,7 @@
 # CONTROL that the buggy `; mv` variant is genuinely detected. Runs as root (the helper chowns root:root) in a
 # disposable container:  podman run --rm -v <repo>:/repo:ro <fedora> bash /repo/tests/setup-atomic-install.sh
 set -uo pipefail
+echo "RELEASE-GATE-RAN: setup-atomic-install" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 [ "$(id -u)" = 0 ] || { echo "SKIP: needs root for chown root:root -- run in a container"; exit 0; }
 fail=0
 ok(){ if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi; }

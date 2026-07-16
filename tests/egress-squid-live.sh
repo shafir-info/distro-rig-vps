@@ -7,6 +7,7 @@
 # the internal-dst deny) -- which no config-text assertion can prove. A positive control (a bogus
 # directive MUST fail) confirms the parser is really validating.
 set -euo pipefail
+echo "RELEASE-GATE-RAN: egress-squid-live" >&2   # tests/release-gate.sh tier-2 runtime-coverage marker
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO/tools/drvps_egress_model.py"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
