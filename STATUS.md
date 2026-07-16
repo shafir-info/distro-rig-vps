@@ -39,10 +39,19 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
 
 ## Trust model and load-bearing boundaries (current, by design)
 
-- **Single trust domain per rig**: all `drvpsctl` members are one tenant at the VM plane (any
-  member can act on every rig VM). Owner-scoping is STORE + ACTION isolation (a client can act on
-  and enumerate only its own snapshots; the preempt path is same-owner-only). Result payloads are
-  PRIVATE by default (`DR_VPS_RESULT_PRIVATE=1`: each result `0600` + a POSIX ACL for the
+- **Owner-scoped VM plane (S1a) -- CANONICAL statement of the isolation model** (USAGE SS11 and
+  the ORCHESTRATOR/AGENT guides defer here): every VM MUTATION and guest-content verb on the
+  agent path -- create/destroy/recreate/exec, detached jobs (exec-detach/-status/-output/-errors),
+  push/pull/console-dump, snapshot (incl. the SOURCE-VM check) and use -- is scoped to the
+  requesting account. The ingress accepter stamps the client's OS uid UNFORGEABLY from
+  SO_PEERCRED; the watcher refuses an unstamped owner-scoped request (fail closed); and the
+  dr-vps layer re-asserts ownership (a foreign or operator-owned VM resolves to not-found -- no
+  existence leak; the offline suites REQUIRE the rejection). Metadata READS stay rig-global by
+  design (`list`/`status`/`inspect`/`wait`: VM ids/names are non-secrets; guest content and
+  lifecycle are what is protected), the direct operator CLI (no `--owner`) is admin, and the
+  preempt path is same-owner-only. At the NETWORK/hypervisor layer the rig remains ONE
+  confinement domain (one sim subnet, L2-isolated ports; per-tenant nets = DR-6). Result payloads
+  are PRIVATE by default (`DR_VPS_RESULT_PRIVATE=1`: each result `0600` + a POSIX ACL for the
   requesting account only; the watcher launcher fails closed without spool ACL support). The
   legacy opt-out (`=0`) makes results `0640` group-readable for a single-tenant rig -- in that
   mode a co-tenant CAN read another member's result envelopes.
@@ -122,9 +131,10 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
 - **M8 wording**: host `owner_uid` appears in agent-visible quota/admission error text; reword
   to "requesting account" (uid stays in daemon-private diagnostics).
 - **v2 features** (specified, not coded): snap export/import, promote-to-golden, restore/
-  rollback UX, multi-owner refcount snapshots, per-VM ownership; `proxied-real`/`open` egress
+  rollback UX, multi-owner refcount snapshots; `proxied-real`/`open` egress
   profiles; broker/tenants/quotas (P3); remote provider (P4); crash reconciliation walk;
-  per-VM anti-spoof nft rule (mitigated by `<port isolated='yes'/>` + single trust domain);
+  per-VM anti-spoof nft rule (mitigated by `<port isolated='yes'/>`; request-layer owner
+  scoping shipped in 0.3.0, network-layer spoofing is the residual this rule would close);
   live-memory checkpoint UX.
 - UX/quality backlog: TODO.md.
 

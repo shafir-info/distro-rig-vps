@@ -297,10 +297,15 @@ Removes the network, nft rules, systemd units, spool, and state, and destroys on
 
 ## 11. Security notes
 
-- **Single-agent trust domain (VM plane).** `drvpsctl` is **one** trust domain for the **VM** plane: any
-  member can `list` and act on **every** rig VM. This is by design (CONCEPT §6/§8). Do **not** place
-  mutually-distrusting agents in `drvpsctl` expecting VM-level isolation; per-VM ownership remains a
-  v2 item. (Result PAYLOADS are per-owner-ACL private by default -- see the boundary note below.)
+- **Owner-scoped VM plane (request layer).** VM **mutations and guest-content** verbs over the agent
+  socket -- `create`/`destroy`/`recreate`/`exec` (incl. detached jobs), `push`/`pull`/`console-dump`,
+  `snapshot` (source-VM checked) and `use` -- are scoped to the requesting account via `SO_PEERCRED`:
+  another account's VM resolves to **not-found**. Metadata reads (`list`/`status`/`inspect`) stay
+  rig-global by design -- treat VM ids/names as visible to co-tenants (non-secrets). At the
+  network/hypervisor layer the rig remains **one** confinement domain (CONCEPT §6/§8; shared subnet,
+  L2-isolated ports -- see §7): do **not** host mutually-hostile workloads expecting network-level
+  tenant isolation. (Result PAYLOADS are per-owner-ACL private by default -- see the boundary note
+  below. Canonical statement of the model: STATUS.md "Trust model".)
 - **Snapshots are per-owner scoped (action + store isolation).** Unlike the VM plane, **snapshots** are
   owner-isolated: the ingress accepter reads the connecting client's OS uid **unforgeably** via `SO_PEERCRED`
   and stamps it as the snapshot's `owner_uid` (the watcher **fails closed** if a snapshot verb ever arrives

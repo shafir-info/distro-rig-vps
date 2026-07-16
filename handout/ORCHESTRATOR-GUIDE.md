@@ -29,17 +29,14 @@ The orchestrator runs as ONE dedicated OS service account on the rig host. Run e
 under this one account; drvps never sees your internal process structure.
 
 **Owner-scoping -- what is private to your account:**
-- SHIPPED today: your **snapshots** and **detached exec jobs** are account-scoped -- other accounts
-  cannot list, read, or act on them (theirs resolve to not-found for you, and vice versa).
-- NOT yet: **VM records are not private today.** `list` shows every account's VMs, and VM operations
-  address a VM by id without an ownership check. On the current rig, do not treat co-tenants as
-  untrusted for VM lifecycle.
-- BUILT, pending rig deploy (part of the service plane): ownership checks extend to VM **mutations and
-  guest-reads** (destroy/recreate/exec/push/pull/console-dump/snapshot) -- another account's attempt on
-  your VM resolves to not-found. Listing/metadata reads (`list`/`status`/`inspect`) stay global: treat VM
-  ids and names as visible to co-tenants (non-secrets); it is the guest CONTENT and lifecycle that get
-  protected. **Sequencing promise: this lands before your account is onboarded to the rig** -- by the
-  time you integrate, your driver VMs are owner-protected.
+- SHIPPED: your **snapshots**, your **detached exec jobs**, and your **VM mutations + guest content**
+  are account-scoped. Another account's attempt to destroy/recreate/exec/push/pull/console-dump/
+  snapshot/use YOUR VM -- or to read your jobs or snapshots -- resolves to **not-found** (no
+  existence leak), and vice versa.
+- Rig-global by design: listing/metadata reads (`list`/`status`/`inspect`) show every account's VMs.
+  Treat VM ids and names as visible to co-tenants (non-secrets); it is the guest CONTENT and
+  lifecycle that are protected. Network-layer isolation between guests is L2 port isolation on ONE
+  shared subnet, not per-tenant networks.
 
 Access is two-layered (both required; the service-group + quota layer is BUILT pending rig deploy,
 per-capability registration ships with each capability):
