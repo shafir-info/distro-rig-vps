@@ -628,6 +628,28 @@ run_sh() {  # <snippet-literal> [args...]
 have() { command -v "$1" >/dev/null 2>&1; }
 need_root() { [ "$DRY_RUN" -eq 1 ] || [ "$(id -u)" = 0 ] || { echo "must run as root (or --dry-run)" >&2; exit 12; }; }
 
+# _dr_atomic_install_root <src> <dest> : publish <dest> = <src>'s bytes, mode 0644, owner root:root, via a
+# SAME-DIR temp + atomic rename -- a concurrent reader (e.g. drvps-egress-approve reading a render input while
+# setup re-runs) sees either the complete old file or the complete new one, never a partial write. INCIDENT:
+# the mv MUST be chained with `&&`, not `;` -- an earlier version used `... ; mv ...` so mv fired even when
+# cat/chmod/chown had failed, which could publish a truncated or wrong-mode file. On ANY failure the temp is
+# removed and the function returns non-zero (caller fails closed). The temp is created in dirname(dest) so the
+# rename stays on the SAME filesystem (a cross-fs mv is a copy, not atomic). Top-level (not nested in step_proxy)
+# so tests/setup-atomic-install.sh can exercise it directly.
+_dr_atomic_install_root() {
+  local _t; _t=$(mktemp -p "$(dirname "$2")" ".$(basename "$2").XXXXXX") || return 1
+  # if-then-else (not `A && B || C`, which shellcheck SC2015-warns and reads ambiguously): the rename runs
+  # ONLY after cat+chmod+chown all succeed; ANY failure removes the temp and returns non-zero (caller fails closed).
+  # `mv -T` (no-target-directory) is REQUIRED: a plain `mv -f tmp DEST` where DEST is an existing directory (or a
+  # symlink to one) would move the temp INSIDE it and return 0, silently leaving the real render-input path
+  # unwritten -- exactly the kind of "succeeds without publishing" the render-input persistence must never do.
+  if cat "$1" >"$_t" && chmod 0644 "$_t" && chown root:root "$_t"; then
+    mv -Tf -- "$_t" "$2" || { rm -f "$_t"; return 1; }
+  else
+    rm -f "$_t"; return 1
+  fi
+}
+
 # ---- shared bounded-poll for post-mutation verify reads (verify-class hardening) ------------------------
 # A read-once postcondition that IMMEDIATELY follows a socket-activated libvirt/systemd mutation can race the
 # daemon reflecting the change (the net-autostart false-negative on fc44 was one instance of the CLASS). This
@@ -1717,11 +1739,8 @@ step_proxy() {
   # reproduce this config to open a splice. fleet.json already lives at /etc/distro-rig-vps; these two
   # complete the reproducible RenderParams (PLAN Task 1.9). host-facts is `{}` here -- it MATCHES what this
   # step rendered with (a stronger SSRF fact set is a separate, tracked hardening item), so approve re-renders
-  # a config that differs from live only by the newly-approved splice.
-  _dr_atomic_install_root() {   # <src-tmp> <dest> : atomic same-fs rename, 0644 root:root
-    local _t; _t=$(mktemp -p /etc/distro-rig-vps ".$(basename "$2").XXXXXX") || return 1
-    cat "$1" >"$_t" && chmod 0644 "$_t" && chown root:root "$_t" && mv -f "$_t" "$2" || { rm -f "$_t"; return 1; }
-  }
+  # a config that differs from live only by the newly-approved splice. (_dr_atomic_install_root is a top-level
+  # helper -- see its definition near the other setup helpers -- so it is unit-tested by tests/setup-atomic-install.sh.)
   if ! _dr_atomic_install_root "$_rp" /etc/distro-rig-vps/egress-render-params.json \
      || ! _dr_atomic_install_root "$_rhf" /etc/distro-rig-vps/egress-host-facts.json; then
     rm -f "$_rp" "$_rhf"
