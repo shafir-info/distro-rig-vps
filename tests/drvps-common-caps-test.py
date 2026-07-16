@@ -43,11 +43,13 @@ for bad in ("banana", "", "1e6", "0x10", "12 MiB"):
     except ValueError:
         ok(False, "malformed %r RAISED (crash-loop for a Restart=always daemon)" % bad)
 
-# ---- zero/negative -> clamped to the positive floor (bounds stay meaningful)
-ok(with_env("DR_VPS_REQ_MAX_BYTES", "0", C.req_max_bytes) == 1, "req_max 0 -> floor 1 (read stays bounded)")
-ok(with_env("DR_VPS_REQ_MAX_BYTES", "-5", C.req_max_bytes) == 1, "req_max negative -> floor 1")
-ok(with_env("DR_VPS_MAX_PENDING", "0", C.max_pending) == 1, "max_pending 0 -> floor 1 (not reject-all)")
-ok(with_env("DR_VPS_MAX_PENDING", "-1", C.max_pending) == 1, "max_pending negative -> floor 1")
+# ---- zero/negative -> the DEFAULT, not the floor (external re-review): clamping REQ_MAX=0 to a
+#      1-byte floor kept the read bounded but rejected EVERY real request ("too large") -- a total
+#      ingress outage. A sub-floor override is semantically invalid, so it falls back like malformed.
+ok(with_env("DR_VPS_REQ_MAX_BYTES", "0", C.req_max_bytes) == 1 << 20, "req_max 0 -> DEFAULT (not an unusable 1-byte cap)")
+ok(with_env("DR_VPS_REQ_MAX_BYTES", "-5", C.req_max_bytes) == 1 << 20, "req_max negative -> DEFAULT")
+ok(with_env("DR_VPS_MAX_PENDING", "0", C.max_pending) == 256, "max_pending 0 -> DEFAULT (not reject-all)")
+ok(with_env("DR_VPS_MAX_PENDING", "-1", C.max_pending) == 256, "max_pending negative -> DEFAULT")
 
 # ---- absurd ceilings clamp (a fat-fingered exponent cannot unbound the daemons)
 ok(with_env("DR_VPS_REQ_MAX_BYTES", str(1 << 40), C.req_max_bytes) == 1 << 30, "req_max huge -> 1GiB ceiling")
@@ -67,8 +69,8 @@ try:
     ok(rt("banana") == 5.0, "malformed read_timeout -> default, no raise")
 except ValueError:
     ok(False, "malformed read_timeout RAISED (accepter crash on every connection)")
-ok(rt("0") > 0, "read_timeout 0 -> clamped positive (0 = non-blocking socket, EAGAIN storm)")
-ok(rt("-3") > 0, "read_timeout negative -> clamped positive (settimeout raises on negative)")
+ok(rt("0") == 5.0, "read_timeout 0 -> default (0 = non-blocking socket, EAGAIN storm)")
+ok(rt("-3") == 5.0, "read_timeout negative -> default (settimeout raises on negative)")
 ok(rt("nan") == 5.0, "non-finite read_timeout -> default")
 ok(rt("inf") == 5.0, "non-finite read_timeout -> default (inf = slow-loris hold forever)")
 ok(rt("999999") <= 3600, "huge read_timeout -> bounded ceiling")

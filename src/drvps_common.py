@@ -16,28 +16,33 @@ REQID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}\Z')   # \Z not $: Python $ matches
 
 
 def cap_int(name, default, lo, hi):
-    """Parse an integer env override DEFENSIVELY: malformed -> default, then clamp to [lo, hi].
-    Both daemons are Restart=always, so a hand-edited value that raised at import would be a crash
-    LOOP. lo stays 1 on the spool caps: legitimate small operator/test overrides survive, while a
-    zero/negative override -- which would turn the accepter's read(cap+1) into an UNBOUNDED read,
-    or the flood cap into reject-all -- cannot."""
+    """Parse an integer env override DEFENSIVELY: malformed OR sub-floor -> default; above the
+    ceiling -> clamp to hi. Both daemons are Restart=always, so a hand-edited value that raised at
+    import would be a crash LOOP. The asymmetry is deliberate (external re-review): a value BELOW
+    the floor is semantically invalid -- clamping REQ_MAX=0 up to a 1-byte floor kept the read
+    bounded but rejected every real request (a total ingress outage), so it falls back like
+    malformed -- while an over-ceiling value is merely excessive and clamps. lo stays 1 on the
+    spool caps so legitimate small operator/test overrides survive."""
     try:
         v = int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         v = default
-    return max(lo, min(hi, v))
+    if v < lo:
+        v = default
+    return min(hi, v)
 
 
 def cap_float(name, default, lo, hi):
-    """cap_int for float envs (timeouts). A non-FINITE parse (nan/inf) counts as malformed too:
-    nan poisons min/max clamping and inf would hold a slow-loris socket forever."""
+    """cap_int for float envs (timeouts): malformed, non-FINITE (nan poisons clamping; inf would
+    hold a slow-loris socket forever), or sub-floor (a 0/negative timeout = non-blocking socket or
+    a raise) -> default; above the ceiling -> clamp."""
     try:
         v = float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         v = default
-    if not math.isfinite(v):
+    if not math.isfinite(v) or v < lo:
         v = default
-    return max(lo, min(hi, v))
+    return min(hi, v)
 
 
 def req_max_bytes():

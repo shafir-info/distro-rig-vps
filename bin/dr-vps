@@ -84,7 +84,7 @@ main() {
     version)           need_eq 0 "$@"; dr_vps_version ;;
     build)             need_eq 1 "$@"; dr_vps_store_init && dr_vps_image_build "$1" ;;   # exact arity: surplus argv must not be silently dropped
     verify)            need 2 "$@"; dr_vps_image_verify "$@" ;;
-    distros)           dr_vps_store_init && dr_vps_image_ls ;;
+    distros)           need_eq 0 "$@"; dr_vps_store_init && dr_vps_image_ls ;;
     create)            need 2 "$@"; dr_vps_store_init && dr_vps_domain_create "$@" ;;
     wait)              need 1 "$@"; dr_vps_store_init && dr_vps_domain_wait "$@" ;;   # store_init: gate/gaterow read migrated cols post-upgrade
     exec)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_exec "$@" ;;   # S1a: exact 2 positionals + optional --owner
@@ -96,7 +96,7 @@ main() {
     pull)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_pull "$@" ;;   # S1a: exact 2 positionals + optional --owner
     console-dump)      need 1 "$@"; dr_vps_store_init && dr_vps_console_dump "$@" ;;
     gate)              need_eq 2 "$@"; dr_vps_store_init && dr_vps_gate_vm "$1" "$2" ;;   # store_init: run pending schema migrations BEFORE gaterow reads new columns
-    list)              dr_vps_store_init && dr_vps_store_vm_ls ;;
+    list)              need_eq 0 "$@"; dr_vps_store_init && dr_vps_store_vm_ls ;;
     status)            need_eq 1 "$@"; dr_vps_store_init && dr_vps_store_vm_get "$1" ;;
     inspect)           need_eq 1 "$@"; dr_vps_store_init && dr_vps_domain_inspect "$1" ;;
     console)           need_eq 1 "$@"; dr_vps_store_init && dr_vps_domain_console "$1" ;;
@@ -104,7 +104,7 @@ main() {
     destroy)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_destroy "$@" ;;   # S1a: forward "$@" so [--owner UID] reaches the wrapper
     snapshot)          need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_create "$@" ;;
     use)               need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_use "$@" ;;
-    snap-ls)           dr_vps_store_init && dr_vps_snapshot_ls "$@" ;;
+    snap-ls)           need_eq_owner 0 "$@"; dr_vps_store_init && dr_vps_snapshot_ls "$@" ;;   # zero positionals + optional trailing --owner (watcher-appended)
     snap-show)         need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_show "$@" ;;
     snap-rm)           need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_rm "$@" ;;
     snap-rename)       need 2 "$@"; dr_vps_store_init && dr_vps_snapshot_rename "$@" ;;

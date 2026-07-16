@@ -105,6 +105,11 @@ setup() {
   # the watcher's appended `--owner UID` still passes the exact-arity gate on the job readers
   run "$BIN/dr-vps" exec-status ffffffffffffffffffffffffffffffff --owner 4001
   [ "$status" -eq 0 ]; [ "$output" = "state=missing" ]
+  # zero-positional verbs (re-review): surplus argv was silently ignored on these too
+  run "$BIN/dr-vps" distros extra;      [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" list extra;         [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" snap-ls bogusarg;   [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" snap-ls --owner 4001 extra; [ "$status" -eq 2 ]   # only a trailing --owner pair is allowed
 }
 
 @test "dr-vps distros: empty store -> 0, no rows" {
