@@ -6,6 +6,7 @@
 # daemons. One source of truth here fixes that. Both programs exec from src/ (their launchers run
 # `python3 <root>/src/drvps_*.py`), so sys.path[0] is this file's dir and `import drvps_common` works.
 # stdlib-only; no side effects on import.
+import math
 import os
 import re
 
@@ -14,14 +15,39 @@ import re
 REQID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}\Z')   # \Z not $: Python $ matches before a trailing newline (shared accepter+watcher)
 
 
+def cap_int(name, default, lo, hi):
+    """Parse an integer env override DEFENSIVELY: malformed -> default, then clamp to [lo, hi].
+    Both daemons are Restart=always, so a hand-edited value that raised at import would be a crash
+    LOOP. lo stays 1 on the spool caps: legitimate small operator/test overrides survive, while a
+    zero/negative override -- which would turn the accepter's read(cap+1) into an UNBOUNDED read,
+    or the flood cap into reject-all -- cannot."""
+    try:
+        v = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+def cap_float(name, default, lo, hi):
+    """cap_int for float envs (timeouts). A non-FINITE parse (nan/inf) counts as malformed too:
+    nan poisons min/max clamping and inf would hold a slow-loris socket forever."""
+    try:
+        v = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    if not math.isfinite(v):
+        v = default
+    return max(lo, min(hi, v))
+
+
 def req_max_bytes():
     """Max bytes of a single request (accepter read cap == watcher claim cap). DR_VPS_REQ_MAX_BYTES."""
-    return int(os.environ.get("DR_VPS_REQ_MAX_BYTES", str(1 << 20)))
+    return cap_int("DR_VPS_REQ_MAX_BYTES", 1 << 20, 1, 1 << 30)
 
 
 def max_pending():
     """Pending-request flood cap, shared by the accepter (early reject) + watcher (list cap)."""
-    return int(os.environ.get("DR_VPS_MAX_PENDING", "256"))
+    return cap_int("DR_VPS_MAX_PENDING", 256, 1, 1 << 20)
 
 
 def write_all(fd, data):

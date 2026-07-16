@@ -107,12 +107,23 @@ dr_vps_net_apply() {
   mkdir -p "$(dirname "$DR_VPS_NET_STATE")" \
     || { dr_vps_die "$DR_VPS_E_GENERIC" "cannot create egress-marker dir $(dirname "$DR_VPS_NET_STATE")"; return $?; }
   chmod 0755 "$(dirname "$DR_VPS_NET_STATE")" 2>/dev/null || true
-  printf '%s\n' "$gen" >"$DR_VPS_NET_STATE" \
-    || { dr_vps_die "$DR_VPS_E_GENERIC" "cannot write egress marker $DR_VPS_NET_STATE"; return $?; }
-  # The installer runs root with umask 0077 -> 0600 root, which the rig user (drvps) can't
-  # read. The marker is a non-secret generation hash; make it world-readable so create_guard
-  # (drvps) can check it. (Fail-closed: if it stays unreadable, create_guard refuses anyway.)
-  chmod 0644 "$DR_VPS_NET_STATE" 2>/dev/null || true
+  # ATOMIC publish (same-dir temp + rename, mirrors _dr_atomic_install_root): create_guard reads
+  # the marker UNLOCKED while the privileged timer rewrites it every ~120s -- a truncate-in-place
+  # write + late chmod let a concurrent create see an empty/partial/root-only (umask 0077) marker
+  # -> a false "stale marker" refusal. chmod the TEMP (the marker is a non-secret generation hash;
+  # the rig user drvps must read it), then rename within the marker's own dir (same fs -> atomic),
+  # so a reader sees the complete old or the complete new marker, never less. Single writer, so
+  # the reader needs no lock once the publish is atomic.
+  local _mt
+  _mt=$(mktemp -p "$(dirname "$DR_VPS_NET_STATE")" ".$(basename "$DR_VPS_NET_STATE").XXXXXX") \
+    || { dr_vps_die "$DR_VPS_E_GENERIC" "cannot create egress marker temp under $(dirname "$DR_VPS_NET_STATE")"; return $?; }
+  if printf '%s\n' "$gen" >"$_mt" && chmod 0644 "$_mt"; then
+    mv -Tf -- "$_mt" "$DR_VPS_NET_STATE" \
+      || { rm -f "$_mt"; dr_vps_die "$DR_VPS_E_GENERIC" "cannot publish egress marker $DR_VPS_NET_STATE"; return $?; }
+  else
+    rm -f "$_mt"
+    dr_vps_die "$DR_VPS_E_GENERIC" "cannot write egress marker $DR_VPS_NET_STATE"; return $?
+  fi
 }
 
 # PRE-BOOT create guard (24 on refusal). Two checks, both fail-closed:

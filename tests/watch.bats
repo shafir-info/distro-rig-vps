@@ -59,18 +59,22 @@ _run_once() { run timeout 20 python3 "$W" --once; }
   printf '{"reqid":"j1","op":"exec-detach","vm":"drvps-vm-abc","cmd":"sleep 5","owner_uid":4001}' >"$SPOOL/requests/j1.json"
   printf '{"reqid":"j2","op":"exec-status","job":"0123456789abcdef0123456789abcdef","owner_uid":4002}' >"$SPOOL/requests/j2.json"
   printf '{"reqid":"j3","op":"exec-output","job":"0123456789abcdef0123456789abcdef","owner_uid":4003}' >"$SPOOL/requests/j3.json"
+  printf '{"reqid":"j3e","op":"exec-errors","job":"0123456789abcdef0123456789abcdef","owner_uid":4003}' >"$SPOOL/requests/j3e.json"
   _run_once; [ "$status" -eq 0 ]
   grep -q 'FAKE exec-detach drvps-vm-abc sleep 5 --owner 4001' "$SPOOL/results/j1.json"
   grep -q 'FAKE exec-status 0123456789abcdef0123456789abcdef --owner 4002' "$SPOOL/results/j2.json"
   grep -q 'FAKE exec-output 0123456789abcdef0123456789abcdef --owner 4003' "$SPOOL/results/j3.json"
+  grep -q 'FAKE exec-errors 0123456789abcdef0123456789abcdef --owner 4003' "$SPOOL/results/j3e.json"
 }
 
-@test "watch: exec-status/exec-output WITHOUT owner_uid -> REJECTED (fail-closed, owner-scoped)" {
+@test "watch: exec-status/exec-output/exec-errors WITHOUT owner_uid -> REJECTED (fail-closed, owner-scoped)" {
   printf '{"reqid":"j4","op":"exec-status","job":"0123456789abcdef0123456789abcdef"}' >"$SPOOL/requests/j4.json"
   printf '{"reqid":"j5","op":"exec-output","job":"0123456789abcdef0123456789abcdef"}' >"$SPOOL/requests/j5.json"
+  printf '{"reqid":"j5e","op":"exec-errors","job":"0123456789abcdef0123456789abcdef"}' >"$SPOOL/requests/j5e.json"
   _run_once; [ "$status" -eq 0 ]
   grep -q '"status": "rejected"' "$SPOOL/results/j4.json"
   grep -q '"status": "rejected"' "$SPOOL/results/j5.json"
+  grep -q '"status": "rejected"' "$SPOOL/results/j5e.json"
 }
 
 @test "watch: exec-status with a hostile job id (non-hex / path traversal) -> REJECTED" {

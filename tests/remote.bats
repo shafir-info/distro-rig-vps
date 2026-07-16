@@ -149,3 +149,29 @@ _mkvm() {  # <id> <uuid>
   run dr_vps_exec         ghost 'id' --owner 1001;          [ "$status" -eq 14 ]   # nonexistent vm -> not-found
   # (surplus-positional rejection is a DISPATCH concern -- need_eq_owner in bin/dr-vps -- covered by cli.bats)
 }
+
+@test "exec-errors: serves the detached job's captured STDERR (.err), owner-scoped like exec-output" {
+  # The launcher captures 2>${tag}.err and the cleanup deletes it, but before this verb NO reader
+  # could reach it -- a failed detached install showed an empty exec-output while the FATAL line sat
+  # in .err. Manufacture a completed job (jobdir+meta) and point the ssh seam's pull at known bytes.
+  _mkvm vmE 77777777-7777-7777-7777-777777777777
+  local jid=0123456789abcdef0123456789abcdef jd
+  jd="${DR_VPS_JOBS_DIR}/${jid}"; mkdir -p "$jd"
+  printf 'vm=vmE\ndom_uuid=77777777-7777-7777-7777-777777777777\ntag=/tmp/.drvps-jobs/%s\nstart=1\nowner=1001\n' "$jid" >"$jd/meta"
+  cat >"$BATS_TEST_TMPDIR/fssh" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *".drvps-jobs/"*".err"*) printf 'FATAL: install exploded\n' ;;   # the guest-side bounded head -c of ${tag}.err
+  *".drvps-jobs/"*".out"*) printf 'stdout bytes\n' ;;
+  *) printf 'SSH %s\n' "$*" ;;
+esac
+exit 0
+EOF
+  run dr_vps_exec_errors "$jid" --owner 1001
+  [ "$status" -eq 0 ]
+  [ "$output" = "FATAL: install exploded" ]                 # the .err bytes, reachable at last
+  run dr_vps_exec_errors "$jid" --owner 2002; [ "$status" -eq 14 ]   # foreign owner -> not-found (no leak)
+  run dr_vps_exec_errors "$jid"; [ "$status" -eq 0 ]                 # operator (no --owner) reads any job
+  run dr_vps_exec_output "$jid" --owner 1001
+  [ "$status" -eq 0 ]; [ "$output" = "stdout bytes" ]                # symmetry: .out reader unchanged
+}

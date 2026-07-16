@@ -18,13 +18,10 @@ import drvps_common   # shared REQID_RE + spool caps (one source of truth with t
 
 def _cap_int(name, default, lo, hi):
     # convergence r2/r3: parse a numeric env cap DEFENSIVELY -- a malformed (hand-edited) value must NOT raise
-    # ValueError and crash-loop the Restart=always watcher; fall back to the default, then clamp to [lo, hi].
-    # lo is kept at 1 for the pre-existing caps so legitimate small operator/test overrides are NOT clamped.
-    try:
-        v = int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        v = default
-    return max(lo, min(hi, v))
+    # ValueError and crash-loop the Restart=always watcher. The parse lives in drvps_common (the accepter's
+    # spool caps use the same one) so accept/clamp behavior cannot drift between the two daemons; this
+    # wrapper keeps the existing name at the 8 callsites.
+    return drvps_common.cap_int(name, default, lo, hi)
 
 
 def _utcnow():
@@ -58,9 +55,9 @@ VM_VERBS = {"wait": "guestexec", "exec": "guestexec", "push": "guestexec", "pull
             "snapshot": "lifecycle"}
 # snap-ls/snap-show/snap-rm operate on a SNAPSHOT artifact (or nothing), not a VM -> no per-VM gate; the
 # daemon runs `dr-vps snap-*` as drvps and dr_vps_snapshot_rm is itself refcount-gated (agent owns snapshots).
-# exec-status/exec-output are JOB-keyed (not vm-keyed): the daemon derives the vm from the host job meta and
-# gates guestexec internally. They are OWNER-SCOPED reads (a client cannot poll/read another owner's job).
-GLOBAL_VERBS = {"create", "list", "distros", "snap-ls", "snap-show", "snap-rm", "use", "version", "exec-status", "exec-output",
+# exec-status/exec-output/exec-errors are JOB-keyed (not vm-keyed): the daemon derives the vm from the host job
+# meta and gates guestexec internally. They are OWNER-SCOPED reads (a client cannot poll/read another owner's job).
+GLOBAL_VERBS = {"create", "list", "distros", "snap-ls", "snap-show", "snap-rm", "use", "version", "exec-status", "exec-output", "exec-errors",
                 # egress: drvpsvc splice-destination register/query. No vm; owner-scoped (below); the store
                 # logic (admit + caps + idempotency) is dr_vps_egress.sh -> drvps_egress_member.py.
                 "egress"}
@@ -122,7 +119,7 @@ def decide(filename, raw, gate_fn, caps):
     # unscoped would let a caller boot a VM off ANOTHER owner's snapshot -- the exact confidentiality breach
     # the fail-closed rule prevents for the read verbs.
     OWNER_SCOPED_VERBS = ("snap-ls", "snap-show", "snap-rm", "snapshot", "use",
-                          "exec-detach", "exec-status", "exec-output",   # agent jobs are owner-tagged + owner-only
+                          "exec-detach", "exec-status", "exec-output", "exec-errors",   # agent jobs are owner-tagged + owner-only
                           # S1a: VM ownership. create stamps the new row; the mutations/guest-reads below
                           # are refused (below) unless owner-verified. Reads (list/status/inspect/wait/
                           # distros/version) stay GLOBAL -- ids/names are non-secrets; payloads+lifecycle are.
@@ -259,7 +256,7 @@ def decide(filename, raw, gate_fn, caps):
                      "argv": [caps["bin"], op, snap] + owner_args, "preempt": False},
                     **idem_fields)   # S4: only snap-rm can carry idem (snap-show already rejected above)
 
-    if op in ("exec-status", "exec-output"):
+    if op in ("exec-status", "exec-output", "exec-errors"):
         # JOB-keyed owner-scoped read: the daemon derives the vm from host job meta + gates guestexec internally.
         job = req.get("job")
         if not isinstance(job, str) or not JOB_RE.match(job):
@@ -504,8 +501,16 @@ def write_result(spool, reqid, obj, result_max, owner=None, private=True):
         # the 512-byte floor) used to fall through to the last-resort byte cut = invalid JSON.
         f = max(("stdout", "stderr", "reason"), key=lambda k: len(obj.get(k) or ""))
         cur = obj.get(f) or ""
-        if not cur:                              # nothing left to trim -> last-resort byte cut (rare)
-            raw = raw[:result_max]; break
+        if not cur:
+            # Nothing free-form left to trim (the bulk sits elsewhere, e.g. an over-cap content_b64
+            # under a lowered result_max). The last resort must STAY valid JSON -- a raw byte cut
+            # can split mid-string/mid-escape and hand every reader a broken envelope. Shrink to a
+            # minimal truncated envelope: reqid/status/exit_code survive (each is small and fenced;
+            # the 512-byte floor always fits them), the payload is dropped.
+            obj = {k: obj[k] for k in ("reqid", "status", "exit_code") if k in obj}
+            obj["truncated"] = True
+            raw = json.dumps(obj).encode()
+            break
         obj[f] = cur[: max(0, len(cur) - (len(raw) - result_max) - 32)]
         obj["truncated"] = True
         raw = json.dumps(obj).encode()

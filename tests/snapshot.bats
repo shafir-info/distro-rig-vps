@@ -530,6 +530,18 @@ _sid() { local h; h=$(printf '%064d' 0 | tr 0 "$1"); printf 'drvps-snap-v1-10485
   run dr_vps_sql "SELECT owner_uid FROM snapshots WHERE id='$sid';"; [ "$output" = "$B" ]   # result owner-stamped
 }
 
+@test "snap-show: a FAILED sidecar read/render propagates a NONZERO rc (never a silent success with no output)" {
+  # The md is absent and the render fallback FAILS: show must return the READ status, not the
+  # status of closing the lock fd (which is 0 -- a caller would treat garbage/empty as success).
+  local A=4001 sa; sa=$(_sid a)
+  _reg_snap "$sa" snap-a "$A"
+  rm -f "${DR_VPS_SNAP_DIR}/${sa}/snapshot.md"
+  dr_vps_snapshot_md_render() { return 7; }
+  run dr_vps_snapshot_show "$sa" --owner "$A"
+  unset -f dr_vps_snapshot_md_render
+  [ "$status" -eq 7 ]
+}
+
 @test "owner-scoping: the operator (no --owner) can rm ANY client's snapshot -- admin recovery is always possible" {
   local A=4001 sa; sa=$(_sid a)
   _reg_snap "$sa" snap-a "$A"

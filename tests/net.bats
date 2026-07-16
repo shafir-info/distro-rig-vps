@@ -77,6 +77,33 @@ _bump_inventory() { jq '.simulated_allow.cache_port=9999' "$DR_VPS_FLEET_JSON" >
   [ "$(cat "$DR_VPS_NET_STATE")" = "$(dr_vps_net_generation)" ]
 }
 
+@test "apply: the marker is published ATOMICALLY -- full bytes + 0644 BEFORE it becomes visible, via a same-dir rename" {
+  # create_guard reads the marker UNLOCKED while the privileged timer rewrites it every ~120s. A
+  # truncate-in-place write + late chmod let a concurrent create see an empty/partial/root-only
+  # marker -> a false "stale marker" refusal. Shadow mv to capture the publish instant: the source
+  # temp must ALREADY carry the complete generation and the world-readable mode, and the rename
+  # must stay in the marker's own directory (same fs -> atomic; a cross-dir mv is a copy).
+  local mvlog="$BATS_TEST_TMPDIR/mvlog"
+  mkdir -p "$BATS_TEST_TMPDIR/shadow"
+  cat >"$BATS_TEST_TMPDIR/shadow/mv" <<EOF
+#!/usr/bin/env bash
+args=(); for a in "\$@"; do case "\$a" in -*) ;; *) args+=("\$a");; esac; done
+printf '%s|%s|%s|%s\n' "\$(cat "\${args[0]}")" "\$(stat -c %a "\${args[0]}")" \
+  "\$(dirname "\${args[0]}")" "\$(dirname "\${args[1]}")" >>"$mvlog"
+exec /usr/bin/mv "\$@"
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/shadow/mv"
+  PATH="$BATS_TEST_TMPDIR/shadow:$PATH" dr_vps_net_apply
+  [ -s "$mvlog" ]                                              # the publish IS a rename, not in-place truncate
+  local rec; rec=$(tail -1 "$mvlog")
+  local c m sd dd; IFS='|' read -r c m sd dd <<<"$rec"
+  [ "$c" = "$(dr_vps_net_generation)" ]                        # complete bytes BEFORE visibility
+  [ "$m" = 644 ]                                               # world-readable BEFORE visibility (no 0600 window)
+  [ "$sd" = "$dd" ]                                            # same-dir temp -> same-fs atomic rename
+  [ "$(cat "$DR_VPS_NET_STATE")" = "$(dr_vps_net_generation)" ]
+  [ "$(stat -c %a "$DR_VPS_NET_STATE")" = 644 ]
+}
+
 @test "apply: IDEMPOTENT -- add->delete->recreate render re-applies cleanly (twice)" {
   # `add table` is idempotent on real nft (validated: nftables v1.1.6 applies the render 3x, rule
   # count stays 2), so the periodic egress timer / --reapply-egress can re-assert without error.

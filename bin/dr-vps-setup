@@ -551,9 +551,9 @@ validate_env() {
   # env-overridable (api.sh default), so a hostile installer env could redirect that root write/chmod
   # to an arbitrary path (e.g. /etc/cron.d/x). Constrain it to a safe rig-namespace path.
   _safe_path "$DR_VPS_NET_STATE"      DR_VPS_NET_STATE
-  # The nft marker is written path-based by dr_vps_net_apply (mkdir -p + redirect + chmod). Confine it to
-  # /run/ (root-owned tmpfs, non-drvps-writable) so no service user can plant a symlink at it -- rather
-  # than the general rig namespace (a drvps-owned rig subtree WOULD be swappable).
+  # The nft marker is written path-based by dr_vps_net_apply (mkdir -p + same-dir temp + atomic
+  # rename). Confine it to /run/ (root-owned tmpfs, non-drvps-writable) so no service user can plant
+  # a symlink at it -- rather than the general rig namespace (a drvps-owned rig subtree WOULD be swappable).
   case "$(realpath -ms "$DR_VPS_NET_STATE")" in
     /run/*) ;;
     *) echo "[setup] FATAL: DR_VPS_NET_STATE must be under /run (root-owned tmpfs); got '$DR_VPS_NET_STATE'" >&2; exit 2;;

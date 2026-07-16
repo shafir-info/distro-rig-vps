@@ -43,6 +43,7 @@ usage: dr-vps <verb> [args]
   exec-detach <id> <cmd>          launch <cmd> detached -> a job id (survives the per-exec cap)
   exec-status <job>               job state: running|done rc=N|infra-failed|driver-timeout|destroyed|missing
   exec-output <job>               pull the job's captured stdout (bounded)
+  exec-errors <job>               pull the job's captured stderr (bounded)
   push <id> <localfile> <remote>  scp a local file into the guest (gated)
   pull <id> <remote>              read a guest file, bounded (gated)
   recreate <id>                   drop overlay, re-clone the pinned golden
@@ -81,23 +82,24 @@ main() {
   case "$cmd" in
     doctor)            dr_vps_doctor "$@" ;;
     version)           need_eq 0 "$@"; dr_vps_version ;;
-    build)             need 1 "$@"; dr_vps_store_init && dr_vps_image_build "$1" ;;
+    build)             need_eq 1 "$@"; dr_vps_store_init && dr_vps_image_build "$1" ;;   # exact arity: surplus argv must not be silently dropped
     verify)            need 2 "$@"; dr_vps_image_verify "$@" ;;
     distros)           dr_vps_store_init && dr_vps_image_ls ;;
     create)            need 2 "$@"; dr_vps_store_init && dr_vps_domain_create "$@" ;;
     wait)              need 1 "$@"; dr_vps_store_init && dr_vps_domain_wait "$@" ;;   # store_init: gate/gaterow read migrated cols post-upgrade
     exec)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_exec "$@" ;;   # S1a: exact 2 positionals + optional --owner
     exec-detach)       need 2 "$@"; dr_vps_store_init && dr_vps_exec_detach "$@" ;;   # launch -> job id ([--owner UID]); store_init: gaterow reads migrated cols
-    exec-status)       need 1 "$@"; dr_vps_store_init && dr_vps_exec_status "$@" ;;   # poll (taxonomy-preserving; [--owner UID])
-    exec-output)       need 1 "$@"; dr_vps_store_init && dr_vps_exec_output "$@" ;;   # pull stdout ([--owner UID])
+    exec-status)       need_eq_owner 1 "$@"; dr_vps_store_init && dr_vps_exec_status "$@" ;;   # poll (taxonomy-preserving; [--owner UID])
+    exec-output)       need_eq_owner 1 "$@"; dr_vps_store_init && dr_vps_exec_output "$@" ;;   # pull stdout ([--owner UID])
+    exec-errors)       need_eq_owner 1 "$@"; dr_vps_store_init && dr_vps_exec_errors "$@" ;;   # pull stderr ([--owner UID])
     push)              need_eq_owner 3 "$@"; dr_vps_store_init && dr_vps_push "$@" ;;   # S1a: exact 3 positionals + optional --owner
     pull)              need_eq_owner 2 "$@"; dr_vps_store_init && dr_vps_pull "$@" ;;   # S1a: exact 2 positionals + optional --owner
     console-dump)      need 1 "$@"; dr_vps_store_init && dr_vps_console_dump "$@" ;;
-    gate)              need 2 "$@"; dr_vps_store_init && dr_vps_gate_vm "$1" "$2" ;;   # store_init: run pending schema migrations BEFORE gaterow reads new columns
+    gate)              need_eq 2 "$@"; dr_vps_store_init && dr_vps_gate_vm "$1" "$2" ;;   # store_init: run pending schema migrations BEFORE gaterow reads new columns
     list)              dr_vps_store_init && dr_vps_store_vm_ls ;;
-    status)            need 1 "$@"; dr_vps_store_init && dr_vps_store_vm_get "$1" ;;
-    inspect)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_inspect "$1" ;;
-    console)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_console "$1" ;;
+    status)            need_eq 1 "$@"; dr_vps_store_init && dr_vps_store_vm_get "$1" ;;
+    inspect)           need_eq 1 "$@"; dr_vps_store_init && dr_vps_domain_inspect "$1" ;;
+    console)           need_eq 1 "$@"; dr_vps_store_init && dr_vps_domain_console "$1" ;;
     recreate)          need 1 "$@"; dr_vps_store_init && dr_vps_domain_recreate "$@" ;;   # S1a: forward "$@" for [--owner UID]
     destroy)           need 1 "$@"; dr_vps_store_init && dr_vps_domain_destroy "$@" ;;   # S1a: forward "$@" so [--owner UID] reaches the wrapper
     snapshot)          need 1 "$@"; dr_vps_store_init && dr_vps_snapshot_create "$@" ;;

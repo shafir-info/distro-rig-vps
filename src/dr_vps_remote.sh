@@ -400,9 +400,13 @@ dr_vps_exec_status() {  # <job_id>
   printf 'state=running\n'
 }
 
-# exec-output: pull the job's captured stdout (bounded head -c cap IN THE GUEST). Read NEVER deletes.
-dr_vps_exec_output() {  # <job_id>
-  local jid="$1" owner=""; shift || true
+# exec-output / exec-errors shared reader: pull ONE captured stream of a detached job (bounded
+# head -c cap IN THE GUEST via dr_vps_pull). Read NEVER deletes. <ext> is FIXED by the two public
+# wrappers ('.out'|'.err'), never derived from caller input, so the fenced job-id stays the only
+# variable path segment. Both streams exist from launch (the payload runs `> tag.out 2> tag.err`).
+_dr_vps_job_pull_stream() {  # <job_id> <ext> [--owner UID]
+  local jid="$1" ext="$2"; shift 2 || { shift "$#"; true; }
+  local owner=""
   while [ "$#" -gt 0 ]; do case "$1" in --owner) owner="${2:-}"; shift 2;; *) shift;; esac; done
   local jobdir; jobdir=$(_dr_vps_job_dir "$jid") || return $?
   [ -d "$jobdir" ] || { dr_vps_die "$DR_VPS_E_NOTFOUND" "no such job: $jid"; return $?; }
@@ -415,13 +419,25 @@ dr_vps_exec_output() {  # <job_id>
   [ "$urc" -eq 0 ] || { dr_vps_die "$DR_VPS_E_LIBVIRT" "job $jid: store read failed"; return $?; }
   [ "$cur" = "$dom_uuid" ] || { dr_vps_die "$DR_VPS_E_NOTFOUND" "job $jid: source VM gone/recreated"; return $?; }
   local otmp; otmp=$(mktemp "${DR_VPS_TMP_DIR:-/tmp}/drvpsout.XXXXXX") || { dr_vps_die "$DR_VPS_E_GENERIC" "mktemp failed"; return $?; }
-  dr_vps_pull "$vm" "${tag}.out" > "$otmp" 2>/dev/null; local prc=$?     # bounded IN-GUEST (head -c cap+1) by dr_vps_pull
+  dr_vps_pull "$vm" "${tag}${ext}" > "$otmp" 2>/dev/null; local prc=$?   # bounded IN-GUEST (head -c cap+1) by dr_vps_pull
   # CHECK the pull rc: an SSH/guest/read failure must NOT become a silent successful EMPTY output.
   [ "$prc" -eq 0 ] || { rm -f "$otmp"; dr_vps_die "$DR_VPS_E_LIBVIRT" "job $jid: pull output failed (guest/transport)"; return $?; }
   # RE-CHECK uuid AFTER the pull: a destroy/recreate during the read must not serve the new VM's bytes (TOCTOU).
   cur=$(_dr_vps_job_cur_uuid "$vm"); urc=$?
   { [ "$urc" -eq 0 ] && [ "$cur" = "$dom_uuid" ]; } || { rm -f "$otmp"; dr_vps_die "$DR_VPS_E_NOTFOUND" "job $jid: source VM recreated during read"; return $?; }
   cat "$otmp"; rm -f "$otmp"
+}
+
+# exec-output: the job's captured stdout. exec-errors: its captured stderr -- the launcher always
+# wrote ${tag}.err, but no verb served it, so a detached job that FAILED showed an empty exec-output
+# with the fatal line unreachable (asymmetric with sync exec, whose envelope carries both streams).
+dr_vps_exec_output() {  # <job_id> [--owner UID]
+  local jid="${1:-}"; shift || true
+  _dr_vps_job_pull_stream "$jid" .out "$@"
+}
+dr_vps_exec_errors() {  # <job_id> [--owner UID]
+  local jid="${1:-}"; shift || true
+  _dr_vps_job_pull_stream "$jid" .err "$@"
 }
 
 # destroy hook: tombstone the VM's jobs (the VM teardown reaps the guest procs). Keeps terminal status for TTL.

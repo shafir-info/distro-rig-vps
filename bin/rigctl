@@ -69,6 +69,8 @@ case "$verb" in
     json=$(jq -nc --arg r "$reqid" --arg j "$1" '{reqid:$r,op:"exec-status",job:$j}') ;;
   exec-output) [ "$#" -eq 1 ] || die "exec-output <job>"
     json=$(jq -nc --arg r "$reqid" --arg j "$1" '{reqid:$r,op:"exec-output",job:$j}') ;;
+  exec-errors) [ "$#" -eq 1 ] || die "exec-errors <job>"
+    json=$(jq -nc --arg r "$reqid" --arg j "$1" '{reqid:$r,op:"exec-errors",job:$j}') ;;
   pull)  [ "$#" -eq 2 ] || die "pull <vm> <remote>"
     json=$(jq -nc --arg r "$reqid" --arg v "$1" --arg p "$2" '{reqid:$r,op:"pull",vm:$v,remote:$p}') ;;
   push)  [ "$#" -eq 3 ] || die "push <vm> <localfile> <remote>"
@@ -172,7 +174,7 @@ case "$verb" in
         json=$(jq -nc --arg r "$reqid" '{reqid:$r,op:"egress",egress_op:"list"}') ;;
       *) die "egress add-splice|remove-splice <host> [port] | list | status <reqid>" ;;
     esac ;;
-  *) die "usage: rigctl create|exec|exec-detach|exec-status|exec-output|push|pull|recreate|destroy|wait|status|inspect|console-dump|list|distros|version|snapshot|snap-ls|snap-show|snap-rm|use|egress ..." ;;
+  *) die "usage: rigctl create|exec|exec-detach|exec-status|exec-output|exec-errors|push|pull|recreate|destroy|wait|status|inspect|console-dump|list|distros|version|snapshot|snap-ls|snap-show|snap-rm|use|egress ..." ;;
 esac
 
 # Submit over the drvps-side ingress SOCKET -- the agent has NO filesystem write to the spool (so it
@@ -183,13 +185,14 @@ sock="${DR_VPS_SUBMIT_SOCK:-/run/drvps-submit.sock}"
 resp=$(printf '%s' "$json" | python3 -c '
 import socket, sys
 path, timeout = sys.argv[1], float(sys.argv[2])
+data = sys.stdin.buffer.read()
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sent = False
+maybe_sent = False
 try:
     s.settimeout(timeout)
     s.connect(path)
-    s.sendall(sys.stdin.buffer.read())
-    sent = True                       # bytes are on the wire -- the ingress MAY now enqueue the request
+    maybe_sent = True                 # entering sendall: a stream send can raise AFTER part of the
+    s.sendall(data)                   # request reached the peer, so from here on a failure is exit 4
     s.shutdown(socket.SHUT_WR)
     buf = b""
     while True:
@@ -198,10 +201,11 @@ try:
             break
         buf += chunk
 except Exception as e:
-    # BEFORE the send completes -> definitely not submitted (exit 3, safe to retry). AFTER it -> the request
-    # may be enqueued but the ack was lost (exit 4, INDETERMINATE). Never conflate the two -- an agent must
-    # not blindly re-run a mutation it cannot confirm.
-    sys.stderr.write(str(e) + "\n"); sys.exit(4 if sent else 3)
+    # Exit 3 (definitely NOT submitted, safe to retry) ONLY for a failure BEFORE the first byte could
+    # have been transmitted (connect/setup). Once the send has STARTED, a raised sendall() proves
+    # nothing about what the peer already read+enqueued -> exit 4, INDETERMINATE. Never conflate the
+    # two -- an agent must not blindly re-run a mutation it cannot confirm.
+    sys.stderr.write(str(e) + "\n"); sys.exit(4 if maybe_sent else 3)
 if not buf:
     sys.exit(4)                       # sent, but the peer closed with NO acknowledgment -> may be enqueued
 sys.stdout.write(buf.decode("utf-8", "replace"))
@@ -211,7 +215,7 @@ _indet="MAY already be enqueued; treat as INDETERMINATE: do NOT blindly re-run a
 case "$_subrc" in
   0) ;;                                                 # got an acknowledgment; parse OK/ERR below
   3) die "could not reach the submit socket ($sock) -- is drvps-rigsubmit.socket enabled and are you in the drvpsctl group? (request NOT submitted -- safe to re-issue once fixed)" ;;
-  4) die "submit acknowledgment lost after sending -- request $reqid $_indet" ;;
+  4) die "submit did not complete after the send began (send failed mid-stream or the ack was lost) -- request $reqid $_indet" ;;
   *) die "submit failed (rc=$_subrc)" ;;
 esac
 case "$resp" in

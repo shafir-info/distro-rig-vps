@@ -36,11 +36,13 @@ setup() {
   run "$BIN/dr-vps" version extra; [ "$status" -eq 2 ]
 }
 
-@test "dr-vps exec-detach/exec-status/exec-output: verb dispatch + arity + bad-job-id guard" {
+@test "dr-vps exec-detach/exec-status/exec-output/exec-errors: verb dispatch + arity + bad-job-id guard" {
   run "$BIN/dr-vps" exec-detach onlyone; [ "$status" -eq 2 ]           # exec-detach needs <vm> <cmd>
   run "$BIN/dr-vps" exec-status; [ "$status" -eq 2 ]                    # exec-status needs <job>
   run "$BIN/dr-vps" exec-output; [ "$status" -eq 2 ]                    # exec-output needs <job>
+  run "$BIN/dr-vps" exec-errors; [ "$status" -eq 2 ]                    # exec-errors needs <job>
   run "$BIN/dr-vps" exec-status '../etc/passwd'; [ "$status" -eq 2 ]    # non-hex job id (path traversal) rejected
+  run "$BIN/dr-vps" exec-errors '../etc/passwd'; [ "$status" -eq 2 ]    # same fence on the stderr reader
   run "$BIN/dr-vps" exec-status ffffffffffffffffffffffffffffffff        # valid hex, unknown -> missing (rc 0)
   [ "$status" -eq 0 ]; [ "$output" = "state=missing" ]
 }
@@ -71,6 +73,22 @@ setup() {
   run "$BIN/dr-vps" exec vm1 echo hello; [ "$status" -eq 2 ]   # unquoted cmd would run as just `echo`
   run "$BIN/dr-vps" push vm1 ./f /r extra; [ "$status" -eq 2 ]
   run "$BIN/dr-vps" pull vm1 /r extra; [ "$status" -eq 2 ]
+}
+
+@test "dr-vps fixed-argv verbs (status/inspect/console/build/gate/exec-status|output|errors): SURPLUS argv -> usage (2)" {
+  # These handlers consume fixed positionals, so a surplus arg (typo'd flag, mis-split word) was
+  # silently DISCARDED -- `dr-vps status vm1 --typo` succeeded as if the flag existed.
+  run "$BIN/dr-vps" status vm1 --typo;  [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" inspect vm1 extra;  [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" console vm1 extra;  [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" build fedora44 extra; [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" gate lifecycle vm1 extra; [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" exec-status ffffffffffffffffffffffffffffffff extra; [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" exec-output ffffffffffffffffffffffffffffffff extra; [ "$status" -eq 2 ]
+  run "$BIN/dr-vps" exec-errors ffffffffffffffffffffffffffffffff extra; [ "$status" -eq 2 ]
+  # the watcher's appended `--owner UID` still passes the exact-arity gate on the job readers
+  run "$BIN/dr-vps" exec-status ffffffffffffffffffffffffffffffff --owner 4001
+  [ "$status" -eq 0 ]; [ "$output" = "state=missing" ]
 }
 
 @test "dr-vps distros: empty store -> 0, no rows" {

@@ -528,7 +528,8 @@ dr_vps_snapshot_show() {  # <id_or_name> [--owner UID]  -> renders snapshot.md (
   if [ -f "$md" ]; then cat "$md" || _src=$?; else
     dr_vps_snapshot_md_render "$(cat "${DR_VPS_SNAP_DIR}/${id}/provenance.json" 2>/dev/null || printf '{}')" || _src=$?
   fi
-  exec {slfd}>&-           # close the lock fd, but return the READ status
+  exec {slfd}>&-
+  return "$_src"           # the READ status -- a failed cat/render must not exit 0 via the fd-close
 }
 
 dr_vps_snapshot_rename() {  # <id_or_name> <new_name> [--owner UID]

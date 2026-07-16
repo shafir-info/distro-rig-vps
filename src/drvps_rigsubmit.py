@@ -48,7 +48,7 @@ REQID_RE     = drvps_common.REQID_RE                     # shared with the watch
 SPOOL        = os.environ.get("DR_VPS_SPOOL_DIR", "/var/spool/distro-rig-vps")
 REQ_MAX      = drvps_common.req_max_bytes()              # == the watcher's req_max
 MAX_PENDING  = drvps_common.max_pending()                # == the watcher's flood cap
-READ_TIMEOUT = float(os.environ.get("DR_VPS_SUBMIT_READ_TIMEOUT", "5"))    # defeat a slow-loris socket hold
+READ_TIMEOUT = drvps_common.cap_float("DR_VPS_SUBMIT_READ_TIMEOUT", 5.0, 0.1, 3600.0)   # defeat a slow-loris socket hold; defensive parse (malformed would crash EVERY connection)
 
 
 def _peer_uid():

@@ -51,7 +51,8 @@ Run things inside the guest / move files:
 rigctl exec <id> 'cmd'                              # run a command INSIDE the guest, wait for it (in-box unrestricted)
 rigctl exec-detach <id> 'cmd'                       # start a LONG command detached -> prints a <job>
 rigctl exec-status <job>                            # poll a detached job
-rigctl exec-output <job>                            # fetch a detached job's output
+rigctl exec-output <job>                            # fetch a detached job's captured STDOUT
+rigctl exec-errors <job>                            # fetch its captured STDERR (where a failed install's FATAL line lands)
 rigctl push <id> <localfile> <remote>              # copy a local file into the guest (no host path leaks)
 rigctl pull <id> <remote>                           # write the guest file's RAW bytes to stdout (binary-safe)
 ```

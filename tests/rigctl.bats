@@ -254,9 +254,36 @@ EOF
   DR_VPS_SUBMIT_SOCK="$sock" RIGCTL_TIMEOUT=2 run "$RIGCTL" exec vm1 'echo hi'
   kill "$spid" 2>/dev/null || true
   [ "$status" -eq 2 ]
-  [[ "$output" == *"submit acknowledgment lost after sending"* ]]  # not "could not reach" (which = never sent)
   [[ "$output" == *"INDETERMINATE"* ]]
   [[ "$output" == *"do NOT blindly re-run"* ]]                     # reconcile-first guidance for the agent
+  [[ "$output" != *"safe to re-issue"* ]]                          # not "could not reach" (which = never sent)
+}
+
+@test "rigctl: a send failure MID-STREAM (peer drops the connection with the request in flight) is INDETERMINATE, never 'safe to retry'" {
+  # An accepter that accepts then CLOSES without reading: a request LARGER than the unix-socket send
+  # buffer (net.core.wmem_default ~208KiB) makes sendall() raise EPIPE after earlier chunks MAY already
+  # have reached the peer. The client cannot know how much arrived -> this must be the INDETERMINATE
+  # (exit-4) classification, NOT the exit-3 "not submitted, safe to re-issue" path -- an agent blindly
+  # re-running a mutation it cannot confirm could double-apply it.
+  local sock="$BATS_TEST_TMPDIR/dropper.sock"
+  cat >"$BATS_TEST_TMPDIR/dropper.py" <<'EOF'
+import socket, os, sys
+p = sys.argv[1]
+try: os.unlink(p)
+except OSError: pass
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srv.bind(p); srv.listen(4)
+conn, _ = srv.accept()
+conn.close()              # drop with the request still in flight (never read, never ack)
+EOF
+  python3 "$BATS_TEST_TMPDIR/dropper.py" "$sock" &
+  local spid=$!
+  for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  head -c 190000 /dev/zero | tr '\0' 'A' >"$BATS_TEST_TMPDIR/big"    # b64 ~253KB -> request > default sndbuf
+  DR_VPS_SUBMIT_SOCK="$sock" RIGCTL_TIMEOUT=2 run "$RIGCTL" push vm1 "$BATS_TEST_TMPDIR/big" /tmp/big
+  kill "$spid" 2>/dev/null || true
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"INDETERMINATE"* ]]                # classified indeterminate (reconcile first)...
+  [[ "$output" != *"safe to re-issue"* ]]             # ...NOT the pre-send exit-3 retryable path
 }
 
 @test "rigctl console-dump: preserves multibyte UTF-8 while dropping NUL/ESC/C1 without corruption (exit 0)" {
