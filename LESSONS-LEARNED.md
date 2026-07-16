@@ -8,6 +8,10 @@ Sections 12–17 are the retrospective on the owner-scoping **convergence flow**
 review rounds + 3 dedicated race audits, ~20 real defects folded before two consecutive clean rounds),
 focused on the multi-angle review method and the concurrency/race class.
 
+For the **project-independent, transferable** distillation of these lessons (generalized rules with
+their mechanism, curated for reuse beyond this codebase), see the companion
+[`LESSONS-GENERALIZED.md`](LESSONS-GENERALIZED.md).
+
 ## 1. Seam tests prove logic; only a real-environment run proves integration
 Phase 1 was 96 seamed bats green and shellcheck-clean — and the first real-KVM run surfaced **~13
 genuine issues none of the tests could reach**: squid's stock conf had no `conf.d` include (the
@@ -37,7 +41,7 @@ once, and **terminate the loop by a behavior rule** — a competent reviewer nev
 big surface, so "reviewer-clean" is the wrong stop condition.
 
 ## 4. Invert the threat intuition — scrutiny belongs where input reaches the HOST
-The instinct was to lock down `exec` (it runs arbitrary code — scary). The advisor inverted it:
+The instinct was to lock down `exec` (it runs arbitrary code — scary). An outside review inverted it:
 `exec` is the **safe** verb (confined to the disposable, egress-fenced guest); `build` is the real
 danger (it runs on the host BUILD plane); and the boring fields — `reqid` used as a *filename*, `vm`
 flowing into `virsh` — are the host-touching holes. **Lesson:** the unrestricted-looking thing can

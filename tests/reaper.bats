@@ -228,7 +228,7 @@ _ccvm() {  # <id> -- register a golden + a vm row so the console reap sees it
   printf '{"state":"done"}' >"$idir/4002/new.json"
   dr_vps_reaper_sweep
   [ ! -e "$idir/4001/old.json" ]
-  [ ! -e "$idir/4001/.k9.a1b2c3" ]                       # aged hidden temp swept too (advisor MINOR-2)
+  [ ! -e "$idir/4001/.k9.a1b2c3" ]                       # aged hidden temp swept too
   [ ! -d "$idir/4001" ]                                  # emptied owner dir pruned (no inode residue)
   [ -f "$idir/4002/new.json" ]                           # fresh entry survives
 }

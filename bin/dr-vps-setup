@@ -1882,7 +1882,7 @@ PY
   rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
   run squid -k parse
   run_sh 'squid -z 2>/dev/null; true'        # initialize the cache_dir structure (idempotent)
-  # Reboot-safety (advisor): squid binds the bridge IP 10.123.0.1, which only exists once
+  # Reboot-safety: squid binds the bridge IP 10.123.0.1, which only exists once
   # libvirtd brings up drvps0. Allow non-local bind + order squid After=libvirtd so a host
   # reboot can't start squid first, fail to bind, and leave the rig with no proxy.
   run_sh 'printf "net.ipv4.ip_nonlocal_bind = 1\n" > /etc/sysctl.d/99-drvps.conf; sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null'

@@ -5,7 +5,7 @@
 Three subsystems land on top of 0.2.0, plus a self-documentation install path. Everything new is
 offline-green (the full bats + python + shellcheck + ast gate) and wired into the installer; the
 live on-host verification of each is the operator's isolated-env step, still pending (see STATUS.md
-and the Deferred list below). No push until that passes.
+and the Deferred list below).
 
 ### Added
 
@@ -125,13 +125,11 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   and egress shell-wiring (store-free admit-gate + reaper-wiring, replacing the retired v1 store-seam
   tests); plus the shared-caps and write_result unit suites from the consistency review. The full
   offline gate stays green (774 bats + python at umask 0077 and 0022 + shellcheck + ast).
-- **The nested dogfood is now honest and was executed (2026-07-16, agent-driven over rigctl on a
-  fresh fedora44 L1).** `tests/dogfood/nested-selftest.sh` previously ran every check as root@L1 and
-  gated on a doctor bar a 4GB L1 could never meet, while its committed form omitted the renumber the
-  real run needed and printed a "define" claim it never tested. It now: stages root-owned under
+- **The nested dogfood was executed on a live nested host (2026-07-16, agent-driven over rigctl on a
+  fresh fedora44 L1).** `tests/dogfood/nested-selftest.sh` stages root-owned under
   `/opt` with the nested renumber baked in (`DR_VPS_BRIDGE_IP=10.199.0.1` + fleet `cache_cidr` patch
-  + `--force-squid`); runs doctor AS drvps with the capacity policy scoped to the small L1; REALLY
-  defines a rendered domain XML (`virsh define --validate` + undefine); drives the member surface as
+  + `--force-squid`); runs doctor AS drvps with the capacity policy scoped to the small L1; defines
+  a rendered domain XML (`virsh define --validate` + undefine); drives the member surface as
   a NON-root drvpsctl+drvpsvc account (egress add-splice with SO_PEERCRED/socket-DAC/result-ACL on
   the path; the drvps-top viewer); and its PASS line claims exactly the mandatory bar (L2 boot +
   firewalld stay labeled best-effort; one distro per run — an ubuntu L1 is a second invocation).

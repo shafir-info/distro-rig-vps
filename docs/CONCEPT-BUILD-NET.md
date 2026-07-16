@@ -3,7 +3,7 @@
 Status: IMPLEMENTED (rev5 design; 2026-07-11). Architecture externally converged. CODE
 externally reviewed to convergence. Seam suite green + shellcheck clean;
 the live-only integration (real libguestfs->shim->qemu/passt; real cgroup scope-kill) is pending a
-first-live-run on dev-us (slirp path) + a Fedora host (passt path).
+first-live-run on an Ubuntu host (slirp path) + a Fedora host (passt path).
 Full-rigor design (operator fork 2). Replaces the manual `dpkg-divert` workaround with an in-code,
 observed, transactional mechanism. BUILD plane only (`dr-vps build` -> `dr_vps_image_bake`);
 vendor-verified images are TRUSTED inputs (the existing bake already runs guest binaries -- no new
@@ -197,7 +197,7 @@ Assertions:
 - dnf uses `makecache --refresh`, legacy Yum-3 uses `clean expire-cache && makecache` (family branch);
 - noexec-tmp: the shim setup EXECUTES the shim and reports a SETUP error, not backend-unavailable;
 - existing 20 image.bats stay green; the fedora/centos passt bake path is unchanged on a passt host.
-Real: dev-us (slirp, proven) + a Fedora host (passt) -- first-live-run of BOTH paths.
+Real: an Ubuntu host (slirp, proven) + a Fedora host (passt) -- first-live-run of BOTH paths.
 
 ## Review gates
 

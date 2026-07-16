@@ -369,7 +369,7 @@ EOF
 }
 
 @test "rigctl: S4 -- an EMPTY --idem '' dies client-side on EVERY mutator (never silently unprotected)" {
-  # advisor MAJOR: an empty key must NOT be silently dropped (submitting unprotected while the caller
+  # An empty key must NOT be silently dropped (submitting unprotected while the caller
   # believes it is protected); RIGCTL_TIMEOUT=1 keeps a regression from hanging the suite.
   for args in "destroy vm1" "recreate vm1" "create n1 fedora44" "snap-rm drvps-snap-v1-1-abc" "snapshot vm1"; do
     run env RIGCTL_TIMEOUT=1 "$RIGCTL" $args --idem ''
