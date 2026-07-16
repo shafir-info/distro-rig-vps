@@ -6,17 +6,17 @@
 #     DRVPS_LIVE=1 tests/dogfood/nested-selftest.sh
 #
 # Pass bar: installer completes + libvirtd up + `dr-vps doctor` passes + a domain can be DEFINED, AND the
-# 0.3.0 wiring works on a REAL install -- the egress installer->approve seam (render inputs persisted +
-# `drvps-egress-approve list` reads them; this is the exact class the offline seam tests MISSED because they
-# hand-provided the inputs under a test_root), and drvps-top (the publisher emits a feed the member viewer
-# reads). Actually BOOTING a nested L2 guest + the guest-through-proxy splice are BEST-EFFORT (L2 is slower/
-# flakier) so the suite never hangs on them. Run a clean Fedora L1 then Ubuntu L1 for host-distro portability.
+# 0.3.0 wiring works on a REAL install -- the egress installer->approve seam (render inputs persisted + a clean
+# `apply` of a SPECIFIC splice; the exact class the offline seam tests MISSED because they hand-provided the
+# inputs under a test_root), and drvps-top (the publisher, with LIVE sources + an advancing seq, emits a feed
+# the member viewer reads). Actually BOOTING a nested L2 guest + the guest-through-proxy splice are BEST-EFFORT
+# (L2 is slower/flakier) so the suite never hangs on them. Run a clean Fedora L1 then Ubuntu L1 for portability.
 #
-# SAFETY: the L1 VM is owner-scoped (this account's VM only) and is destroyed on ANY exit via a trap, so a
-# failed run never leaks a VM on the shared host. Keep the L1 small (2 vCPU / 4 GB, below).
+# SAFETY (finding: a leaked/hung run on the shared host): the L1 VM is owner-scoped and destroyed on ANY exit via
+# a trap installed BEFORE creation; every remote/create/destroy step is time-bounded (SSH ConnectTimeout +
+# ServerAlive + an outer `timeout`); the source archive is a per-run mktemp removed by the trap.
 #
-# NOTE: a cheaper proxy for the NON-KVM wiring is `tests/release-gate.sh --container` (real installer helpers
-# + squid in disposable podman); this nested test adds the real-KVM + full-install layer on top.
+# NOTE: a cheaper proxy for the NON-KVM wiring is `tests/release-gate.sh --container`; this adds real-KVM.
 set -uo pipefail
 [ "${DRVPS_LIVE:-}" = 1 ] || { echo "set DRVPS_LIVE=1 to run the nested dogfood (needs KVM)"; exit 0; }
 
@@ -30,60 +30,81 @@ GUEST_DISTRO="${1:-fedora44}"
 fail() { echo "DOGFOOD FAIL: $*" >&2; exit 1; }
 step() { echo "== $* =="; }
 
-step "boot an L1 guest ($GUEST_DISTRO) with nested virt"
-ID=$("$DR" create dogfood-l1 "$GUEST_DISTRO" --net simnet --cpus 2 --mem 4096 --ssh-key "$PUBKEY") || fail "L1 create"
-# SAFETY: destroy the L1 on ANY exit (success, fail(), or interrupt) so a run never leaks a VM on the shared host.
-cleanup() { [ -n "${ID:-}" ] && "$DR" destroy "$ID" >/dev/null 2>&1 || true; }
+# SAFETY trap installed BEFORE any resource is created: destroy the L1 (if created) + remove the archive on ANY
+# exit. ID/ARCHIVE start empty so cleanup is a safe no-op if we fail before they are set.
+ID=""; ARCHIVE=""
+cleanup() {
+  [ -n "$ID" ] && timeout 120 "$DR" destroy "$ID" >/dev/null 2>&1
+  [ -n "$ARCHIVE" ] && rm -f "$ARCHIVE"
+  return 0
+}
 trap cleanup EXIT INT TERM
-"$DR" wait "$ID" 300 || fail "L1 not ready"
-IP=$(virsh -c qemu:///system domifaddr "$ID" | awk '/ipv4/{print $NF}' | cut -d/ -f1 | head -1)
-SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o CheckHostIP=no -o IdentitiesOnly=yes -i "$KEY" "root@$IP")
-"${SSH[@]}" 'test -e /dev/kvm' || fail "no nested /dev/kvm in the L1 guest (check kvm_intel nested=Y)"
+
+step "boot an L1 guest ($GUEST_DISTRO) with nested virt"
+ID=$(timeout 300 "$DR" create dogfood-l1 "$GUEST_DISTRO" --net simnet --cpus 2 --mem 4096 --ssh-key "$PUBKEY") || fail "L1 create"
+timeout 320 "$DR" wait "$ID" 300 || fail "L1 not ready"
+IP=$(timeout 30 virsh -c qemu:///system domifaddr "$ID" | awk '/ipv4/{print $NF}' | cut -d/ -f1 | head -1)
+[ -n "$IP" ] || fail "no L1 IP"
+# ConnectTimeout + ServerAlive bound a wedged transport; each command is ALSO wrapped in an outer `timeout` so a
+# STUCK remote command (installer/package manager) can never hang the run (ServerAlive only covers a dead link).
+SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o CheckHostIP=no
+     -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -i "$KEY" "root@$IP")
+timeout 30 "${SSH[@]}" 'test -e /dev/kvm' || fail "no nested /dev/kvm in the L1 guest (check kvm_intel nested=Y)"
 
 step "copy the rig in + run the installer inside the L1 guest"
-tar -czf /tmp/drvps.tgz -C "$ROOT/.." "$(basename "$ROOT")"
-scp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o CheckHostIP=no -o IdentitiesOnly=yes -i "$KEY" /tmp/drvps.tgz "root@$IP:/tmp/" || fail "scp"
-"${SSH[@]}" 'cd /tmp && tar xzf drvps.tgz && cd distro-rig-vps* && ./bin/dr-vps-setup --yes' || fail "installer inside L1"
+ARCHIVE=$(mktemp --suffix=.tgz)                                       # per-run (no fixed /tmp path -> no stale/races)
+tar -czf "$ARCHIVE" -C "$ROOT/.." "$(basename "$ROOT")" || fail "archive build failed"
+timeout 120 scp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o CheckHostIP=no \
+     -o IdentitiesOnly=yes -o ConnectTimeout=15 -i "$KEY" "$ARCHIVE" "root@$IP:/tmp/drvps.tgz" || fail "scp"
+timeout 900 "${SSH[@]}" 'cd /tmp && rm -rf distro-rig-vps* && tar xzf drvps.tgz && cd distro-rig-vps* && ./bin/dr-vps-setup --yes' \
+  || fail "installer inside L1"
 
 step "PASS BAR: libvirtd up + doctor + can DEFINE a domain (in the L1 guest, re-login for groups)"
-"${SSH[@]}" 'sg kvm -c "cd /tmp/distro-rig-vps* && systemctl is-active libvirtd && ./bin/dr-vps doctor"' \
+timeout 120 "${SSH[@]}" 'sg kvm -c "cd /tmp/distro-rig-vps* && systemctl is-active libvirtd && ./bin/dr-vps doctor"' \
   || fail "L1 doctor/libvirtd"
 echo "  L1 installer + doctor PASS"
 
 # ---- 0.3.0 wiring on a REAL install (the coverage the offline/seamed tests could not give) ----
-step "0.3.0 egress: the installer->approve seam -- stage a splice, APPROVE it, squid stays healthy"
-# INCIDENT: an earlier step_proxy rendered squid.conf from temp files and deleted them, so nothing wrote the
-# /etc render inputs drvps-egress-approve reads -> `apply` crashed on a real host. The offline + container
-# tests hand-provided those inputs under a test_root and never saw it. The MANDATORY bar here is a full
-# stage -> apply -> healthy: `approve list` reads only fleet.json + the request store, so it never calls
-# _render_params (the crash path); ONLY `apply` does. So the apply MUST succeed, not be best-effort.
-"${SSH[@]}" 'test -s /etc/distro-rig-vps/egress-render-params.json && test -s /etc/distro-rig-vps/egress-host-facts.json' \
+step "0.3.0 egress: stage a SPECIFIC splice, APPROVE it cleanly, prove it is in the live policy"
+# INCIDENT: an earlier step_proxy rendered squid.conf from temp files and deleted them -> nothing wrote the /etc
+# render inputs approve reads -> `apply` crashed on a real host (masked by test_root). MANDATORY: `apply` must
+# reach _render_params (only `apply` does; `list` reads only fleet + the store) AND CLEANLY (rc=0 + healthy; a
+# degraded rc 3/4 still prints "APPLIED") AND open the SPECIFIC host (not just "an" apply that restarted squid).
+timeout 20 "${SSH[@]}" 'test -s /etc/distro-rig-vps/egress-render-params.json && test -s /etc/distro-rig-vps/egress-host-facts.json' \
   || fail "installer did NOT persist the egress render inputs -- approve apply would crash on this host"
-"${SSH[@]}" 'cd /tmp/distro-rig-vps* && ./bin/rigctl egress add-splice callback.dogfood.example >/dev/null 2>&1' \
+timeout 30 "${SSH[@]}" 'cd /tmp/distro-rig-vps* && ./bin/rigctl egress add-splice callback.dogfood.example >/dev/null 2>&1' \
   || fail "rigctl egress add-splice failed (watcher/socket wiring)"
-# Require apply's OWN exit code == 0, not just "APPLIED" in the output: a DEGRADED apply still prints
-# "APPLIED (...)" but returns 3 (decisions not durable) or 4 (rival terminal) -- a piped `grep -q APPLIED`
-# would accept those. Capture rc separately (no pipefail on the remote) and demand the CLEAN outcome.
-"${SSH[@]}" 'cd /tmp/distro-rig-vps* && out=$(printf "YES\n" | ./bin/drvps-egress-approve apply 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" = 0 ] && printf "%s" "$out" | grep -q "squid restarted + healthy"' \
-  || fail "drvps-egress-approve apply did not CLEANLY apply (rc=0 + 'squid restarted + healthy') -- it reads the render inputs via _render_params (the crash path); a degraded rc 3/4 is rejected"
-"${SSH[@]}" 'systemctl is-active --quiet squid' \
-  || fail "squid is not healthy after the approve restart"
-echo "  egress stage -> approve apply -> squid healthy PASS (the render-input read path is exercised)"
+timeout 120 "${SSH[@]}" 'cd /tmp/distro-rig-vps* && out=$(printf "YES\n" | ./bin/drvps-egress-approve apply 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" = 0 ] && printf "%s" "$out" | grep -q "squid restarted + healthy"' \
+  || fail "drvps-egress-approve apply did not CLEANLY apply (rc=0 + 'squid restarted + healthy'); a degraded rc 3/4 is rejected"
+timeout 20 "${SSH[@]}" 'grep -q "callback.dogfood.example" /etc/distro-rig-vps/fleet.json' \
+  || fail "apply did not add callback.dogfood.example to fleet.json splice_allowlist -- the WRONG destination was approved?"
+timeout 20 "${SSH[@]}" 'grep -q "callback.dogfood.example" /etc/squid/squid.conf' \
+  || fail "the approved host is not in the LIVE squid.conf -- the running proxy would not splice it"
+timeout 20 "${SSH[@]}" 'systemctl is-active --quiet squid' || fail "squid is not healthy after the approve restart"
+echo "  egress stage -> approve apply (clean, specific host, live policy) -> squid healthy PASS"
 
-step "0.3.0 drvps-top: publisher emits a feed + the member viewer reads it"
-# The privileged publisher (AS drvps) reads store.db + virsh -> one feed frame; the unprivileged viewer
-# validates it with the hostile-file protocol + renders. Only a real install exercises this wiring.
-"${SSH[@]}" 'sudo -u drvps /tmp/distro-rig-vps*/bin/drvps-top-publish --once 2>/dev/null | head -1 | grep -q "^H"' \
+step "0.3.0 drvps-top: publisher (active + LIVE sources + advancing seq) + member viewer reads it"
+# The publisher emits a VALID feed even when its sources are DOWN (db_status=down / libvirt_status=down) and the
+# viewer renders a STALE feed successfully -- so "feed exists + viewer parses" does NOT prove the data path works.
+timeout 30 "${SSH[@]}" 'sudo -u drvps /tmp/distro-rig-vps*/bin/drvps-top-publish --once 2>/dev/null | head -1 | grep -q "^H"' \
   || fail "drvps-top-publish --once did not emit a valid feed frame (H header)"
-"${SSH[@]}" 'systemctl start drvps-top-publish 2>/dev/null || true; for i in $(seq 1 20); do [ -s /run/drvps-top/feed ] && break; sleep 0.5; done; test -s /run/drvps-top/feed' \
+timeout 60 "${SSH[@]}" 'systemctl start drvps-top-publish' || fail "drvps-top-publish unit failed to start"
+timeout 20 "${SSH[@]}" 'systemctl is-active --quiet drvps-top-publish' || fail "drvps-top-publish unit is not active (dead/wedged)"
+timeout 30 "${SSH[@]}" 'for i in $(seq 1 20); do [ -s /run/drvps-top/feed ] && break; sleep 0.5; done; test -s /run/drvps-top/feed' \
   || fail "the drvps-top-publish unit did not write /run/drvps-top/feed"
-"${SSH[@]}" 'cd /tmp/distro-rig-vps* && ./bin/drvps-top --once >/tmp/topview.out 2>&1 || { cat /tmp/topview.out; exit 1; }' \
+# LIVE sources: H fields 8=db_status, 10=libvirt_status (per the serializer). A degraded feed reports 'down'.
+timeout 20 "${SSH[@]}" 'h=$(head -1 /run/drvps-top/feed); db=$(printf "%s" "$h" | cut -f8); lv=$(printf "%s" "$h" | cut -f10); [ "$db" = ok ] && [ "$lv" = ok ]' \
+  || fail "feed reports non-ok sources (db/libvirt down) -- the installed service is not reading its real data"
+# ADVANCING seq (H field 4): a dead publisher that left one stale file keeps the same seq -> the unit is not live.
+timeout 40 "${SSH[@]}" 's1=$(head -1 /run/drvps-top/feed | cut -f4); sleep 6; s2=$(head -1 /run/drvps-top/feed | cut -f4); [ "$s2" -gt "$s1" ]' \
+  || fail "feed seq did not advance -- the publisher unit is not actively refreshing (dead/wedged)"
+timeout 30 "${SSH[@]}" 'cd /tmp/distro-rig-vps* && ./bin/drvps-top --once >/tmp/topview.out 2>&1 || { cat /tmp/topview.out; exit 1; }' \
   || fail "the member viewer (drvps-top --once) failed to validate/render the feed"
-echo "  drvps-top publisher+viewer wiring PASS"
+echo "  drvps-top publisher(active,live,advancing) + viewer wiring PASS"
 
 step "0.3.0 DR-2 firewalld (best-effort; a fedora L1 ships firewalld)"
-if "${SSH[@]}" 'command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1'; then
-  "${SSH[@]}" 'z=$(firewall-cmd --get-zone-of-interface=drvps0 2>/dev/null || echo libvirt); firewall-cmd --permanent --zone="$z" --list-rich-rules 2>/dev/null | grep -q "port=\"3128\""' \
+if timeout 20 "${SSH[@]}" 'command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1'; then
+  timeout 20 "${SSH[@]}" 'z=$(firewall-cmd --get-zone-of-interface=drvps0 2>/dev/null || echo libvirt); firewall-cmd --permanent --zone="$z" --list-rich-rules 2>/dev/null | grep -q "port=\"3128\""' \
     && echo "  firewalld scoped rich-rule for the cache port PASS" \
     || echo "  firewalld rich-rule check best-effort (zone/state varied) -- inspect manually if needed"
 else
@@ -91,11 +112,11 @@ else
 fi
 
 step "BEST-EFFORT: try to boot a nested L2 guest (non-fatal)"
-if "${SSH[@]}" 'sg kvm -c "cd /tmp/distro-rig-vps* && DRVPS_TEST_KEY=/home/drvps/.ssh/drvps_vm_ed25519 DRVPS_LIVE=1 timeout 240 tests/acceptance/live-fedora44.sh"'; then
+if timeout 300 "${SSH[@]}" 'sg kvm -c "cd /tmp/distro-rig-vps* && DRVPS_TEST_KEY=/home/drvps/.ssh/drvps_vm_ed25519 DRVPS_LIVE=1 timeout 240 tests/acceptance/live-fedora44.sh"'; then
   echo "  nested L2 boot PASS (full self-hosting proven)"
 else
   echo "  nested L2 boot skipped/failed (best-effort; L1 define-bar already passed)"
 fi
 
-# L1 is destroyed by the EXIT trap (cleanup) -- covers this success path AND every early fail().
+# L1 + archive are removed by the EXIT trap (cleanup) -- covers this success path AND every early fail().
 echo "DOGFOOD PASS ($GUEST_DISTRO L1: installer + libvirtd + doctor + define + egress-wiring + drvps-top)"
