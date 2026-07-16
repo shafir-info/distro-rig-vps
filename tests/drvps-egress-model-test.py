@@ -130,7 +130,11 @@ ok(has("on_unsupported_protocol respond all"), "non-TLS pinned")
 ok("acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8" in body and "10.123.0.0/24" in body and "192.0.2.10" in body,
    "internal-deny reserved + host_facts")
 # the UNSPECIFIED addresses must be denied (connecting to 0.0.0.0 / :: reaches host loopback on Linux -- SSRF)
-ok("0.0.0.0/8" in body and "::/128" in body, "internal-deny includes 0.0.0.0/8 + ::/128")
+ok(all(c in body for c in ("0.0.0.0/8","::/128","198.18.0.0/15","240.0.0.0/4","64:ff9b::/96","fec0::/10")), "internal-deny covers unspecified/benchmark/reserved/NAT64/site-local")
+# REGRESSION GUARD: ::ffff:0:0/96 must NEVER be in the deny set -- squid stores every IPv4 dst as an IPv4-mapped
+# address, so `dst ::ffff:0:0/96` denies ALL IPv4 traffic (a total splice outage the container gate caught). The
+# plain v4 ranges already cover mapped-loopback because squid normalizes v4-mapped back to v4. See RESERVED_DENY_CIDRS.
+ok("::ffff:0:0/96" not in body and "::ffff:0:0/96" not in M.RESERVED_DENY_CIDRS, "IPv4-mapped ::ffff:0:0/96 EXCLUDED (would deny all IPv4 in squid)")
 # ORDERING: splice allow before mirror allow, both after internal-deny; ssl_bump peek<splice<bump<terminate
 idx = {k: body.index(k) for k in [
     "ssl_bump peek step1", "ssl_bump splice step2", "ssl_bump bump step2", "ssl_bump terminate all",

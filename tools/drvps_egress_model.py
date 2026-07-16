@@ -39,12 +39,24 @@ DECISION_REASONS = frozenset(("applied", "already-active", "already-absent",
 _LABEL = re.compile(r"\A[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")   # 1-63, start/end alnum
 _IPV4 = re.compile(r"\A[0-9]{1,3}(\.[0-9]{1,3}){3}\Z")
 
-# internal-destination deny set (C-§6.3): the UNSPECIFIED addresses (0.0.0.0/8, ::/128 -- connecting to which
-# reaches host loopback on Linux), loopback/RFC1918/link-local/CGNAT/IPv6-local. The drvps-specific ranges
-# (subnets, host IPs, block_cidrs) come from HostFacts and are appended.
+# internal-destination deny set (C-§6.3): every NON-globally-reachable / special-purpose range, so a
+# rebinding/compromised approved splice name can never resolve into anything but a real public host. A splice
+# target is by definition an external public callback, so denying all non-global space is safe. Covers: the
+# UNSPECIFIED addresses (0.0.0.0/8, ::/128 -- connecting to which reaches host loopback on Linux), loopback,
+# RFC1918, CGNAT, link-local, IETF-protocol (192.0.0.0/24), benchmarking (198.18.0.0/15), reserved/future
+# (240.0.0.0/4), and the genuinely-IPv6 special ranges: NAT64 (64:ff9b::/96, 64:ff9b:1::/48), discard
+# (100::/64), link/site-local (fe80::/10, fec0::/10), ULA (fc00::/7), documentation (2001:db8::/32).
+# DELIBERATELY EXCLUDED -- ::ffff:0:0/96 (IPv4-mapped IPv6): squid stores EVERY IPv4 destination internally as
+# an IPv4-mapped address, so a `dst ::ffff:0:0/96` ACL matches ALL IPv4 traffic and denies every legitimate
+# public callback (the container behavioral gate caught this as a total splice outage). It is also redundant:
+# squid normalizes an IPv4-mapped destination back to IPv4 before matching, so the plain v4 ranges above
+# (127.0.0.0/8 et al.) already cover ::ffff:127.0.0.1 and friends. See tests/egress-squid-container.sh.
+# The drvps-specific ranges (subnets, host IPs, block_cidrs) come from HostFacts and are appended.
 RESERVED_DENY_CIDRS = (
     "0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "169.254.0.0/16", "100.64.0.0/10", "::/128", "::1/128", "fe80::/10", "fc00::/7")
+    "169.254.0.0/16", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4",
+    "::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+    "fe80::/10", "fc00::/7", "fec0::/10", "2001:db8::/32")
 
 
 class EgressError(ValueError):

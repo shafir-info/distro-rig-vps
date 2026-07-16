@@ -96,6 +96,17 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
   release-gate integration harness (1.10), the doctor-side egress fleet<->config generation-mismatch
   check (1.9 L -- the approver already re-verifies baseline drift; only the `doctor` surfacing is
   missing), and the on-host bare-metal live-dev run. The feature stays OFF until an operator opens a destination.
+- **Egress SPLICE — proxy-publish crash-atomicity + host-IP freshness (both self-healing, no WAL).**
+  `step_proxy` publishes squid.conf and its two render inputs (`egress-render-params.json` +
+  `egress-host-facts.json`) as per-file atomic renames, rolled back as a unit on any single failure.
+  It is NOT journal-transactional: a crash BETWEEN the render inputs and squid.conf can leave them
+  momentarily divergent. This is self-healing — `drvps-egress-approve` re-renders squid.conf FROM the
+  persisted inputs and drift-checks all three before any splice change (`_reconcile_squid` +
+  the under-lock re-verify), so the next approve reconciles a torn publish. A write-ahead journal
+  for the three-file set is deferred. Separately, `egress-host-facts.json` pins the host's routable
+  IPs (the SSRF deny set) at install/reapply time; if the host renumbers afterward the deny set is
+  stale until `dr-vps-setup --reapply-egress` re-derives it (the light path runs `step_proxy`).
+  A doctor-side "host IP changed since last egress apply" surfacing is deferred.
 - **DR-2 firewalld (installer-automated; live + self-test pending)**: firewalld's zone REJECT
   outranks the rig's nft ACCEPT for guest->cache traffic. `step_firewalld` now adds the scoped rich
   rules + persists the drvps0 zone binding automatically (seam-tested, `tests/firewalld-dr2.sh`);

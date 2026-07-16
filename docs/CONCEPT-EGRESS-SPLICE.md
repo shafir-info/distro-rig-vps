@@ -67,9 +67,11 @@ acl splice_dst dstdomain -n callback.crm.example
 acl mirror_sni ssl::server_name --client-requested <mirrors>   # CHANGED: add --client-requested
 acl mirror_dst dstdomain -n <mirrors>                          # CHANGED: add -n (see bugfix note)
 acl step2 at_step SslBump2
-# internal-destination deny (SSRF / DNS-rebinding): loopback/link-local/RFC1918/CGNAT/host-mgmt/
-# drvps subnets/IPv6-local -- see sec 6.3 (the LITERAL set is derived, not hardcoded)
-acl drvps_internal_dst dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 ::1/128 fe80::/10 fc00::/7
+# internal-destination deny (SSRF / DNS-rebinding): EVERY non-global range -- unspecified/loopback/
+# RFC1918/CGNAT/link-local/benchmark/reserved + IPv4-mapped/NAT64/site-local IPv6 -- plus the drvps
+# subnets + host IPs. The LITERAL set is DERIVED, not hardcoded here: the canonical source is
+# RESERVED_DENY_CIDRS in tools/drvps_egress_model.py (this line is illustrative + non-exhaustive).
+acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8 ... 198.18.0.0/15 240.0.0.0/4 ::/128 ::1/128 ::ffff:0:0/96 fc00::/7 ...
 ssl_bump peek step1
 ssl_bump splice step2 splice_dst splice_sni     # splice ONLY when BOTH dst AND sni are the splice host
 ssl_bump bump   step2 mirror_dst mirror_sni     # bump   ONLY when BOTH dst AND sni are a mirror

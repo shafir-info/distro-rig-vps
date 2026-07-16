@@ -650,6 +650,15 @@ _dr_atomic_install_root() {
   fi
 }
 
+# Restore ONE render input to its pre-publish state during a proxy-publish rollback. <backup> <dest> <had-flag>:
+# had=1 means <dest> EXISTED before this publish -> restore its saved bytes ATOMICALLY (same-fs rename, not an
+# in-place `cp -p` that a second crash could tear); had=0 means <dest> did NOT exist -> REMOVE the file this
+# publish newly created, so a partial persist (first input committed, second failed) never leaves an orphaned
+# new render input beside the untouched live squid.conf. Top-level so tests/setup-atomic-install.sh drives it.
+_dr_rollback_render_input() {  # <backup-path> <dest-path> <had 0|1>
+  if [ "$3" = 1 ]; then _dr_atomic_install_root "$1" "$2" || rm -f "$2"; else rm -f "$2"; fi
+}
+
 # ---- shared bounded-poll for post-mutation verify reads (verify-class hardening) ------------------------
 # A read-once postcondition that IMMEDIATELY follows a socket-activated libvirt/systemd mutation can race the
 # daemon reflecting the change (the net-autostart false-negative on fc44 was one instance of the CLASS). This
@@ -1778,19 +1787,28 @@ PY
   # persisted inputs describing DIFFERENT configs (a later approve would else re-render a policy that diverges
   # from the running one). The render inputs are validated transitively: squid.conf was rendered FROM them and
   # passed `squid -k parse` above. (_dr_atomic_install_root is a top-level helper, unit-tested by tests/setup-atomic-install.sh.)
+  # SCOPE: each file lands atomically, but the three-file set is NOT journal-transactional -- a crash (power loss)
+  # BETWEEN the two render inputs and squid.conf leaves them momentarily divergent. That window is self-healing,
+  # not silent: drvps-egress-approve re-renders squid.conf FROM the persisted inputs and drift-checks the two
+  # before every splice change (bin/drvps-egress-approve, the render+compare gate), so the next approve run
+  # reconciles a torn publish. A full write-ahead journal is deferred (see STATUS.md egress deferrals).
+  # SCOPE: egress-host-facts.json pins the host's addresses at INSTALL time; if the host's routable IPs change
+  # afterward the SSRF deny set goes stale until `dr-vps-setup --reapply-egress` re-derives them (STATUS.md).
   local _pp=/etc/distro-rig-vps/egress-render-params.json _ph=/etc/distro-rig-vps/egress-host-facts.json
   local _ppb _phb _had_pp=0 _had_ph=0; _ppb=$(mktemp); _phb=$(mktemp)
   [ -f "$_pp" ] && { cp -p "$_pp" "$_ppb"; _had_pp=1; }
   [ -f "$_ph" ] && { cp -p "$_ph" "$_phb"; _had_ph=1; }
+  # Persisting either render input can partially succeed (first commits, second fails). Roll BOTH back to their
+  # exact pre-publish state -- restore-or-remove, unconditionally -- so neither an orphaned new file nor a stale
+  # half-updated pair is ever left behind (a restore of an unchanged input just rewrites identical bytes).
   if ! _dr_atomic_install_root "$_rp" "$_pp" || ! _dr_atomic_install_root "$_rhf" "$_ph"; then
-    [ "$_had_pp" = 1 ] && cp -p "$_ppb" "$_pp"; [ "$_had_ph" = 1 ] && cp -p "$_phb" "$_ph"
+    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp"; _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph"
     rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
     echo "[setup] failed to persist egress render inputs -- drvps-egress-approve could not open a splice" >&2
     exit 1
   fi
   if ! _dr_atomic_install_root "$conf" /etc/squid/squid.conf; then
-    if [ "$_had_pp" = 1 ]; then cp -p "$_ppb" "$_pp"; else rm -f "$_pp"; fi   # roll the render inputs BACK
-    if [ "$_had_ph" = 1 ]; then cp -p "$_phb" "$_ph"; else rm -f "$_ph"; fi
+    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp"; _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph"
     rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
     echo "[setup] committing squid.conf failed -- rolled back the egress render inputs (live config preserved)" >&2
     exit 1

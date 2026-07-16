@@ -16,6 +16,8 @@ ok(){ if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi; }
 # awk-slice pattern firewalld-dr2.sh uses. This is why the helper is top-level, not nested in step_proxy.
 eval "$(awk '/^_dr_atomic_install_root\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' /repo/bin/dr-vps-setup)"
 type _dr_atomic_install_root >/dev/null 2>&1 || { echo "FAIL: could not extract _dr_atomic_install_root"; exit 1; }
+eval "$(awk '/^_dr_rollback_render_input\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' /repo/bin/dr-vps-setup)"
+type _dr_rollback_render_input >/dev/null 2>&1 || { echo "FAIL: could not extract _dr_rollback_render_input"; exit 1; }
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 printf 'NEW-CONTENT\n' > "$W/src"
@@ -65,6 +67,23 @@ _buggy(){ local _t; _t=$(mktemp -p "$(dirname "$2")" ".$(basename "$2").XXXXXX")
 _buggy "$W/nonexistent-src" "$W/dest4.json" 2>/dev/null || true
 ok "positive control: buggy ';' variant DOES publish a partial file" '[ -e "$W/dest4.json" ]'
 ok "real helper published NOTHING where the buggy one did"           '[ ! -e "$W/dest3.json" ]'
+
+# 5) ROLLBACK helper (_dr_rollback_render_input <backup> <dest> <had>): restore the pre-publish state during a
+# proxy-publish rollback. Two arms, matching the two ways a render input can enter the publish:
+# 5a) had=1 (the input EXISTED): restore the saved bytes ATOMICALLY (a rename -> a NEW inode, not an in-place cp).
+printf 'PRIOR\n' > "$W/rb.json"; printf 'PRIOR\n' > "$W/rb.bak"   # dest currently holds the (torn) new bytes...
+printf 'TORN-NEW\n' > "$W/rb.json"                                # ...simulate the half-committed new content
+_ino5=$(stat -c %i "$W/rb.json")
+_dr_rollback_render_input "$W/rb.bak" "$W/rb.json" 1
+ok "rollback had=1 restores the prior bytes"          '[ "$(cat "$W/rb.json")" = PRIOR ]'
+ok "rollback had=1 is a RENAME (inode changed), not in-place cp" \
+   "[ \"\$(stat -c %i \"\$W/rb.json\")\" != \"$_ino5\" ]"
+ok "rollback had=1 restores mode 0644 root:root"      '[ "$(stat -c %a:%U:%G "$W/rb.json")" = 644:root:root ]'
+# 5b) had=0 (the input did NOT exist before -> this publish newly created it): REMOVE it, so a partial persist
+# (first input committed, second failed) leaves no orphaned new render input beside the untouched live config.
+printf 'ORPHAN-NEW\n' > "$W/rb2.json"
+_dr_rollback_render_input "$W/unused-backup" "$W/rb2.json" 0
+ok "rollback had=0 removes the newly-created file"    '[ ! -e "$W/rb2.json" ]'
 
 echo "-------------------------------------------"
 echo "setup atomic-install: $([ $fail = 0 ] && echo PASS || echo FAIL)"
