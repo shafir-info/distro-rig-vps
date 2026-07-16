@@ -42,7 +42,10 @@ ok "approve _render_params reads the PRODUCTION render inputs (no test_root seam
 # the persisted production inputs must render the expected ssl-bump policy structure (the config's runtime
 # file dependencies -- the bump CA + ssl_db -- are installed separately by step_proxy and exercised by
 # egress-squid-container.sh; here we assert the STRUCTURE the render produces from the production inputs).
-python3 "$CLI" render --fleet /etc/distro-rig-vps/fleet.json --params /etc/distro-rig-vps/egress-render-params.json --host-facts /etc/distro-rig-vps/egress-host-facts.json > /tmp/prod-squid.conf 2>/tmp/prod-render.err
+python3 "$CLI" render --fleet /etc/distro-rig-vps/fleet.json --params /etc/distro-rig-vps/egress-render-params.json --host-facts /etc/distro-rig-vps/egress-host-facts.json > /tmp/prod-squid.conf 2>/tmp/prod-render.err; _render_rc=$?
+# require the renderer's OWN exit code -- a renderer that emits all the expected ACL lines AND an invalid
+# directive while returning nonzero would else slip past the structural greps below (it fails the real approve).
+ok "renderer EXITS 0 (a nonzero rc must fail, even with valid-looking output)" "[ $_render_rc = 0 ]"
 ok "renderer produces a config from the persisted production inputs" '[ -s /tmp/prod-squid.conf ]'
 ok "rendered config carries the ssl-bump + terminate-all + deny-all structure" \
    'grep -q "http_port 127.0.0.1:3128 ssl-bump" /tmp/prod-squid.conf && grep -q "ssl_bump peek step1" /tmp/prod-squid.conf && grep -q "ssl_bump terminate all" /tmp/prod-squid.conf && grep -qx "http_access deny all" /tmp/prod-squid.conf'

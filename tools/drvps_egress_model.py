@@ -39,11 +39,12 @@ DECISION_REASONS = frozenset(("applied", "already-active", "already-absent",
 _LABEL = re.compile(r"\A[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")   # 1-63, start/end alnum
 _IPV4 = re.compile(r"\A[0-9]{1,3}(\.[0-9]{1,3}){3}\Z")
 
-# internal-destination deny set (C-§6.3): loopback/RFC1918/link-local/CGNAT/IPv6-local. The
-# drvps-specific ranges (subnets, host IPs, block_cidrs) come from HostFacts and are appended.
+# internal-destination deny set (C-§6.3): the UNSPECIFIED addresses (0.0.0.0/8, ::/128 -- connecting to which
+# reaches host loopback on Linux), loopback/RFC1918/link-local/CGNAT/IPv6-local. The drvps-specific ranges
+# (subnets, host IPs, block_cidrs) come from HostFacts and are appended.
 RESERVED_DENY_CIDRS = (
-    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fe80::/10", "fc00::/7")
+    "0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "100.64.0.0/10", "::/128", "::1/128", "fe80::/10", "fc00::/7")
 
 
 class EgressError(ValueError):

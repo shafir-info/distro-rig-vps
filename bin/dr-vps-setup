@@ -1709,11 +1709,49 @@ step_proxy() {
   # to the former inline block (proven by tests/egress-render-noop.sh). AUTHORIZE on dstdomain (not the
   # guest-controlled SNI: a guest sets CONNECT host and SNI independently); SNI is only the bump
   # selector; `terminate all` kills every non-mirror TLS -- all enforced inside the renderer.
-  local _rp _rhf
-  _rp=$(mktemp); _rhf=$(mktemp)
+  local _rp _rhf _subnet
+  _rp=$(mktemp); _rhf=$(mktemp); _subnet="${DR_VPS_PROXY_SRC:-10.123.0.0/24}"
   printf '{"proxy_ip":"%s","proxy_src":"%s","cache_mb":%s,"maxobj_mb":%s,"certgen_path":"%s"}\n' \
-    "$pip" "${DR_VPS_PROXY_SRC:-10.123.0.0/24}" "${DR_VPS_CACHE_MB:-8192}" "${DR_VPS_CACHE_MAXOBJ_MB:-2048}" "$certgen" >"$_rp"
-  printf '{}\n' >"$_rhf"
+    "$pip" "$_subnet" "${DR_VPS_CACHE_MB:-8192}" "${DR_VPS_CACHE_MAXOBJ_MB:-2048}" "$certgen" >"$_rp"
+  # SSRF host-facts (was `{}`, which left the host's OWN routable IPs + the guest subnet OUT of the
+  # internal-destination deny ACL -- so a rebound/compromised approved splice host could resolve back to the
+  # host or a guest and tunnel to it). Derive them and FAIL CLOSED rather than install a weaker policy:
+  #   drvps_subnets = the guest subnet; host_ips = every non-loopback/non-link-local address on this host
+  #   (/32|/128, so the host itself + the bridge/proxy IP are denied); fleet_public_ips + block_cidrs =
+  #   optional operator config (DR_VPS_EGRESS_FLEET_IPS / DR_VPS_EGRESS_BLOCK_CIDRS, space/comma separated).
+  if ! python3 - "$_subnet" "${DR_VPS_EGRESS_FLEET_IPS:-}" "${DR_VPS_EGRESS_BLOCK_CIDRS:-}" >"$_rhf" <<'PY'
+import ipaddress, json, subprocess, sys
+subnet, fleet, block = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    r = subprocess.run(["ip", "-j", "addr"], capture_output=True, text=True, timeout=10)
+except Exception as e:
+    sys.exit("ip addr unavailable: %s" % e)
+if r.returncode != 0:
+    sys.exit("ip addr failed rc=%d" % r.returncode)
+host_ips = set()
+for link in json.loads(r.stdout or "[]"):
+    for a in link.get("addr_info", []):
+        ip = a.get("local")
+        if not ip:
+            continue
+        try:
+            o = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if o.is_loopback or o.is_link_local:   # already covered by RESERVED_DENY_CIDRS
+            continue
+        host_ips.add("%s/%d" % (ip, 32 if o.version == 4 else 128))
+if not host_ips:
+    sys.exit("no non-loopback host address found -- cannot derive the SSRF deny set")
+_sp = lambda s: [x for x in s.replace(",", " ").split() if x]
+json.dump({"drvps_subnets": [subnet], "host_ips": sorted(host_ips),
+           "fleet_public_ips": _sp(fleet), "block_cidrs": _sp(block)}, sys.stdout)
+PY
+  then
+    rm -f "$conf" "$_rp" "$_rhf"
+    echo "[setup] could not derive the egress SSRF host-facts (ip addr) -- refusing to install a weaker policy" >&2
+    exit 1
+  fi
   if ! python3 "$SRC/../tools/drvps_egress_model.py" render --fleet "$fleet" --params "$_rp" --host-facts "$_rhf" >"$conf"; then
     rm -f "$conf" "$_rp" "$_rhf"
     echo "[setup] egress renderer (tools/drvps_egress_model.py) failed -- NOT installing squid.conf (live config preserved)" >&2
@@ -1733,21 +1771,31 @@ step_proxy() {
     printf '%s\n' "$_perr" | sed 's/^/    squid| /' >&2
     exit 1
   fi
-  install -m 0644 "$conf" /etc/squid/squid.conf || { rm -f "$conf" "$_rp" "$_rhf"; echo "[setup] write squid.conf failed" >&2; exit 1; }
-  rm -f "$conf"
-  # Persist the EXACT render inputs (same-dir atomic rename, root:root 0644) so drvps-egress-approve can
-  # reproduce this config to open a splice. fleet.json already lives at /etc/distro-rig-vps; these two
-  # complete the reproducible RenderParams (PLAN Task 1.9). host-facts is `{}` here -- it MATCHES what this
-  # step rendered with (a stronger SSRF fact set is a separate, tracked hardening item), so approve re-renders
-  # a config that differs from live only by the newly-approved splice. (_dr_atomic_install_root is a top-level
-  # helper -- see its definition near the other setup helpers -- so it is unit-tested by tests/setup-atomic-install.sh.)
-  if ! _dr_atomic_install_root "$_rp" /etc/distro-rig-vps/egress-render-params.json \
-     || ! _dr_atomic_install_root "$_rhf" /etc/distro-rig-vps/egress-host-facts.json; then
-    rm -f "$_rp" "$_rhf"
-    echo "[setup] failed to persist egress render inputs -- drvps-egress-approve would be unable to open a splice" >&2
+  # ATOMIC PUBLISH of the proxy state as ONE unit (squid.conf + the render inputs approve re-renders FROM):
+  # persist the render inputs FIRST, then install squid.conf LAST as the single COMMIT point. Each write is an
+  # atomic same-dir rename (_dr_atomic_install_root); if the squid.conf commit fails, ROLL BACK the render inputs
+  # to their pre-publish state -- so a mid-publish I/O failure can never leave the live squid.conf and the
+  # persisted inputs describing DIFFERENT configs (a later approve would else re-render a policy that diverges
+  # from the running one). The render inputs are validated transitively: squid.conf was rendered FROM them and
+  # passed `squid -k parse` above. (_dr_atomic_install_root is a top-level helper, unit-tested by tests/setup-atomic-install.sh.)
+  local _pp=/etc/distro-rig-vps/egress-render-params.json _ph=/etc/distro-rig-vps/egress-host-facts.json
+  local _ppb _phb _had_pp=0 _had_ph=0; _ppb=$(mktemp); _phb=$(mktemp)
+  [ -f "$_pp" ] && { cp -p "$_pp" "$_ppb"; _had_pp=1; }
+  [ -f "$_ph" ] && { cp -p "$_ph" "$_phb"; _had_ph=1; }
+  if ! _dr_atomic_install_root "$_rp" "$_pp" || ! _dr_atomic_install_root "$_rhf" "$_ph"; then
+    [ "$_had_pp" = 1 ] && cp -p "$_ppb" "$_pp"; [ "$_had_ph" = 1 ] && cp -p "$_phb" "$_ph"
+    rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
+    echo "[setup] failed to persist egress render inputs -- drvps-egress-approve could not open a splice" >&2
     exit 1
   fi
-  rm -f "$_rp" "$_rhf"
+  if ! _dr_atomic_install_root "$conf" /etc/squid/squid.conf; then
+    if [ "$_had_pp" = 1 ]; then cp -p "$_ppb" "$_pp"; else rm -f "$_pp"; fi   # roll the render inputs BACK
+    if [ "$_had_ph" = 1 ]; then cp -p "$_phb" "$_ph"; else rm -f "$_ph"; fi
+    rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
+    echo "[setup] committing squid.conf failed -- rolled back the egress render inputs (live config preserved)" >&2
+    exit 1
+  fi
+  rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
   run squid -k parse
   run_sh 'squid -z 2>/dev/null; true'        # initialize the cache_dir structure (idempotent)
   # Reboot-safety (advisor): squid binds the bridge IP 10.123.0.1, which only exists once

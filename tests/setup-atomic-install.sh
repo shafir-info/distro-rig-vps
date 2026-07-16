@@ -27,10 +27,16 @@ ok "dest published with the source bytes"    '[ "$(cat "$W/dest.json")" = NEW-CO
 ok "dest mode is 0644"                        '[ "$(stat -c %a "$W/dest.json")" = 644 ]'
 ok "dest owner is root:root"                  '[ "$(stat -c %U:%G "$W/dest.json")" = root:root ]'
 
-# 2) ATOMIC REPLACE: an existing dest is swapped whole, never left corrupted
+# 2) ATOMIC REPLACE: an existing dest is swapped whole (by RENAME), never left corrupted
 printf 'OLD\n' > "$W/dest2.json"
+_ino=$(stat -c %i "$W/dest2.json")
 _dr_atomic_install_root "$W/src" "$W/dest2.json"
-ok "existing dest atomically replaced"       '[ "$(cat "$W/dest2.json")" = NEW-CONTENT ]'
+ok "existing dest replaced with the new content" '[ "$(cat "$W/dest2.json")" = NEW-CONTENT ]'
+# ATOMICITY: a same-dir RENAME gives the dest a NEW inode (the temp's); an in-place truncate+write keeps the
+# SAME inode and is observable half-written by a concurrent reader. So the inode MUST change on replace -- this
+# is what catches a regression to a non-atomic direct write (which the content check alone would bless).
+ok "replace is a RENAME (dest inode changed), not an in-place write" \
+   "[ \"\$(stat -c %i \"\$W/dest2.json\")\" != \"$_ino\" ]"
 
 # 3) FAILURE-SAFETY: cat fails (missing source) -> dest NOT published, no temp leaked
 _dr_atomic_install_root "$W/nonexistent-src" "$W/dest3.json"; rc=$?
