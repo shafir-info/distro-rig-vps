@@ -28,10 +28,14 @@ old_render() {  # <proxy_ip> <proxy_src> <certgen> <cache_mb> <maxobj_mb> <mirro
   printf 'acl drvps_https port 443\n'
   printf 'acl drvps_http port 80 443\n'
   printf 'acl step1 at_step SslBump1\n'
+  # internal-destination deny -- ALWAYS rendered (F3: guards the mirror path too). FROZEN copy of the empty-
+  # host-facts RESERVED_DENY_CIDRS set; a change to that tuple intentionally breaks this differential.
+  printf 'acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 192.0.0.0/24 198.18.0.0/15 240.0.0.0/4 ::/128 ::1/128 64:ff9b:1::/48 100::/64 fe80::/10 fc00::/7 fec0::/10 2001:db8::/32\n'
   printf 'ssl_bump peek step1\n'
   printf 'ssl_bump bump mirror_sni\n'
   printf 'ssl_bump terminate all\n'
   printf 'http_access deny !drvps_guests\n'
+  printf 'http_access deny drvps_internal_dst\n'
   printf 'http_access allow drvps_connect mirror_dst drvps_https\n'
   printf 'http_access allow mirror_methods mirror_dst drvps_http\n'
   printf 'http_access deny all\n'

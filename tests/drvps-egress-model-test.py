@@ -89,10 +89,12 @@ LIVE_BODY = (
 "acl drvps_https port 443\n"
 "acl drvps_http port 80 443\n"
 "acl step1 at_step SslBump1\n"
++ ("acl drvps_internal_dst dst " + " ".join(M.internal_deny_cidrs(m0, M.HostFacts())) + "\n") +
 "ssl_bump peek step1\n"
 "ssl_bump bump mirror_sni\n"
 "ssl_bump terminate all\n"
 "http_access deny !drvps_guests\n"
+"http_access deny drvps_internal_dst\n"
 "http_access allow drvps_connect mirror_dst drvps_https\n"
 "http_access allow mirror_methods mirror_dst drvps_http\n"
 "http_access deny all\n"
@@ -115,6 +117,13 @@ if got != LIVE_BODY:
 ok(M.render_squid(M.load_model({"mirror_allowlist": list(LIVE_MIRRORS), "splice_allowlist": []}), P, HF) == LIVE_BODY,
    "empty splice_allowlist == mirror-only baseline")
 ok("# egress-model-revision" not in LIVE_BODY, "mirror-only has no revision line")
+# F3 REGRESSION (external review): the internal-destination deny is rendered even in the mirror-only (NO-splice)
+# DEFAULT config -- an allowlisted mirror that resolves via poisoned DNS/compromise to an internal IP is the same
+# SSRF as a rebinding splice, so the `dst` deny must guard the always-on mirror path, ordered BEFORE its allow.
+ok("acl drvps_internal_dst dst " in LIVE_BODY and "\nhttp_access deny drvps_internal_dst\n" in LIVE_BODY,
+   "mirror-only config STILL renders the internal-destination deny (SSRF guard not splice-gated)")
+ok(LIVE_BODY.index("http_access deny drvps_internal_dst") < LIVE_BODY.index("http_access allow drvps_connect mirror_dst"),
+   "mirror-only: internal-deny ordered BEFORE the mirror allow")
 
 # ---- SPLICE branch render (C-§4): conjunctive dst+sni, internal-deny, on_unsupported, revision ----
 HF2 = M.HostFacts(drvps_subnets=("10.123.0.0/24",), host_ips=("192.0.2.10",))
@@ -130,11 +139,13 @@ ok(has("on_unsupported_protocol respond all"), "non-TLS pinned")
 ok("acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8" in body and "10.123.0.0/24" in body and "192.0.2.10" in body,
    "internal-deny reserved + host_facts")
 # the UNSPECIFIED addresses must be denied (connecting to 0.0.0.0 / :: reaches host loopback on Linux -- SSRF)
-ok(all(c in body for c in ("0.0.0.0/8","::/128","198.18.0.0/15","240.0.0.0/4","64:ff9b::/96","fec0::/10")), "internal-deny covers unspecified/benchmark/reserved/NAT64/site-local")
-# REGRESSION GUARD: ::ffff:0:0/96 must NEVER be in the deny set -- squid stores every IPv4 dst as an IPv4-mapped
-# address, so `dst ::ffff:0:0/96` denies ALL IPv4 traffic (a total splice outage the container gate caught). The
-# plain v4 ranges already cover mapped-loopback because squid normalizes v4-mapped back to v4. See RESERVED_DENY_CIDRS.
-ok("::ffff:0:0/96" not in body and "::ffff:0:0/96" not in M.RESERVED_DENY_CIDRS, "IPv4-mapped ::ffff:0:0/96 EXCLUDED (would deny all IPv4 in squid)")
+ok(all(c in body for c in ("0.0.0.0/8","::/128","198.18.0.0/15","240.0.0.0/4","64:ff9b:1::/48","fec0::/10")), "internal-deny covers unspecified/benchmark/reserved/local-NAT64/site-local")
+# REGRESSION GUARD: prefixes that ENCODE an IPv4 address must NEVER be in the deny set -- squid stores every IPv4
+# dst as IPv4-mapped, so `dst ::ffff:0:0/96` denies ALL IPv4 (total outage the container gate caught); and the
+# well-known NAT64 prefix 64:ff9b::/96 is IANA globally-reachable and maps public IPv4 callbacks. The plain v4
+# ranges already cover mapped-loopback because squid normalizes v4-mapped back to v4. See RESERVED_DENY_CIDRS.
+ok(all(c not in body and c not in M.RESERVED_DENY_CIDRS for c in ("::ffff:0:0/96", "64:ff9b::/96")),
+   "IPv4-encoding prefixes ::ffff:0:0/96 + 64:ff9b::/96 EXCLUDED (would deny public IPv4)")
 # ORDERING: splice allow before mirror allow, both after internal-deny; ssl_bump peek<splice<bump<terminate
 idx = {k: body.index(k) for k in [
     "ssl_bump peek step1", "ssl_bump splice step2", "ssl_bump bump step2", "ssl_bump terminate all",

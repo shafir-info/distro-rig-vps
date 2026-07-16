@@ -39,23 +39,28 @@ DECISION_REASONS = frozenset(("applied", "already-active", "already-absent",
 _LABEL = re.compile(r"\A[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")   # 1-63, start/end alnum
 _IPV4 = re.compile(r"\A[0-9]{1,3}(\.[0-9]{1,3}){3}\Z")
 
-# internal-destination deny set (C-§6.3): every NON-globally-reachable / special-purpose range, so a
-# rebinding/compromised approved splice name can never resolve into anything but a real public host. A splice
-# target is by definition an external public callback, so denying all non-global space is safe. Covers: the
-# UNSPECIFIED addresses (0.0.0.0/8, ::/128 -- connecting to which reaches host loopback on Linux), loopback,
+# internal-destination deny set (C-§6.3): the special-purpose / non-global ranges most likely to FRONT an
+# internal host, so a rebinding/compromised allowlisted name (mirror OR splice) can't be tunnelled inward.
+# Covers: UNSPECIFIED (0.0.0.0/8, ::/128 -- connecting to which reaches host loopback on Linux), loopback,
 # RFC1918, CGNAT, link-local, IETF-protocol (192.0.0.0/24), benchmarking (198.18.0.0/15), reserved/future
-# (240.0.0.0/4), and the genuinely-IPv6 special ranges: NAT64 (64:ff9b::/96, 64:ff9b:1::/48), discard
+# (240.0.0.0/4), and the genuinely-IPv6 special ranges: local-use NAT64 (64:ff9b:1::/48, RFC 8215), discard
 # (100::/64), link/site-local (fe80::/10, fec0::/10), ULA (fc00::/7), documentation (2001:db8::/32).
-# DELIBERATELY EXCLUDED -- ::ffff:0:0/96 (IPv4-mapped IPv6): squid stores EVERY IPv4 destination internally as
-# an IPv4-mapped address, so a `dst ::ffff:0:0/96` ACL matches ALL IPv4 traffic and denies every legitimate
-# public callback (the container behavioral gate caught this as a total splice outage). It is also redundant:
-# squid normalizes an IPv4-mapped destination back to IPv4 before matching, so the plain v4 ranges above
-# (127.0.0.0/8 et al.) already cover ::ffff:127.0.0.1 and friends. See tests/egress-squid-container.sh.
+# DELIBERATELY EXCLUDED -- prefixes that ENCODE an IPv4 address, because denying the whole prefix denies the
+# public IPv4 space it maps and breaks legitimate egress:
+#   * ::ffff:0:0/96 (IPv4-mapped): squid stores EVERY IPv4 destination internally as an IPv4-mapped address, so
+#     `dst ::ffff:0:0/96` matches ALL IPv4 and is a total outage (the container behavioral gate caught this).
+#     It is also redundant -- squid normalizes v4-mapped back to v4, so 127.0.0.0/8 et al. already cover it.
+#   * 64:ff9b::/96 (well-known NAT64, IANA GLOBALLY-REACHABLE): on a NAT64 host this legitimately represents
+#     public IPv4 callbacks; a blanket deny blocks them. Only the local-use 64:ff9b:1::/48 is kept.
+# NOT PURSUED (documented rejection, not an oversight): exhaustive IANA-registry completeness (e.g. the v4
+# documentation blocks 192.0.2.0/24 / 198.51.100.0/24 / 203.0.113.0/24). They are a weak SSRF vector (reserved,
+# not used to front real services) AND 192.0.2.50 is the conventional public stand-in used by the behavioral
+# tunnel test; chasing full-registry parity is unbounded and risks re-introducing an over-broad prefix.
 # The drvps-specific ranges (subnets, host IPs, block_cidrs) come from HostFacts and are appended.
 RESERVED_DENY_CIDRS = (
     "0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
     "169.254.0.0/16", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4",
-    "::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+    "::/128", "::1/128", "64:ff9b:1::/48", "100::/64",
     "fe80::/10", "fc00::/7", "fec0::/10", "2001:db8::/32")
 
 
@@ -237,9 +242,10 @@ def internal_deny_cidrs(model: EgressModel, host_facts: HostFacts):
 
 def render_squid(model: EgressModel, params: RenderParams, host_facts: HostFacts) -> str:
     """The FULL managed squid.conf body incl. the marker + a trailing model-revision comment.
-    Mirror ACLs are pinned to the client SNI + reverse-DNS-off (`-n`) [Stage M bugfix]. When
-    splice_allowlist is non-empty, the splice branch adds the conjunctive dst+sni ssl_bump rules,
-    the internal-destination deny, and `on_unsupported_protocol respond all` [C-§4]."""
+    Mirror ACLs are pinned to the client SNI + reverse-DNS-off (`-n`) [Stage M bugfix]. The
+    internal-destination deny (`drvps_internal_dst`) is ALWAYS rendered -- it guards the always-on
+    mirror path AND any splice. When splice_allowlist is non-empty, the splice branch additionally
+    adds the conjunctive dst+sni ssl_bump rules and `on_unsupported_protocol respond all` [C-§4]."""
     mirrors = " ".join(model.mirrors)
     has_splice = bool(model.splices)
     L = [
@@ -262,9 +268,14 @@ def render_squid(model: EgressModel, params: RenderParams, host_facts: HostFacts
         "acl drvps_http port 80 443",
         "acl step1 at_step SslBump1",
     ]
+    # internal-destination deny (SSRF / DNS-rebinding): ALWAYS defined + denied, NOT only when a splice exists.
+    # The mirror allowlist is always active, and an allowlisted mirror name that is compromised or resolves
+    # through poisoned DNS to an internal address is the SAME SSRF as a rebinding splice callback -- so the
+    # `dst` deny must guard the mirror path too, ordered before EVERY http_access allow. (Previously this was
+    # gated on has_splice, leaving the default mirror-only config unprotected -- external review finding.)
+    L += ["acl drvps_internal_dst dst %s" % " ".join(internal_deny_cidrs(model, host_facts))]
     if has_splice:
-        L += ["acl step2 at_step SslBump2",
-              "acl drvps_internal_dst dst %s" % " ".join(internal_deny_cidrs(model, host_facts))]
+        L += ["acl step2 at_step SslBump2"]
     L += ["ssl_bump peek step1"]
     if has_splice:                                  # bind BOTH dst AND sni per action
         L += ["ssl_bump splice step2 splice_dst splice_sni",
@@ -272,10 +283,10 @@ def render_squid(model: EgressModel, params: RenderParams, host_facts: HostFacts
     else:
         L += ["ssl_bump bump mirror_sni"]
     L += ["ssl_bump terminate all",
-          "http_access deny !drvps_guests"]
+          "http_access deny !drvps_guests",
+          "http_access deny drvps_internal_dst"]    # ALWAYS before any allow (mirror + splice both guarded)
     if has_splice:
-        L += ["http_access deny drvps_internal_dst",
-              "http_access allow drvps_connect splice_dst drvps_https"]
+        L += ["http_access allow drvps_connect splice_dst drvps_https"]
     L += [
         "http_access allow drvps_connect mirror_dst drvps_https",
         "http_access allow mirror_methods mirror_dst drvps_http",

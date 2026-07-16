@@ -57,21 +57,26 @@ component that opens a sink, and only after a human YES. #4 touches squid ONLY.
 - INVARIANT: `splice_allowlist.host` and `mirror_allowlist` are DISJOINT sets (a host cannot be
   both bumped and spliced). Non-empty intersection => fail closed at render AND at approve time.
 
-## 4. Squid policy (rendered by step_proxy when splice_allowlist non-empty)
-Added lines (exact ordering matters -- ssl_bump + http_access are first-match). Each bump/splice
-action binds the CONNECT DESTINATION *and* the SNI conjunctively (SNI-only lets a
-mirror CONNECT with a splice SNI be spliced, and vice versa):
+## 4. Squid policy
+The `drvps_internal_dst` deny is rendered UNCONDITIONALLY (it guards the always-on mirror allowlist AND
+any splice against DNS-rebinding SSRF). The splice-specific ACLs/rules below (splice_sni/splice_dst,
+`ssl_bump splice`, the splice allow, `on_unsupported_protocol`) are added only when splice_allowlist is
+non-empty. Exact ordering matters -- ssl_bump + http_access are first-match. Each bump/splice action binds
+the CONNECT DESTINATION *and* the SNI conjunctively (SNI-only lets a mirror CONNECT with a splice SNI be
+spliced, and vice versa):
 ```
 acl splice_sni ssl::server_name --client-requested callback.crm.example
 acl splice_dst dstdomain -n callback.crm.example
 acl mirror_sni ssl::server_name --client-requested <mirrors>   # CHANGED: add --client-requested
 acl mirror_dst dstdomain -n <mirrors>                          # CHANGED: add -n (see bugfix note)
 acl step2 at_step SslBump2
-# internal-destination deny (SSRF / DNS-rebinding): EVERY non-global range -- unspecified/loopback/
-# RFC1918/CGNAT/link-local/benchmark/reserved + IPv4-mapped/NAT64/site-local IPv6 -- plus the drvps
-# subnets + host IPs. The LITERAL set is DERIVED, not hardcoded here: the canonical source is
-# RESERVED_DENY_CIDRS in tools/drvps_egress_model.py (this line is illustrative + non-exhaustive).
-acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8 ... 198.18.0.0/15 240.0.0.0/4 ::/128 ::1/128 ::ffff:0:0/96 fc00::/7 ...
+# internal-destination deny (SSRF / DNS-rebinding): special-purpose / non-global ranges -- unspecified/
+# loopback/RFC1918/CGNAT/link-local/benchmark/reserved + local-NAT64/site-local/ULA IPv6 -- plus the drvps
+# subnets + host IPs. ALWAYS rendered (guards the mirror path too, not only splices). The LITERAL set is
+# DERIVED, not hardcoded here: the canonical source is RESERVED_DENY_CIDRS in tools/drvps_egress_model.py
+# (this line is illustrative). Prefixes that ENCODE IPv4 (::ffff:0:0/96, 64:ff9b::/96) are EXCLUDED -- squid
+# maps v4 dsts to v4-mapped, so denying them would deny all/public IPv4.
+acl drvps_internal_dst dst 0.0.0.0/8 127.0.0.0/8 10.0.0.0/8 ... 198.18.0.0/15 240.0.0.0/4 ::/128 ::1/128 64:ff9b:1::/48 fc00::/7 ...
 ssl_bump peek step1
 ssl_bump splice step2 splice_dst splice_sni     # splice ONLY when BOTH dst AND sni are the splice host
 ssl_bump bump   step2 mirror_dst mirror_sni     # bump   ONLY when BOTH dst AND sni are a mirror

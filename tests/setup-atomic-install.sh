@@ -84,6 +84,13 @@ ok "rollback had=1 restores mode 0644 root:root"      '[ "$(stat -c %a:%U:%G "$W
 printf 'ORPHAN-NEW\n' > "$W/rb2.json"
 _dr_rollback_render_input "$W/unused-backup" "$W/rb2.json" 0
 ok "rollback had=0 removes the newly-created file"    '[ ! -e "$W/rb2.json" ]'
+# 5c) had=1 but the RESTORE fails (backup source missing): the helper must NOT delete the dest (deleting is the
+# more destructive error -- it could wipe a valid, never-modified file) and must return NON-ZERO so the caller
+# surfaces "run --reapply-egress" instead of silently leaving an inconsistent pair (external review Bug B).
+printf 'STILL-VALID\n' > "$W/rb3.json"
+_dr_rollback_render_input "$W/does-not-exist-backup" "$W/rb3.json" 1 2>/dev/null; _rc5=$?
+ok "rollback had=1 restore-failure returns non-zero"  "[ $_rc5 != 0 ]"
+ok "rollback had=1 restore-failure does NOT delete the dest" '[ -e "$W/rb3.json" ] && [ "$(cat "$W/rb3.json")" = STILL-VALID ]'
 
 echo "-------------------------------------------"
 echo "setup atomic-install: $([ $fail = 0 ] && echo PASS || echo FAIL)"

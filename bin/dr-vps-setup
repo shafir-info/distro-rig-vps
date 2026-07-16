@@ -655,8 +655,11 @@ _dr_atomic_install_root() {
 # in-place `cp -p` that a second crash could tear); had=0 means <dest> did NOT exist -> REMOVE the file this
 # publish newly created, so a partial persist (first input committed, second failed) never leaves an orphaned
 # new render input beside the untouched live squid.conf. Top-level so tests/setup-atomic-install.sh drives it.
-_dr_rollback_render_input() {  # <backup-path> <dest-path> <had 0|1>
-  if [ "$3" = 1 ]; then _dr_atomic_install_root "$1" "$2" || rm -f "$2"; else rm -f "$2"; fi
+# On a had=1 restore FAILURE we do NOT `rm` the dest: deleting is the more destructive error (it could remove a
+# valid, never-modified file), so we leave whatever is there and return non-zero for the caller to surface --
+# `--reapply-egress` re-derives + republishes the pair atomically and is the reconcile path.
+_dr_rollback_render_input() {  # <backup-path> <dest-path> <had 0|1>  -> non-zero if a had=1 restore failed
+  if [ "$3" = 1 ]; then _dr_atomic_install_root "$1" "$2"; else rm -f "$2"; fi
 }
 
 # ---- shared bounded-poll for post-mutation verify reads (verify-class hardening) ------------------------
@@ -1795,22 +1798,40 @@ PY
   # SCOPE: egress-host-facts.json pins the host's addresses at INSTALL time; if the host's routable IPs change
   # afterward the SSRF deny set goes stale until `dr-vps-setup --reapply-egress` re-derives them (STATUS.md).
   local _pp=/etc/distro-rig-vps/egress-render-params.json _ph=/etc/distro-rig-vps/egress-host-facts.json
-  local _ppb _phb _had_pp=0 _had_ph=0; _ppb=$(mktemp); _phb=$(mktemp)
-  [ -f "$_pp" ] && { cp -p "$_pp" "$_ppb"; _had_pp=1; }
-  [ -f "$_ph" ] && { cp -p "$_ph" "$_phb"; _had_ph=1; }
+  local _ppb _phb _had_pp=0 _had_ph=0
+  _ppb=$(mktemp) || { echo "[setup] FATAL: mktemp failed (egress publish backup)" >&2; exit 1; }
+  _phb=$(mktemp) || { echo "[setup] FATAL: mktemp failed (egress publish backup)" >&2; rm -f "$_ppb"; exit 1; }
+  # FAIL CLOSED on backup capture: if an input EXISTS but we cannot copy it aside, we could not roll back a
+  # failed publish -- so refuse BEFORE mutating anything (the `_had=1` flag must reflect a REAL saved backup, or
+  # a later rollback would atomically install an empty/partial "backup" over the live input).
+  if [ -f "$_pp" ]; then
+    if cp -p "$_pp" "$_ppb"; then _had_pp=1
+    else echo "[setup] FATAL: cannot back up $_pp before republish -- refusing (unable to guarantee rollback)" >&2; rm -f "$_ppb" "$_phb"; exit 1; fi
+  fi
+  if [ -f "$_ph" ]; then
+    if cp -p "$_ph" "$_phb"; then _had_ph=1
+    else echo "[setup] FATAL: cannot back up $_ph before republish -- refusing (unable to guarantee rollback)" >&2; rm -f "$_ppb" "$_phb"; exit 1; fi
+  fi
   # Persisting either render input can partially succeed (first commits, second fails). Roll BOTH back to their
   # exact pre-publish state -- restore-or-remove, unconditionally -- so neither an orphaned new file nor a stale
-  # half-updated pair is ever left behind (a restore of an unchanged input just rewrites identical bytes).
+  # half-updated pair is ever left behind (a restore of an unchanged input just rewrites identical bytes). A
+  # had=1 restore that itself fails does NOT delete the dest (see helper); it returns non-zero, which we surface.
   if ! _dr_atomic_install_root "$_rp" "$_pp" || ! _dr_atomic_install_root "$_rhf" "$_ph"; then
-    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp"; _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph"
+    local _rbfail=0
+    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp" || _rbfail=1
+    _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph" || _rbfail=1
     rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
     echo "[setup] failed to persist egress render inputs -- drvps-egress-approve could not open a splice" >&2
+    [ "$_rbfail" = 1 ] && echo "[setup] WARNING: a render-input rollback did NOT fully restore -- run --reapply-egress to reconcile" >&2
     exit 1
   fi
   if ! _dr_atomic_install_root "$conf" /etc/squid/squid.conf; then
-    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp"; _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph"
+    local _rbfail=0
+    _dr_rollback_render_input "$_ppb" "$_pp" "$_had_pp" || _rbfail=1
+    _dr_rollback_render_input "$_phb" "$_ph" "$_had_ph" || _rbfail=1
     rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"
     echo "[setup] committing squid.conf failed -- rolled back the egress render inputs (live config preserved)" >&2
+    [ "$_rbfail" = 1 ] && echo "[setup] WARNING: a render-input rollback did NOT fully restore -- run --reapply-egress to reconcile" >&2
     exit 1
   fi
   rm -f "$conf" "$_rp" "$_rhf" "$_ppb" "$_phb"

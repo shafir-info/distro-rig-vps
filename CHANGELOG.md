@@ -35,6 +35,17 @@ and the Deferred list below). No push until that passes.
   drvps0 to its zone, and reloads — idempotent, query-before-add, a no-op when firewalld is inactive
   (`step_firewalld`). Replaces the manual two-rule workaround from 0.2.0's runbook.
 
+### Security
+
+- Egress internal-destination SSRF guard hardened (external review). The `drvps_internal_dst` deny is
+  now rendered UNCONDITIONALLY — it guards the always-on mirror allowlist too, not only splices, so a
+  compromised/DNS-rebound allowlisted mirror name cannot be tunnelled to an internal host. The deny set
+  covers the special-purpose / non-global ranges plus the host's own IPs/subnets; prefixes that ENCODE
+  IPv4 (`::ffff:0:0/96`, well-known NAT64 `64:ff9b::/96`) are deliberately excluded because squid maps
+  every IPv4 destination to its v4-mapped form, so denying them would deny all/public IPv4 (a total
+  outage the container gate caught). `step_proxy` derives + persists the real host-facts (fail-closed)
+  and publishes squid.conf + both render inputs atomically with a fail-closed, non-deleting rollback.
+
 ### Changed
 
 - Egress request store migrated to the seam-free v2 layout (`drvps-egress-migrate`, an operator-run
