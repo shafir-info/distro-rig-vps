@@ -46,6 +46,34 @@ and the Deferred list below). No push until that passes.
   outage the container gate caught). `step_proxy` derives + persists the real host-facts (fail-closed)
   and publishes squid.conf + both render inputs atomically with a fail-closed, non-deleting rollback.
 
+### Fixed (multi-distro nested sweep, 2026-07-16 — el9 portability + install robustness)
+
+Driven by running the nested mandatory bar across all 5 goldens (agent over rigctl). **fedora44 and
+centos9 (CentOS Stream 9, el9) now both pass the full bar end to end**; the el9 path surfaced and
+fixed three real blockers plus two transient install faults:
+
+- el9 EPEL: `cloud-utils` + `inotify-tools` are not in el9 BaseOS/AppStream, so `dnf install` died
+  "Unable to find a match". `step_deps` ensures EPEL on el9 first (prefer `epel-release`, else pin
+  the official EPEL repo by a single-host `dl.fedoraproject.org` baseurl — not the mirror metalink an
+  egress-fenced host can't reach — with gpgcheck). No-op on Fedora.
+- **cloud-localds fallback:** EPEL9 packages no cloud-utils at all, so cloud-localds is simply absent
+  on el9. `dr_vps_storage_seed_build` now builds the identical NoCloud seed ISO with `genisoimage
+  -volid cidata -graft-points …` when cloud-localds is missing (new `DR_GENISOIMAGE` seam), and fails
+  closed if neither exists. `genisoimage` is now a mandatory dep; `cloud-utils` dropped to best-effort
+  (present on Fedora, absent everywhere on el9 where genisoimage covers the build). `doctor`'s
+  `cloud_localds` fact reads true when either builder is present.
+- Fresh-boot reaper heartbeat: the rigreaper timer's first tick is `OnBootSec=10min`, so a host
+  installed within 10 min of boot (every nested/cloud provision) failed its first `dr-vps doctor`
+  ("reaper heartbeat stale/missing"). `step_units` now kicks one real reaper run so the heartbeat
+  exists immediately.
+- squid Type=notify readiness timeout under install load ("Failed with result 'protocol'" though
+  `squid -k parse` passed): added one generic safe retry (the prior recovery only handled the
+  SysV-shm case) — idempotent, a genuine config fault still fails the retry.
+
+**Not fixed here (operator-side):** ubuntu22/24/26 nested fail at the package step because the
+golden's ~2.3 GB root fs cannot hold the ~900 MB install — a golden rebuild with a larger disk
+(`dr-vps build`), not a code change.
+
 ### Fixed (whole-tree consistency review, 2026-07-16 — every finding closed RED-first)
 
 - **CRITICAL — snapshot owner-scopes its SOURCE VM.** `snapshot <vm>` parsed `--owner` but stamped
