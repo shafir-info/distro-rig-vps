@@ -19,6 +19,15 @@ CREATE TABLE vms(id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL, state TEXT NOT 
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, vm_id TEXT, artifact_id TEXT, source_vm_id TEXT,
   secret_bearing INTEGER DEFAULT 0, name TEXT, parent_golden_id TEXT, scrub_profile TEXT,
   shutdown_mode TEXT, validation_status TEXT, notes TEXT, owner_uid TEXT, created_at TEXT);
+-- store_init ENFORCEMENT objects: schema_probe (hardened to reproduce store_init's full refusal set) requires
+-- these indexes + triggers to EXIST by name+type, so the real-schema fixture must create them too. schema_probe
+-- only checks presence via sqlite_master, so the minimal no-op trigger bodies below satisfy it.
+CREATE UNIQUE INDEX images_kind_name_uq ON images(kind,name);
+CREATE UNIQUE INDEX snapshots_name_uq ON snapshots(name);
+CREATE TRIGGER images_kind_ins BEFORE INSERT ON images BEGIN SELECT 1; END;
+CREATE TRIGGER images_kind_upd BEFORE UPDATE OF kind ON images BEGIN SELECT 1; END;
+CREATE TRIGGER snapshots_ins BEFORE INSERT ON snapshots BEGIN SELECT 1; END;
+CREATE TRIGGER snapshots_upd BEFORE UPDATE ON snapshots BEGIN SELECT 1; END;
 INSERT INTO images VALUES('drvps-raw-v1-99-bc07c9f78db03574','/g/f','golden','fed','{"distro":"fedora44"}','2026-07-12T12:58:02Z');
 INSERT INTO images VALUES('drvps-snap-v1-99-a9f0e966caafc7e4','/g/s','snapshot','u26snap','{"distro":"ubuntu26"}','2026-07-12T13:01:39Z');
 INSERT INTO vms VALUES('drvps-vm-b71deae19298de23','drvps-snap-v1-99-a9f0e966caafc7e4','running','n1','p','b71deae1-9298-de23-4a5b-0011deadbeef','net','c','1007','throwaway','2026-07-12T20:00:00Z');
