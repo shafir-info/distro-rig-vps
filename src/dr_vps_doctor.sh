@@ -102,7 +102,9 @@ dr_vps_doctor_host_facts() {  # -> JSON
     cl=$(printf '%s' "$ft" | jq -r '.cloud_localds'); nft=$(printf '%s' "$ft" | jq -r '.nft'); qi=$(printf '%s' "$ft" | jq -r '.qemu_img')
     xl=$(printf '%s' "$ft" | jq -r '.xmllint // "true"')   # default true so pre-Phase-2 seam facts still pass
   else
-    dr_vps_have "$DR_CLOUDLOCALDS" && cl=true || cl=false
+    # cloud_localds fact = "a NoCloud seed builder is present": cloud-localds OR its genisoimage
+    # fallback (EPEL9 ships neither cloud-utils; genisoimage covers the seed build there).
+    { dr_vps_have "$DR_CLOUDLOCALDS" || dr_vps_have "$DR_GENISOIMAGE"; } && cl=true || cl=false
     dr_vps_have "$DR_NFT" && nft=true || nft=false
     dr_vps_have "$DR_QEMU_IMG" && qi=true || qi=false
     dr_vps_have "$DR_XMLLINT" && xl=true || xl=false       # Phase-2 gate hard-requires xmllint

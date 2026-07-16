@@ -300,8 +300,22 @@ dr_vps_storage_seed_build() {  # <vm_id> <ssh_pubkey_file> [instance_seq] -> see
   printf 'instance-id: %s\nlocal-hostname: %s\n' "${vm_id}-${seq}" "$vm_id" >"$md"
   seed="${DR_VPS_SEED_DIR}/${vm_id}-seed.iso"
   _dr_vps_publish_guard "$seed" || { rm -rf "$d"; return 1; }   # no-follow/no-clobber (golden-protection)
-  "$DR_CLOUDLOCALDS" "$seed" "$ud" "$md" >/dev/null 2>&1 \
-    || { rm -rf "$d"; dr_vps_die "$DR_VPS_E_GENERIC" "cloud-localds failed for $vm_id"; return $?; }
+  # BUILD the NoCloud seed ISO. Prefer cloud-localds; fall back to genisoimage when it is absent
+  # (EPEL9 packages NO cloud-utils/cloud-localds -- live centos9 finding). cloud-localds IS just
+  # `genisoimage -output SEED -volid cidata -joliet -rock user-data meta-data`, so the fallback is
+  # byte-contract-equivalent. -graft-points pins the in-ISO names to user-data/meta-data regardless
+  # of the temp paths (cloud-init keys off those exact names + the 'cidata' volume label). Both tools
+  # get the files by PATH, never the key on argv. Fail CLOSED if neither tool is present.
+  if dr_vps_have "$DR_CLOUDLOCALDS"; then
+    "$DR_CLOUDLOCALDS" "$seed" "$ud" "$md" >/dev/null 2>&1 \
+      || { rm -rf "$d"; dr_vps_die "$DR_VPS_E_GENERIC" "cloud-localds failed for $vm_id"; return $?; }
+  elif dr_vps_have "$DR_GENISOIMAGE"; then
+    "$DR_GENISOIMAGE" -output "$seed" -volid cidata -joliet -rock \
+      -graft-points "user-data=$ud" "meta-data=$md" >/dev/null 2>&1 \
+      || { rm -rf "$d"; dr_vps_die "$DR_VPS_E_GENERIC" "genisoimage (cloud-localds fallback) failed for $vm_id"; return $?; }
+  else
+    rm -rf "$d"; dr_vps_die "$DR_VPS_E_CAP" "no NoCloud seed builder: neither cloud-localds nor genisoimage found (install cloud-utils or genisoimage)"; return $?
+  fi
   rm -rf "$d"                                  # remove the 0600 user-data with the key
   # FAIL-CLOSED on perms/group: a seed qemu cannot read => the VM won't boot. Better to
   # refuse here than hand out an unreadable seed. (Installer guarantees the qemu group.)

@@ -272,3 +272,19 @@ _console_env_ok() {
   DR_VPS_FACT_ACL=unsupported run dr_vps_doctor_result_acl; [ "$status" -ne 0 ]
   DR_VPS_RESULT_PRIVATE=0 DR_VPS_FACT_ACL=unsupported run dr_vps_doctor_result_acl; [ "$status" -eq 0 ]  # legacy: no ACL needed
 }
+
+@test "doctor: cloud-localds ABSENT but genisoimage present -> seed-tool fact satisfied (el9 hosts)" {
+  # EPEL9 packages NO cloud-utils/cloud-localds; the seed builder falls back to genisoimage, so the
+  # cloud_localds host-fact must read true when EITHER tool is present. Drive the REAL tool-probe
+  # (unset the FACT_TOOLS seam) so the OR-logic in dr_vps_doctor_host_facts is what is under test.
+  unset DR_VPS_FACT_TOOLS
+  printf '#!/bin/sh\nexit 0\n' >"$BATS_TEST_TMPDIR/genisoimage"; chmod +x "$BATS_TEST_TMPDIR/genisoimage"
+  export DR_CLOUDLOCALDS="$BATS_TEST_TMPDIR/no-such-cloud-localds"   # absent (el9)
+  export DR_GENISOIMAGE="$BATS_TEST_TMPDIR/genisoimage"             # present (the fallback builder)
+  run dr_vps_doctor_host_facts; [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.tools.cloud_localds')" = true ]   # fact satisfied via genisoimage
+  # negative control: BOTH absent -> the fact is false
+  export DR_GENISOIMAGE="$BATS_TEST_TMPDIR/no-such-genisoimage"
+  run dr_vps_doctor_host_facts; [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.tools.cloud_localds')" = false ]
+}

@@ -75,6 +75,37 @@ EOF
   grep -q "ssh_pwauth: false" "$seed"                     # no password auth
 }
 
+@test "seed_build: cloud-localds ABSENT -> genisoimage fallback (volid cidata, graft-pinned names; el9)" {
+  # EPEL9 packages NO cloud-utils/cloud-localds at all (live centos9 nested finding, 2026-07-16);
+  # for a NoCloud seed cloud-localds IS genisoimage with -volid cidata over user-data/meta-data.
+  # The recorder pins that ISO contract; graft-points force the in-ISO names whatever the temp paths.
+  cat >"$BATS_TEST_TMPDIR/fakegeniso" <<'EOF'
+#!/usr/bin/env bash
+out=""; args="$*"
+while [ "$#" -gt 0 ]; do case "$1" in -output) out="$2"; shift 2;; *) shift;; esac; done
+printf '%s\n' "$args" >"${out}.argv"
+printf 'ISO\n' >"$out"
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/fakegeniso"
+  export DR_CLOUDLOCALDS="$BATS_TEST_TMPDIR/no-such-cloud-localds"    # tool absent (el9)
+  export DR_GENISOIMAGE="$BATS_TEST_TMPDIR/fakegeniso"
+  run dr_vps_storage_seed_build "vmgi" "$KEY" "seq1"; [ "$status" -eq 0 ]; seed="$output"
+  [ -f "$seed" ]
+  grep -q -- '-volid cidata' "${seed}.argv"                            # NoCloud label
+  grep -qE -- '-graft-points .*user-data=' "${seed}.argv"              # pinned in-ISO names
+  grep -qE -- ' meta-data=' "${seed}.argv"
+  [ "$(stat -c '%a' "$seed")" = 640 ]                                  # same perms contract as the localds path
+}
+
+@test "seed_build: NEITHER cloud-localds nor genisoimage -> fails CLOSED (no seed, key temp cleaned)" {
+  export DR_CLOUDLOCALDS="$BATS_TEST_TMPDIR/absent-localds" DR_GENISOIMAGE="$BATS_TEST_TMPDIR/absent-geniso"
+  run dr_vps_storage_seed_build "vmno" "$KEY" "seq1"
+  [ "$status" -ne 0 ]
+  [ ! -e "$DR_VPS_SEED_DIR/vmno-seed.iso" ]
+  # the 0600 key-bearing temp dir must not leak on the failure path
+  [ -z "$(find "$DR_VPS_SEED_DIR" -maxdepth 1 -name 'seed.*' -type d 2>/dev/null)" ]
+}
+
 @test "SEED-SECRET control: the key never appears in seed_build output OR a set -x trace" {
   run dr_vps_storage_seed_build "vm2" "$KEY" "seq1"
   [[ "$output" != *AAAASECRETKEYMATERIAL* ]]               # not on stdout/stderr

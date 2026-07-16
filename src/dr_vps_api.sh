@@ -35,6 +35,7 @@ readonly DR_VPS_E_EGRESS=24     DR_VPS_E_SECRET=25
 : "${DR_VIRT_CUSTOMIZE:=virt-customize}"
 : "${DR_VIRT_SYSPREP:=virt-sysprep}"          # SNAPSHOT feature: identity/secret scrub (guestfs-tools); seamed in bats
 : "${DR_CLOUDLOCALDS:=cloud-localds}"
+: "${DR_GENISOIMAGE:=genisoimage}"            # NoCloud-seed fallback when cloud-localds is absent (EPEL9 ships no cloud-utils)
 : "${DR_NFT:=nft}"
 : "${DR_SQLITE:=sqlite3}"
 : "${DR_SSH:=ssh}"

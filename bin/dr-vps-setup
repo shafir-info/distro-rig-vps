@@ -1193,7 +1193,12 @@ step_preflight() {
 # step_state can label the pool (else step_state fatals late, after packages/user/libvirt).
 # Harmless on a SELinux-off host. (Debian defaults SELinux-off, so apt does not need it; step_state's
 # SELinux gate skips semanage there, and its missing-tool message covers a rare SELinux-on Debian.)
-PKGS_dnf="qemu-kvm libvirt virt-install qemu-img cloud-utils genisoimage nftables squid jq sqlite guestfs-tools libxml2 openssl python3 inotify-tools policycoreutils-python-utils acl"
+# genisoimage is MANDATORY: it is the NoCloud-seed builder the driver falls back to when cloud-localds
+# is absent (dr_vps_storage_seed_build). cloud-utils (which provides the PREFERRED cloud-localds) is
+# BEST-EFFORT (PKGS_dnf_opt) -- it exists in Fedora's main repos but in NO el9 repo (not BaseOS/
+# AppStream, retired from EPEL9; live centos9 finding 2026-07-16), where genisoimage covers the build.
+PKGS_dnf="qemu-kvm libvirt virt-install qemu-img genisoimage nftables squid jq sqlite guestfs-tools libxml2 openssl python3 inotify-tools policycoreutils-python-utils acl"
+PKGS_dnf_opt="cloud-utils"
 # Debian/Ubuntu split Squid into base `squid` (NO SSL-bump) and `squid-openssl` (the OpenSSL flavor that
 # provides SSL-Bump + security_file_certgen). step_proxy generates an SSL-bump config unconditionally, so
 # the apt path MUST install squid-openssl, else squid -k parse / certgen discovery fails LATE after
@@ -1205,11 +1210,51 @@ PKGS_dnf="qemu-kvm libvirt virt-install qemu-img cloud-utils genisoimage nftable
 # PKGS_dnf keeps qemu-kvm -- there it IS a real package.)
 PKGS_apt="qemu-system-x86 libvirt-daemon-system virtinst qemu-utils cloud-image-utils genisoimage nftables squid-openssl jq sqlite3 libguestfs-tools libxml2-utils openssl python3 inotify-tools acl"
 
+# el9 family (RHEL/CentOS Stream/Rocky/Alma): cloud-utils (cloud-localds) + inotify-tools live in
+# EPEL, not BaseOS/AppStream, so a plain `dnf install` dies "Unable to find a match" (found live on
+# a centos9 nested L1, 2026-07-16). Ensure EPEL first: prefer the distro's own epel-release; if that
+# is unavailable too (a repo-pinned image without the extras repo), pin the OFFICIAL EPEL repo by a
+# SINGLE-HOST baseurl on dl.fedoraproject.org -- deliberately NOT the metalink, which fans out to
+# arbitrary mirrors an egress-fenced/cache-proxied host cannot reach -- with gpgcheck against the
+# official EPEL key. Fedora is untouched (both packages sit in its main repos); no-op when EPEL is
+# already present, so re-runs stay idempotent.
+_dnf_ensure_epel() {
+  local id="" like="" relver=""
+  [ -r /etc/os-release ] || return 0
+  id=$(. /etc/os-release; printf '%s' "${ID:-}")
+  like=$(. /etc/os-release; printf '%s' "${ID_LIKE:-}")
+  case "$id" in
+    centos|rhel|rocky|almalinux) ;;
+    *) case " $like " in *" rhel "*) ;; *) return 0;; esac ;;
+  esac
+  rpm -q epel-release >/dev/null 2>&1 && { say "EPEL already enabled (epel-release installed)"; return 0; }
+  [ -f /etc/yum.repos.d/drvps-epel.repo ] && { say "EPEL already pinned (drvps-epel.repo)"; return 0; }
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] el9 host: ensure EPEL (epel-release, else pin drvps-epel.repo -> dl.fedoraproject.org, gpgcheck on)\n'; return 0; fi
+  if dnf install -y epel-release >/dev/null 2>&1; then say "EPEL enabled via epel-release"; return 0; fi
+  relver=$(. /etc/os-release; printf '%s' "${VERSION_ID%%.*}")
+  case "$relver" in ''|*[!0-9]*) echo "[setup] FATAL: cannot determine the el releasever for EPEL (VERSION_ID='$relver')" >&2; exit 11;; esac
+  say "epel-release unavailable -> pinning the official EPEL $relver repo (dl.fedoraproject.org, gpgcheck on)"
+  cat > /etc/yum.repos.d/drvps-epel.repo <<EOF
+[drvps-epel]
+name=EPEL $relver (drvps pinned: single-host baseurl for egress-fenced installs)
+baseurl=https://dl.fedoraproject.org/pub/epel/$relver/Everything/\$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-$relver
+EOF
+}
+
 step_deps() {
   local pm; pm="${PM:-$(detect_pm)}"; say "deps (package manager: $pm)"
   # shellcheck disable=SC2086  # $PKGS_* is a TRUSTED literal list, deliberately word-split into argv
   case "$pm" in
-    dnf) run dnf install -y $PKGS_dnf ;;
+    dnf) _dnf_ensure_epel; run dnf install -y $PKGS_dnf
+         # BEST-EFFORT: cloud-utils gives the preferred cloud-localds where it exists (Fedora); on el9
+         # it is absent and the genisoimage fallback (already installed above) handles the seed build.
+         # A missing package must NOT fail the step, so this is deliberately NOT `run` (which exits on rc!=0).
+         if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] dnf install -y (best-effort) %s\n' "$PKGS_dnf_opt"
+         elif dnf install -y $PKGS_dnf_opt >/dev/null 2>&1; then say "optional deps installed: $PKGS_dnf_opt"
+         else say "optional deps unavailable (ok -- genisoimage covers the seed build): $PKGS_dnf_opt"; fi ;;
     apt) run_sh 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"' $PKGS_apt ;;
     *)   echo "unsupported host distro (need dnf or apt)" >&2; exit 11 ;;
   esac
@@ -1883,6 +1928,17 @@ PY
         systemctl restart squid && _sqfail=0
       fi
     fi
+    # GENERIC transient retry (surfaced on a centos9 nested L1 under install load, 2026-07-16): squid is
+    # Type=notify, so a slow SSL-cert-db/DNS init that misses TimeoutStartSec makes systemd report
+    # "Failed with result 'protocol'" -- a spurious readiness timeout, not a config fault (the config
+    # already passed `squid -k parse` above). If the shm-specific recovery did not resolve it and the
+    # failure is NOT the shm error, wait briefly and retry ONCE. Safe + idempotent: `systemctl restart`
+    # of an already-good unit just cycles it, and a genuine config fault fails the retry too (still fatal).
+    if [ "$_sqfail" -ne 0 ] && [ "$_shmerr" -eq 0 ]; then
+      say "  squid did not signal ready on first start (Type=notify timeout under load?) -- waiting 3s and retrying once"
+      sleep 3
+      systemctl restart squid && _sqfail=0
+    fi
     if [ "$_sqfail" -ne 0 ]; then
       echo "[setup] squid restart FAILED (fail-closed) -- diagnostics:" >&2
       LC_ALL=C systemctl status squid --no-pager -l 2>&1 | sed 's/^/    status| /' >&2 || true
@@ -2145,6 +2201,13 @@ EOF
     exit 1
   }
   run systemctl enable --now drvps-rigreaper.timer
+  # KICK one reaper run NOW: the timer's first tick is OnBootSec=10min, so on a freshly-BOOTED host
+  # (install within 10min of boot -- every nested/cloud provision) the console-reaper heartbeat does
+  # not exist yet and the first `dr-vps doctor` -- including this installer's own final sanity check
+  # -- fails "reaper heartbeat stale/missing" until the tick (found live on a fedora44 nested L1,
+  # 2026-07-16; long-booted hosts never see it because an already-elapsed OnBootSec fires at once).
+  # A real run, so the heartbeat reflects an actual reaper pass, not a fabricated marker.
+  run systemctl start drvps-rigreaper.service
 }
 
 step_top() {                       # drvps-top: viewer trust config (/etc/drvps-top/viewer.conf) + the feed
