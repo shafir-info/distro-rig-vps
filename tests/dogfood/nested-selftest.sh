@@ -26,10 +26,10 @@
 # guest (tests/acceptance/live-fedora44.sh as drvps). The PASS line claims only the mandatory bar.
 # PORTABILITY: ONE L1 distro per run (arg 1, default fedora44). Another family is a SEPARATE
 # operator-run invocation (`DRVPS_LIVE=1 tests/dogfood/nested-selftest.sh centos9`); a single PASS
-# line never implies multi-distro coverage. PROVEN passing (2026-07-16): fedora44 and centos9 (el9,
-# via the genisoimage seed fallback). KNOWN-FAILING: ubuntu22/24/26 -- the stock cloud golden's
-# ~2.3GB root fs cannot hold the ~900MB rig install; needs a golden rebuilt with a larger disk
-# (`dr-vps build`), not a code change. The apt installer LOGIC was proven on a larger outer guest.
+# line never implies multi-distro coverage. PROVEN passing (2026-07-16): ALL FIVE goldens --
+# fedora44, centos9 (el9, via the genisoimage seed fallback + pinned EPEL), and ubuntu22/24/26 (on
+# 12GB goldens built via the recipe `disk_size` field -- the stock ~2-3.5GB ubuntu cloud golden is
+# too small for the ~900MB rig install; `disk_size` grows it and cloud-init growpart expands root).
 #
 # SAFETY (finding: a leaked/hung run on the shared host): the L1 VM is owner-scoped and destroyed on ANY exit via
 # a trap installed BEFORE creation; every remote/create/destroy step is time-bounded (SSH ConnectTimeout +

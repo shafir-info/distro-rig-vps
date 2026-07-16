@@ -70,9 +70,18 @@ fixed three real blockers plus two transient install faults:
   `squid -k parse` passed): added one generic safe retry (the prior recovery only handled the
   SysV-shm case) — idempotent, a genuine config fault still fails the retry.
 
-**Not fixed here (operator-side):** ubuntu22/24/26 nested fail at the package step because the
-golden's ~2.3 GB root fs cannot hold the ~900 MB install — a golden rebuild with a larger disk
-(`dr-vps build`), not a code change.
+- ubuntu golden disk too small: ubuntu22/24/26 nested failed at the package step because the stock
+  cloud golden's ~2–3.5 GB root fs cannot hold the ~900 MB install. Added a `disk_size` recipe field
+  (see below) that grows the golden's virtual disk at build; the three ubuntu recipes set
+  `"disk_size": "12G"`. **All five goldens (fedora44, centos9, ubuntu22/24/26) now pass the full
+  nested bar** end to end.
+
+Separately, `dr_vps_image_build` gained an optional **`disk_size`** recipe field (a qemu-img size):
+it `qemu-img resize`s the fetched image AFTER the sha verify (so `upstream_sha256` still checks the
+original vendor download — no re-pinning) and BEFORE bake/digest, so every VM cloned from the golden
+gets the bigger disk and cloud-init growpart expands root on first boot. Grow-only (fails closed on a
+shrink); schema-validated. The ubuntu recipes' pinned shas were refreshed to the vendor's current
+published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are rolling).
 
 ### Fixed (whole-tree consistency review, 2026-07-16 — every finding closed RED-first)
 
