@@ -12,12 +12,14 @@ drive the rig via `rigctl` -- no re-researching after a context clear.
 
 Operates only inside your own ~/.claude, needs no sudo, and never creates OS accounts. "Ours" is proven by a
 tool-written provenance marker (never by the skill's own name). A COPY marker records the SHA-256 of every
-file it installs; a LINK marker is bound to the published symlink's (st_dev, st_ino). A managed copy is reset
+file it installs; a LINK marker is bound to the published symlink's (st_dev, st_ino, st_mtime_ns). A managed copy is reset
 ONLY when it holds EXACTLY the nodes this tool installed, each of the exact type, with bytes still matching the
-recorded hashes; a link is "ours" ONLY when its inode matches the marker -- so a foreign same-name skill, a
-file whose CONTENT differs from what we installed, user data hidden behind a managed name, or a user-created
-symlink (different inode, or no marker) is PRESERVED, never overwritten or deleted. An orphaned marker can
-never claim a different inode, so it is harmless. Every final-component operation on a managed node is
+recorded hashes; a link is "ours" ONLY when its (dev, ino, mtime) match the marker -- so a foreign same-name
+skill, a file whose CONTENT differs from what we installed, user data hidden behind a managed name, or a
+user-created symlink (no marker) is PRESERVED, never overwritten or deleted. Inode numbers are REUSED by
+filesystems, so an orphaned marker will not claim a later user symlink that has a distinct mtime -- true on
+any filesystem with sub-second symlink mtime (ext4/xfs/btrfs/tmpfs). Every final-component operation on a
+managed node is
 type-checked (lstat) and no-follow, and the replacement is built first and published by an atomic rename with
 restore-on-caught-failure. Guarantee scope: this preserves anything whose BYTES differ from what we installed
 (a byte-identical replacement is indistinguishable and treated as ours; metadata-only changes are not tracked).
@@ -32,7 +34,7 @@ import shutil
 import stat
 import sys
 
-SCHEMA = 1
+SCHEMA = 2                                    # marker format version; bump 1->2 = link marker gained mtime_ns
 TOOL = "drvps-skill-install"
 MARKER = ".drvps-skill"                        # provenance marker -- ONLY this tool writes it
 REFS = ("AGENT-GUIDE.md", "ORCHESTRATOR-GUIDE.md")
@@ -146,7 +148,7 @@ def _read_marker(path, mode):
     in MARKER_MAX and parse as our exact structure -- so a truncated valid prefix + trailing user bytes, or a
     bare {tool,schema} file the tool never writes, is REJECTED (not mistaken for ours). Returns the dict or None:
       copy: {tool, schema, mode:"copy", sha256:{SKILL.md + each guide -> 64-hex}}   (extras allowed: none)
-      link: {tool, schema, mode:"link", dev:int, ino:int}"""
+      link: {tool, schema, mode:"link", dev:int, ino:int, mtime_ns:int}"""
     if not _is_regular(path):
         return None
     try:
@@ -177,9 +179,10 @@ def _read_marker(path, mode):
         if not all(_is_hex64(v) for v in shas.values()):
             return None
     elif mode == "link":
-        if set(obj) != {"tool", "schema", "mode", "dev", "ino"}:
+        if set(obj) != {"tool", "schema", "mode", "dev", "ino", "mtime_ns"}:
             return None
-        if not (_is_uint64(obj.get("dev")) and _is_uint64(obj.get("ino"))):   # os.lstat never writes negative/huge ids
+        if not (_is_uint64(obj.get("dev")) and _is_uint64(obj.get("ino"))
+                and _is_uint64(obj.get("mtime_ns"))):   # os.lstat never writes negative/huge ids or times
             return None
     else:
         return None
@@ -197,12 +200,18 @@ def _link_marker(dest):
 
 
 def _write_link_marker(dest):
-    """Write the companion provenance marker, BOUND to the published symlink's (st_dev, st_ino). Because it is
-    tied to that exact inode, an ORPHANED marker (symlink later removed/replaced) can never match a DIFFERENT
-    symlink the user creates -- so a stale marker is harmless, not a claim on someone else's link. Call AFTER
-    the symlink is published at dest."""
-    st = os.lstat(dest)                                          # the published symlink's own inode
-    obj = {"tool": TOOL, "schema": SCHEMA, "mode": "link", "dev": st.st_dev, "ino": st.st_ino}
+    """Write the companion provenance marker, BOUND to the published symlink's (st_dev, st_ino, st_mtime_ns).
+    Inode numbers are REUSED by filesystems (tmpfs/overlayfs hand a freed inode straight back), so (dev, ino)
+    alone cannot tell our removed link from a user's later symlink at the same path -- but a freshly created
+    symlink almost always has a distinct mtime, so an ORPHANED marker will not match a DIFFERENT symlink the
+    user creates. Call AFTER the symlink is published.
+    Two known limits of this mtime bind (parked upgrade to immutable birthtime -- statx STX_BTIME, Python
+    3.12+ -- in the CHANGELOG "Deferred" list): a whole-second symlink mtime (FAT, some NFS) can collide under
+    same-second inode reuse; and an EXTERNAL mtime change (touch -h, a copy that does not preserve symlink
+    mtime) makes the tool treat its own link as foreign -- a SAFE failure (it declines to act, never deletes)."""
+    st = os.lstat(dest)                                          # the published symlink's own identity
+    obj = {"tool": TOOL, "schema": SCHEMA, "mode": "link",
+           "dev": st.st_dev, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
     payload = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("ascii")
     m = _link_marker(dest)
     tmp = _fresh_sibling(m, "tmp")
@@ -226,7 +235,9 @@ def _is_our_link(dest):
         st = os.lstat(dest)
     except OSError:
         return False
-    if m.get("dev") != st.st_dev or m.get("ino") != st.st_ino:  # the marker must name THIS exact symlink inode
+    # the marker must name THIS exact symlink -- inode NUMBERS are reused (tmpfs/overlay), so compare mtime too
+    if (m.get("dev") != st.st_dev or m.get("ino") != st.st_ino
+            or m.get("mtime_ns") != st.st_mtime_ns):
         return False
     try:
         return os.path.realpath(dest) == os.path.realpath(SRC)   # and it points at our current source

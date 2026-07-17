@@ -128,6 +128,27 @@ _missing() {  # <allow-newline-list> <doc> -> prints any verb named by <doc> tha
   [ -L "$d" ] && [ "$(readlink "$d")" = "$root/share/skills/drvps" ]        # user symlink intact
 }
 
+@test "BLOCKER: inode REUSE cannot let an orphaned link marker claim a user's symlink (mtime-bound)" {
+  # The natural case above relies on the new symlink getting a different inode. On tmpfs/overlayfs a freed
+  # inode is REUSED immediately, so (dev,ino) alone would match -- the marker also binds st_mtime_ns, which a
+  # freshly created symlink cannot share. Force the reuse deterministically and assert we still say foreign.
+  local root h d lm; root="$(_root)"; h="$BATS_TEST_TMPDIR/reuse"; mkdir -p "$h"
+  d="$h/.claude/skills/drvps"; lm="$h/.claude/skills/.drvps.drvps-link"
+  env HOME="$h" python3 "$(_tool)" --link >/dev/null                        # our link + marker(dev,ino,mtime)
+  rm "$d"; ln -s "$root/share/skills/drvps" "$d"                            # user's OWN symlink at the same path
+  python3 - "$lm" "$d" <<'PYRE'                                             # simulate the FS reusing our inode
+import json, os, sys
+st = os.lstat(sys.argv[2])
+m = json.load(open(sys.argv[1]))
+m["ino"] = st.st_ino                        # our freed inode handed back to the user's link
+m["mtime_ns"] = st.st_mtime_ns - 10**9      # our link predated theirs by >=1s (distinct on ANY fs resolution)
+json.dump(m, open(sys.argv[1], "w"))
+PYRE
+  run env HOME="$h" python3 "$(_tool)" --status; [[ "$output" == foreign:* ]]   # mtime still differs -> NOT ours
+  run env HOME="$h" python3 "$(_tool)" --uninstall; [ "$status" -ne 0 ]         # refuses to delete the user's symlink
+  [ -L "$d" ] && [ "$(readlink "$d")" = "$root/share/skills/drvps" ]            # user symlink intact
+}
+
 @test "an orphan link marker with an ABSENT dest is reconciled (cleaned) by uninstall" {
   local h d lm; h="$BATS_TEST_TMPDIR/reconcile"; mkdir -p "$h"
   d="$h/.claude/skills/drvps"; lm="$h/.claude/skills/.drvps.drvps-link"
@@ -165,13 +186,13 @@ _missing() {  # <allow-newline-list> <doc> -> prints any verb named by <doc> tha
 @test "BLOCKER: a marker must match the FULL mode-specific structure -- a bare {tool,schema} file is not ours" {
   local h d lm; h="$BATS_TEST_TMPDIR/loose"; d="$h/.claude/skills/drvps"; mkdir -p "$d"
   lm="$h/.claude/skills/.drvps.drvps-link"
-  printf '{"schema":1,"tool":"drvps-skill-install"}' > "$d/.drvps-skill"      # a copy marker missing mode/sha256
+  printf '{"schema":2,"tool":"drvps-skill-install"}' > "$d/.drvps-skill"      # a copy marker missing mode/sha256
   echo "not our skill" > "$d/SKILL.md"
   run env HOME="$h" python3 "$(_tool)" --status; [[ "$output" == foreign:* ]] # not recognized as a managed copy
   run env HOME="$h" python3 "$(_tool)" --uninstall; [ "$status" -ne 0 ]       # refuses; leaves it intact
   [ -f "$d/.drvps-skill" ]
   # a bare marker at the LINK path: not reconciled/deleted; --link refuses (foreign file at the marker path)
-  rm -rf "$d"; printf '{"schema":1,"tool":"drvps-skill-install"}' > "$lm"
+  rm -rf "$d"; printf '{"schema":2,"tool":"drvps-skill-install"}' > "$lm"
   env HOME="$h" python3 "$(_tool)" --uninstall >/dev/null 2>&1; [ -f "$lm" ]
   run env HOME="$h" python3 "$(_tool)" --link; [ "$status" -ne 0 ]; [ -f "$lm" ]
 }
@@ -179,21 +200,21 @@ _missing() {  # <allow-newline-list> <doc> -> prints any verb named by <doc> tha
 @test "BLOCKER: an oversize marker (valid prefix + trailing user bytes) is rejected, never treated as ours" {
   local h lm; h="$BATS_TEST_TMPDIR/oversize"; mkdir -p "$h/.claude/skills"
   lm="$h/.claude/skills/.drvps.drvps-link"
-  { printf '{"dev":1,"ino":1,"mode":"link","schema":1,"tool":"drvps-skill-install"}'
+  { printf '{"dev":1,"ino":1,"mtime_ns":1,"mode":"link","schema":2,"tool":"drvps-skill-install"}'
     head -c 5000 /dev/zero | tr '\0' ' '; printf 'USER-TRAILER'; } > "$lm"     # valid JSON prefix + trailer past 4 KiB
   run env HOME="$h" python3 "$(_tool)" --uninstall; [ -f "$lm" ]              # oversize -> not our marker -> left intact
 }
 
 @test "BLOCKER: a marker's schema must be a real JSON int (True/1.0), no duplicate keys, no oversize" {
   local h lm; h="$BATS_TEST_TMPDIR/strict"; mkdir -p "$h/.claude/skills"; lm="$h/.claude/skills/.drvps.drvps-link"
-  printf '{"dev":1,"ino":1,"mode":"link","schema":true,"tool":"drvps-skill-install"}' > "$lm"
+  printf '{"dev":1,"ino":1,"mtime_ns":1,"mode":"link","schema":true,"tool":"drvps-skill-install"}' > "$lm"
   env HOME="$h" python3 "$(_tool)" --uninstall >/dev/null 2>&1; [ -f "$lm" ]     # schema:true rejected
-  printf '{"dev":1,"ino":1,"mode":"link","schema":1.0,"tool":"drvps-skill-install"}' > "$lm"
+  printf '{"dev":1,"ino":1,"mtime_ns":1,"mode":"link","schema":1.0,"tool":"drvps-skill-install"}' > "$lm"
   env HOME="$h" python3 "$(_tool)" --uninstall >/dev/null 2>&1; [ -f "$lm" ]     # schema:1.0 rejected
-  printf '{"tool":"drvps-skill-install","tool":"drvps-skill-install","dev":1,"ino":1,"mode":"link","schema":1}' > "$lm"
+  printf '{"tool":"drvps-skill-install","tool":"drvps-skill-install","dev":1,"ino":1,"mtime_ns":1,"mode":"link","schema":2}' > "$lm"
   env HOME="$h" python3 "$(_tool)" --uninstall >/dev/null 2>&1; [ -f "$lm" ]     # duplicate key rejected
   # a structurally-valid link marker with an IMPOSSIBLE dev/ino (os.lstat never returns these) is not ours
-  printf '{"dev":-1,"ino":-1,"mode":"link","schema":1,"tool":"drvps-skill-install"}' > "$lm"
+  printf '{"dev":-1,"ino":-1,"mtime_ns":1,"mode":"link","schema":2,"tool":"drvps-skill-install"}' > "$lm"
   env HOME="$h" python3 "$(_tool)" --uninstall >/dev/null 2>&1; [ -f "$lm" ]     # negative id rejected -> not deleted
   env HOME="$h" python3 "$(_tool)" >/dev/null 2>&1; [ -f "$lm" ]                  # nor deleted by copy stale-cleanup
   run env HOME="$h" python3 "$(_tool)" --link; [ "$status" -ne 0 ]; [ -f "$lm" ] # --link refuses (foreign at marker path)
