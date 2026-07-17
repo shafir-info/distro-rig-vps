@@ -34,7 +34,7 @@ rigctl version                                      # rig version + which build 
 Lifecycle + access:
 
 ```
-rigctl create <name> <distro> [ttl] [mem] [cpus] [--idem KEY]   # clone a VM from a golden distro (e.g. fedora44)
+rigctl create <name> <distro> [ttl] [mem] [cpus] [--class service] [--idem KEY]   # clone a VM from a golden distro (e.g. fedora44)
 rigctl use <name> --from-snap <snap-id> [--ttl H] [--mem M] [--cpus N] [--class service] [--idem KEY] [--restore-secrets]   # clone from one of YOUR snapshots
 rigctl list                                         # id  state  name  artifact_id
 rigctl status <id>                                  # state | generation | artifact_id | egress_gen

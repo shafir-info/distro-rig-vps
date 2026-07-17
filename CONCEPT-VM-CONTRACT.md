@@ -1,8 +1,9 @@
 # CONCEPT -- drvps minimal distro VM compatibility contract + console observability (STAGED) [rev4]
 
-Status: rev4, externally converged (correctness, architecture, and security all GO; every finding folded in).
-Re-scoped from "expose all qemu options" to a TYPED, RESOLVED, gate-bounded, STAGED contract. Part A
-(console-log) is proven and ships FIRST. An interactive console is a separate parked idea (TODO.md).
+Status: design converged (rev4; correctness, architecture, and security reviews all GO — every
+finding folded in). Re-scoped from "expose all qemu options" to a TYPED, RESOLVED, gate-bounded,
+STAGED contract. Part A (console-log) is SHIPPED (see STATUS.md); an interactive console is a
+separate parked idea (TODO.md).
 
 ## Reframe
 NOT "N independent knobs for all qemu/libvirt options" (combinatorial test + security surface). Instead:

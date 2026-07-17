@@ -24,7 +24,7 @@ dr_vps_image_fetch() {  # <url> <dest>
     file://*) cp -f "${url#file://}" "$dest" ;;
     # --progress-bar streams a download meter to STDERR (build stdout must stay the bare artifact_id);
     # -f fail-on-error, -L follow redirects. (was -fsSL: the -s silenced all progress -> "feels frozen".)
-    http://*|https://*) curl -fL --progress-bar -o "$dest" "$url" ;;
+    http://*|https://*) curl -fL --max-redirs 5 --progress-bar -o "$dest" "$url" ;;
     *) cp -f "$url" "$dest" ;;
   esac || { dr_vps_die "$DR_VPS_E_GENERIC" "fetch failed: $url"; return $?; }
   [ -s "$dest" ] || { dr_vps_die "$DR_VPS_E_GENERIC" "fetched empty file: $url"; return $?; }

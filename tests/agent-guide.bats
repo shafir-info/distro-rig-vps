@@ -14,7 +14,8 @@
 # The extraction + comparison are FACTORED into shared functions (_rigctl_labels / _guide_verbs /
 # _drift_check) used by BOTH the real-files test (must PASS) and a deliberately-drifted fixture (must FAIL).
 # So breaking the real checker -- not a reimplementation of it -- is what the positive control catches.
-# Also checks make-pack.sh --profile=agent and the bin/rigctl pull paired-status path.
+# Also guards CONCEPT.md's "Fixed verb whitelist" bullet against the same allowlist (both directions),
+# and checks make-pack.sh --profile=agent and the bin/rigctl pull paired-status path.
 
 load helpers
 
@@ -27,6 +28,17 @@ _watcher_allow() {
 import ast, sys
 tree = ast.parse(open(sys.argv[1]).read())
 verbs = set()
+# the reader sees only the LITERAL table assignments -- fail loudly on any later augmentation
+# (AugAssign / subscript store) instead of silently under-reading the allowlist
+for n in ast.walk(tree):
+    if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) \
+            and n.target.id in ("GLOBAL_VERBS", "VM_VERBS"):
+        sys.stderr.write("verb table augmented after definition -- extend the drift guard\n"); sys.exit(2)
+    if isinstance(n, ast.Assign):
+        for t in n.targets:
+            if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) \
+                    and t.value.id in ("GLOBAL_VERBS", "VM_VERBS"):
+                sys.stderr.write("verb table augmented after definition -- extend the drift guard\n"); sys.exit(2)
 for n in ast.walk(tree):
     if isinstance(n, ast.Assign):
         for t in n.targets:
@@ -77,6 +89,55 @@ _drift_check() {  # <labels> <allow> <gverbs>
   gverbs=$(_guide_verbs "$guide");  [ -n "$gverbs" ]
   run _drift_check "$labels" "$allow" "$gverbs"
   [ "$status" -eq 0 ] || { echo "guide drift:"; echo "$output"; false; }
+}
+
+# CONCEPT.md's security-model whitelist bullet is load-bearing (a reviewer sizes the agent surface
+# from it), so it gets the same two-way drift guard as the agent guide. Verb tokens are the
+# backticked lowercase words inside the ONE "Fixed verb whitelist" bullet (header line included,
+# next top-level bullet ends it); the two gate-class names (guestexec/lifecycle) are categories,
+# not verbs. Uppercase table names, pathnames, and --flags fall outside the char class by design.
+# Known blind spot: the guard compares MEMBERSHIP only -- a verb->gate-tier reclassification
+# inside VM_VERBS (the security content of the tiers) is not doc-checked here.
+_concept_verbs() {  # <concept-file>
+  local bt; bt=$(printf '\140')
+  awk '/^- \*\*/{f=0} /^- \*\*Fixed verb whitelist/{f=1} f' "$1" \
+    | grep -oE "${bt}[a-z][a-z0-9-]*${bt}" | tr -d "$bt" \
+    | grep -vxE 'guestexec|lifecycle' | LC_ALL=C sort -u
+}
+# Compare doc verbs vs the real allowlist, BOTH directions; tagged line per drift, nonzero on any.
+_concept_drift_check() {  # <allow> <doc>
+  local allow="$1" doc="$2" v bad=0
+  for v in $doc;   do printf '%s\n' "$allow" | grep -qxF "$v" || { echo "CONCEPT-DOCS-NONVERB $v"; bad=1; }; done
+  for v in $allow; do printf '%s\n' "$doc"   | grep -qxF "$v" || { echo "CONCEPT-MISSES-VERB $v"; bad=1; }; done
+  return "$bad"
+}
+
+@test "CONCEPT.md 'Fixed verb whitelist' bullet matches the watcher's REAL allowlist (both directions)" {
+  local root concept watcher allow doc; root="$(_root)"
+  concept="$root/CONCEPT.md"; watcher="$root/src/drvps_rigctl.py"
+  [ -f "$concept" ]; [ -f "$watcher" ]
+  allow=$(_watcher_allow "$watcher"); [ -n "$allow" ]
+  doc=$(_concept_verbs "$concept");   [ -n "$doc" ]
+  run _concept_drift_check "$allow" "$doc"
+  [ "$status" -eq 0 ] || { echo "CONCEPT whitelist drift:"; echo "$output"; false; }
+}
+
+@test "CONCEPT whitelist drift guard POSITIVE CONTROL: the REAL checker fires both directions on a drifted fixture" {
+  # A fixture bullet documenting a fake verb (forward drift) while omitting every real verb but
+  # 'create' (reverse drift); a verb mentioned AFTER the next bullet must not be extracted.
+  local bt f; bt=$(printf '\140')
+  f="$BATS_TEST_TMPDIR/fake-concept.md"
+  printf -- '- **Fixed verb whitelist.** Only %sbogus-verb%s and %screate%s here.\n- **Next bullet.** %sdestroy%s outside is ignored.\n' \
+    "$bt" "$bt" "$bt" "$bt" "$bt" "$bt" > "$f"
+  local doc; doc=$(_concept_verbs "$f")
+  printf '%s\n' "$doc" | grep -qxF bogus-verb                  # extraction sees inside the bullet ...
+  ! printf '%s\n' "$doc" | grep -qxF destroy || false          # ... and stops at the next bullet
+  local allow; allow=$(_watcher_allow "$(_root)/src/drvps_rigctl.py")
+  run _concept_drift_check "$allow" "$doc"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"CONCEPT-DOCS-NONVERB bogus-verb"* ]]       # forward: fake documented verb caught
+  [[ "$output" == *"CONCEPT-MISSES-VERB destroy"* ]]           # reverse: real undocumented verb caught
+  [[ "$output" != *"CONCEPT-MISSES-VERB create"* ]]            # the one correctly-documented verb is clean
 }
 
 @test "drift guard SELF-TEST: an agent-DISallowed verb ('restore', present only in LIFECYCLE) is not treated as allowed" {

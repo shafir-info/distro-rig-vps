@@ -244,3 +244,22 @@ _ccvm() {  # <id> -- register a golden + a vm row so the console reap sees it
   for i in 1 2 3; do [ -f "$idir/4001/a$i.json" ]; done   # NONE count-evicted (owner A intact)
   [ -f "$idir/4002/b1.json" ]                             # owner B's in-progress intact (no cross-owner evict)
 }
+
+@test "reaper: knob guard -- malformed GC/age knobs fall back to defaults LOUDLY, valid values pass through" {
+  # find silently no-ops on a malformed -mmin argument (rc eaten by '|| true'), and the snap-bundle
+  # age-gate's empty-means-old polarity would INVERT into reaping in-flight bundles -- so the knobs
+  # are validated once, with an audit line on fallback.
+  run _dr_vps_reap_knob DR_VPS_RESULT_TTL_MIN 1440
+  [ "$status" -eq 0 ]; [ "$output" = 1440 ]                                # unset -> default
+  DR_VPS_RESULT_TTL_MIN=90 run _dr_vps_reap_knob DR_VPS_RESULT_TTL_MIN 1440
+  [ "$output" = 90 ]                                                      # valid passes through
+  DR_VPS_RESULT_TTL_MIN=1d run _dr_vps_reap_knob DR_VPS_RESULT_TTL_MIN 1440
+  [ "$output" = 1440 ]                                                    # malformed -> default ...
+  grep -q '"reaper":"reap-bad-knob","id":"DR_VPS_RESULT_TTL_MIN"' "$DR_VPS_SPOOL_DIR/audit.log"  # ... loudly
+  # and the sweep still GCs with the fallback: an old result survives a malformed knob's no-op no more
+  mkdir -p "$DR_VPS_SPOOL_DIR/results"
+  printf '{}' >"$DR_VPS_SPOOL_DIR/results/old1.json"
+  touch -d '3 days ago' "$DR_VPS_SPOOL_DIR/results/old1.json"
+  DR_VPS_RESULT_TTL_MIN=1d dr_vps_reaper_sweep
+  [ ! -f "$DR_VPS_SPOOL_DIR/results/old1.json" ]                          # swept via the 1440 fallback
+}

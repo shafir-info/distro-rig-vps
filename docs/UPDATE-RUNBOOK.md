@@ -30,8 +30,10 @@ only that far:
 - pack tarball 0600 in the agent's 0700 `~/tmp` -- the operator reads it via `sudo`.
 - `/root/drvps-backups` 0700 (root only).
 - state + logs (`/var/lib/distro-rig-vps`, `/var/log/distro-rig-vps`) 0750 `drvps:qemu` -- group access for the
-  virtlogd/qemu side, NO world bit. Secrets stay tighter: `/etc/distro-rig-vps/env` 0640, the VM ssh key under
-  `~drvps/.ssh` 0700.
+  virtlogd/qemu side, NO world bit. The config env `/etc/distro-rig-vps/env` is 0644 (non-secret, paths only;
+  it MUST stay readable by the agent and drvps -- rigctl and the acceptance script source it with a
+  readability guard and silently fall back to defaults if it is not). Secrets stay tighter: the VM ssh key
+  under `~drvps/.ssh` 0700.
 - NO world-readable trees. The code at `/opt/distro-rig-vps` is `root:drvpsctl`, top dir `0750`, files `g=rX,o=`
   (group-only, no world bit): `make-pack.sh` normalises archive modes to `u=rwX,g=rX,o=`, and Steps 3/Rollback
   `chown -R root:drvpsctl` + `chmod 0750` the top dir. BOTH the `drvps` service user and the agent are members of
@@ -229,3 +231,19 @@ sudo systemctl start drvps-rigsubmit.socket
   the `drvps-rigreaper.timer` interval, or the operator doctor false-alarms between sweeps.
 - verify-before-delete -- both the swap and the rollback `test -x .../dr-vps-setup` the staged tree BEFORE any
   `rm -rf`, so a bad pack/backup can never wipe `/opt`.
+- S5 private result store (ACL) -- on a pre-S5 rig the FIRST fail-closed moment is Step 4:
+  `dr-vps-setup --yes` starts the watcher (`enable --now`), whose launcher hard-requires POSIX-ACL
+  support on the spool fs (the setup's own service-start check aborts with the journal tail; see
+  INSTALL-RUNBOOK "POSIX ACL support"). For a no-ACL spool the opt-out is `DR_VPS_RESULT_PRIVATE=0`,
+  BUT setup rewrites `/etc/distro-rig-vps/env` on every run: add the line AFTER Step 4 (and re-add it
+  after any future setup re-run), then start the services per Step 5 -- or use a systemd drop-in
+  (`Environment=DR_VPS_RESULT_PRIVATE=0` on drvps-rigctl.service), which survives setup re-runs.
+- S5 legacy-results tail -- results written 0640 BEFORE the update stay group-readable until the
+  reaper's result GC AGES them out (`DR_VPS_RESULT_TTL_MIN`, default 24h); a manual reaper start does
+  NOT shorten that, it only sweeps what is already past the TTL. To close the tail immediately, run
+  the reaper once with a lowered TTL (this also ages out duplicate-reqid replay tombstones early --
+  acceptable right after an update, when no pre-update reqid should ever be re-submitted):
+
+```
+sudo runuser -u drvps -- env DR_VPS_RESULT_TTL_MIN=1 /opt/distro-rig-vps/bin/drvps-rigreaper
+```

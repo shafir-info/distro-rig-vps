@@ -104,6 +104,8 @@ dr_vps_gate_vm() {
     # into the XPaths below as a STRING LITERAL: a quote in the path breaks XPath COMPILATION so
     # _dr_gate_count returns the ERR sentinel and every downstream numeric guard fails CLOSED.
     local EXPECTED; EXPECTED=$(dr_vps_console_log_path "$id")
+    # NB: many refusal messages below are asserted VERBATIM by tests/gate.bats (per-clause pins),
+    # so the die text is a test-facing contract -- reword a message and its pins together.
     # (a) net: every interface is type='network' on $net (no non-simnet egress) AND carries exactly one
     # <port isolated='yes'/>. Guest-to-guest L2 on the rig bridge is NOT nft-filtered (nft is L3) -- it
     # is enforced ONLY by libvirt bridge port isolation (rendered by dr_vps_domain.sh). A redefined

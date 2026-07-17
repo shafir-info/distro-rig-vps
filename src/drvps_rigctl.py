@@ -468,7 +468,8 @@ def _owner_of(raw):
 def _apply_owner_acl(path, owner):
     """S5: grant the agent-owner (a DIFFERENT uid than drvps) read on a 0600 drvps-owned spool file
     via a POSIX ACL, so a co-tenant cannot read it but the requester can. BEST-EFFORT + loud: the
-    doctor ACL gate is the real precondition, so a failure here means a misconfigured spool fs -- the
+    launcher's start-time ACL probe is the real precondition (dr-vps doctor deliberately does NOT
+    check it), so a failure here means a runtime spool-fs degrade -- the
     file stays 0600 (confidentiality intact), the cross-uid agent just can't read it (availability
     degrades, logged). NEVER raises: a Restart=always daemon must still publish the result."""
     try:
@@ -481,7 +482,8 @@ def _apply_owner_acl(path, owner):
     except Exception as ex:
         sys.stderr.write("drvps-rigctl: setfacl u:%d:r on %s FAILED (%s) -- result stays 0600 "
                          "drvps-only; a cross-uid agent will NOT read it. Check the spool fs is "
-                         "mounted with 'acl' and the acl package is installed (doctor gates this).\n"
+                         "mounted with 'acl' and the acl package is installed (the launcher probes "
+                         "this at every start; 'dr-vps doctor' does NOT check it).\n"
                          % (owner, path, type(ex).__name__))
 
 
@@ -522,6 +524,9 @@ def write_result(spool, reqid, obj, result_max, owner=None, private=True):
         # 0600 private (S5): structurally ends the co-tenant group-read leak regardless of ACL; legacy
         # 0640 relies on the setgid drvpsctl dir for agent read (DR_VPS_RESULT_PRIVATE=0, trusted rig).
         os.fchmod(fd, 0o600 if private else 0o640)
+        # NB: once _apply_owner_acl runs, ls/stat SHOW 0640 -- with an extended ACL the st_mode group
+        # bits display the ACL MASK (r--), not the owning group's access (still group::---); getfacl
+        # is authoritative. Same applies to mark_claimed's .claimed markers.
         os.fsync(fd)
     finally:
         os.close(fd)

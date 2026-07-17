@@ -10,6 +10,9 @@
 #   tests/release-gate.sh --live       # + TIER 3 the nested "really works" run (needs KVM; see dogfood/)
 #   tests/release-gate.sh --all        # tiers 1+2+3
 #
+# DRVPS_REQUIRE_ACL=1 turns the S5 result-privacy SKIPs (py suite) into failures -- set it
+# wherever ACLs are expected (CI does; RELEASING.md's commands do).
+#
 # A tier that is EXPLICITLY REQUESTED but whose prerequisite is missing (no podman / no /dev/kvm) is a FAILURE,
 # not a skip -- you asked to run it and it did not. An UNREQUESTED tier just SKIPs. Run the OFFLINE tier as a
 # NON-root user -- the bats suite asserts 0700/0600 refusals a root process would bypass (CI runs it as `ci`).
@@ -130,7 +133,7 @@ run1 "residue gate (handle + provider shorthand + review-label class)" bash -c '
   X="--exclude-dir=.git --exclude-dir=.github --exclude=release-gate.sh"
   ! grep -rniE "winhelm" $X . &&
   ! grep -rnE "\bgpt\b|\bgrok\b" $X . &&
-  ! grep -rnE "finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\bCOR-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)[-:]" $X .'
+  ! grep -rnE "finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\b(ARC|COR|SEC|OPS|TST|DOC|IMP|PUB)-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)[-:]" $X .'
 
 echo "================ TIER 2: CONTAINER e2e (disposable rootless podman) ================"
 if [ "$WANT_CONTAINER" = 1 ]; then

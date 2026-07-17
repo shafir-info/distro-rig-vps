@@ -10,9 +10,8 @@ It is the full-fidelity VM sibling of `distro-rig` (the container fixture rig): 
 systemd, kernel, or boot-level deploy testing that containers can't reach.
 
 > This document supersedes the phased design sketches (folded and removed at release); where any
-> older record
-> disagree with this file or the code, the code wins. For how to install and use the system, see
-> [`USAGE.md`](USAGE.md).
+> older record disagrees with this file or the code, the code wins. For how to install and use the
+> system, see [`USAGE.md`](USAGE.md).
 
 ---
 
@@ -34,9 +33,9 @@ operator-supplied and immutable; the agent only ever works with what is already 
 ## 2. Components (files)
 
 ```
-bin/dr-vps            operator CLI: doctor build verify distros create wait list status
-                      console console-dump exec push pull recreate destroy
-                      gate (internal: the watcher's authorization probe, read-only)
+bin/dr-vps            operator CLI (full verb list: `bin/dr-vps --help`; the agent-reachable
+                      subset is section 6's whitelist; `gate` is the watcher's internal
+                      read-only authorization probe)
 bin/dr-vps-setup      privileged one-time installer (operator sudo; idempotent, re-entrant)
 bin/rigctl            AGENT client: submit one verb over the ingress socket, poll the result
 bin/drvps-rigsubmit   ingress-accepter launcher (sources env, execs the python accepter)
@@ -100,8 +99,8 @@ cache. Four layers, all driven by the operator-owned `etc/fleet.json` (nothing i
    the shared bridge is blocked by libvirt bridge port isolation).
 
 The fence is **re-applied every boot and re-verified every ~120s** by a root `drvps-egress` oneshot +
-timer, which re-stamps a world-readable **generation marker** on tmpfs (`/run/distro-rig-vps/
-nft.applied`). The non-root rig can read but not forge it; if the marker is missing/stale, VM creation
+timer, which re-stamps a world-readable **generation marker** on tmpfs
+(`/run/distro-rig-vps/nft.applied`). The non-root rig can read but not forge it; if the marker is missing/stale, VM creation
 and guest-exec **fail closed** (exit 24) until the fence is re-applied.
 
 ---
@@ -138,21 +137,29 @@ could use to reach the host/fleet/net:
 - every serial/console is a `pty`;
 - the egress generation is **fresh**.
 
-`destroy` and `status` are deliberately **not** pre-gated by the watcher. `destroy`: `dr-vps destroy`
-is itself the authoritative gate (store-row required + conditional identity gate + path-fence) and
-can also clear a no-domain "broken" VM, which a raw lifecycle gate would wrongly reject and wedge the
-agent's reset path. `status`: `dr-vps status` is an ungated pure store **read** (no virsh/ssh/scp),
-and the raw lifecycle gate (which requires a live domain) would refuse it exactly on a broken or
-undefined VM -- the state the agent most needs to inspect (the same wedge class as `destroy`).
+`destroy`, `status`, and `inspect` are deliberately **not** pre-gated by the watcher. `destroy`:
+`dr-vps destroy` is itself the authoritative gate (store-row required + conditional identity gate +
+path-fence) and can also clear a no-domain "broken" VM, which a raw lifecycle gate would wrongly
+reject and wedge the agent's reset path. `status`: `dr-vps status` is an ungated pure store **read**
+(no virsh/ssh/scp), and the raw lifecycle gate (which requires a live domain) would refuse it exactly
+on a broken or undefined VM -- the state the agent most needs to inspect (the same wedge class as
+`destroy`). `inspect` follows the same pattern: a host-side facts read that gates its live virsh
+reads INTERNALLY (conditional, like `destroy`), so it stays usable on exactly the broken/undefined
+VMs it exists to diagnose.
 
 ---
 
 ## 6. The Phase-2 control loop (agent -> watcher)
 
 **Trust model: a SINGLE untrusted agent.** The `drvpsctl` group is one trust domain -- the operator
-adds exactly **one** agent principal to it. The rig does **not** isolate between `drvpsctl` members
-(all rig VMs are the single agent's disposable playground; result payloads are per-owner-ACL private by default -- files created 0600, a named-owner ACL grant, `getfacl` shows `group::---`; the watcher launcher FAILS CLOSED if the spool fs lacks ACL support; `DR_VPS_RESULT_PRIVATE=0` = legacy group-readable opt-out). Multi-agent
-isolation is explicitly out of scope (see [`USAGE.md`](USAGE.md) "Security notes").
+adds exactly **one** agent principal to it. Within that group the request layer IS owner-scoped
+(S1a: every VM mutation and guest-content verb acts only on the requester's own VMs, and result
+payloads are per-owner-ACL private by default -- files created 0600 with a named-owner ACL grant,
+`getfacl` shows `group::---`; the watcher launcher FAILS CLOSED if the spool fs lacks ACL support;
+`DR_VPS_RESULT_PRIVATE=0` = legacy group-readable opt-out), but the rig remains ONE confinement
+domain: the global reads are not peer-filtered (see "Not claimed", section 8) and nothing else
+separates members. True multi-agent isolation is explicitly out of scope (canonical statement:
+[STATUS.md](STATUS.md) "Trust model"; see also [`USAGE.md`](USAGE.md) "Security notes").
 
 Flow:
 
@@ -164,7 +171,8 @@ agent: rigctl exec myvm 'reboot -f'
   -> drvps-rigctl watcher (User=drvps, never root):
        claim (unlink) the request  ->  validate against the fixed verb whitelist
        ->  GATE the VM verb  ->  run `dr-vps <verb>` (guest op runs INSIDE the fenced VM)
-       ->  write results/<reqid>.json  (results/ is 2750; the agent group-READS it)
+       ->  write results/<reqid>.json  (results/ is 2750; the FILE is 0600 + a per-owner ACL --
+           the agent reads only its OWN result; DR_VPS_RESULT_PRIVATE=0 = legacy group-read)
   -> rigctl bounded-waits on results/<reqid>.json, prints the envelope
 ```
 
@@ -174,10 +182,15 @@ Key properties:
   plant a non-regular "poison" entry that a never-root watcher couldn't reclaim. The accepter is
   deliberately thin (validate reqid/size/JSON + flood cap + atomic `O_EXCL|O_NOFOLLOW` temp +
   no-clobber `renameat2` publish); the **watcher** is the sole authoritative verb/semantic validator.
-- **Fixed verb whitelist.** Global: `create`, `list`. Per-VM `lifecycle`: `recreate`, `destroy`,
-  `status`. Per-VM `guestexec`: `exec`, `push`, `pull`, `wait`, `console-dump`. Anything else is
-  rejected. `create` fixes `--net`/`--ssh-key`/`--project` (agent-set values are ignored); numeric
-  caps (ttl/mem/cpus) are range-checked.
+- **Fixed verb whitelist.** The authoritative tables are `VM_VERBS` + `GLOBAL_VERBS` in
+  `src/drvps_rigctl.py` (on any drift, the code wins). Current surface -- per-VM `guestexec`:
+  `exec`, `exec-detach`, `push`, `pull`, `wait`, `console-dump`; per-VM `lifecycle`: `recreate`,
+  `destroy`, `status`, `inspect`, `snapshot`; global: `create`, `list`, `use`, `distros`,
+  `version`, the snapshot-artifact verbs `snap-ls`/`snap-show`/`snap-rm`, the owner-scoped job
+  reads `exec-status`/`exec-output`/`exec-errors`, and the owner-scoped `egress`
+  (splice-destination register/query). Anything else is rejected. `create` fixes
+  `--net`/`--ssh-key`/`--project` (agent-set values are ignored); numeric caps (ttl/mem/cpus) are
+  range-checked.
 - **`exec` is unrestricted *inside the box*** -- the command is one trailing ssh arg (never `bash -c`
   on the host; the IP is resolved from libvirt by the watcher, not the agent), and it runs only in the
   disposable, egress-fenced VM. `recreate` resets the VM from the verified golden.
@@ -225,9 +238,19 @@ whose root-exec surface is hardened on every axis a root installer can be attack
 5. The install-time root path cannot be subverted.
 
 **Not claimed / out of scope:**
-- **Per-agent isolation.** `drvpsctl` is a single trust domain; there is one agent. No per-peer result
-  privacy. A multi-agent rig would need per-agent authorization (peer-uid ownership via `SO_PEERCRED`
-  + owner-filtered verbs) -- a Phase-3/4 feature.
+- **Per-agent *authorization*.** `drvpsctl` is a single trust domain; there is one agent. Result
+  *payloads* ARE per-owner-private (S5): each result file + `.claimed` marker is `0600` drvps-owned with
+  a named-owner POSIX ACL keyed to the `SO_PEERCRED` uid, so one `drvpsctl` uid cannot read another's
+  result (contingent on an ACL-capable spool fs, which the watcher launcher fails closed on;
+  `DR_VPS_RESULT_PRIVATE=0` is the legacy group-readable opt-out). Two precision notes: an
+  UNattributable request's result is written `0600` with NO grant at all (fail closed -- more
+  private, not less), and `ls`/`stat` render an ACL-masked file as `0640` (the group bits display
+  the ACL *mask*; real group access stays `group::---` -- audit with `getfacl`, not mode bits).
+  What is NOT provided is per-agent *authorization* of the verbs themselves: mutations and
+  guest-CONTENT verbs are owner-scoped, but the reads
+  (`list`/`status`/`inspect`/`wait`/`distros`/`version`) stay global and are not peer-uid
+  access-controlled (note `wait` reaches the guest over SSH yet is global). A true multi-agent rig would
+  owner-filter every verb (peer-uid ownership end-to-end) -- a Phase-3/4 feature.
 - **A zero-trust confinement of the guest.** Confinement still relies on libvirt/qemu + the root
   egress unit + the privileged installer; the honest host-facing surface is documented, not eliminated.
 - Broker / tenants / quotas / remote provider (deferred Phase 3/4).
@@ -245,9 +268,10 @@ whose root-exec surface is hardened on every axis a root installer can be attack
 
 ---
 
-## 10. Historical records
+## 10. Companion records
 
-- CHANGELOG.md -- the original phased
-  design sketches (rationale and threat tables). Historical.
-- `STATUS.md` -- the running implementation/validation history, including live-KVM first-contact fixes
-  and CHANGELOG.md.
+- CHANGELOG.md -- the release record: per-release summaries plus the external-review rounds and
+  their outcomes. (The original phased design sketches were folded into these docs and removed at
+  release; the opening note records the supersession.)
+- `STATUS.md` -- the current verification status: LIVE-verified vs seam-tested per feature, trust
+  boundaries, and every known limitation/deferral (includes the live-KVM first-contact fixes).

@@ -2,7 +2,7 @@
 
 Current verification state of every subsystem, the load-bearing trust boundaries, and the open
 deferrals. History and per-cycle review narratives live in CHANGELOG.md; engineering lessons in
-LESSONS-LEARNED.md. Last updated: 2026-07-16 (0.3.0 in development).
+LESSONS-LEARNED.md. Last updated: 2026-07-17 (0.3.0 in development).
 
 ## Verification status
 
@@ -29,7 +29,7 @@ wired, and tested but disabled by default pending an operator decision.
 | Collision/net-ownership preflight (structural, live-address-complete) | LIVE | non-dry-run positive + planted-drift negative controls (widened /16, deleted /24, foreign net XML) |
 | Multi-distro golden builds (dnf/apt/zypper/apk profiles) | dnf (fedora44/centos9) + apt (ubuntu22/24/26) LIVE; zypper/apk SEAM | fedora44/centos9/ubuntu22/24/26 goldens built AND driven through the full nested bar (2026-07-16); ubuntu built with recipe `disk_size:"12G"`. zypper (opensuse-leap) / apk (alpine) family profiles remain seam-tested (live acceptance pending). |
 | Console-log observability (drvps-readable, DoS-bounded) | LIVE | reaper tail-compaction bound; readability decoupled from virtlogd |
-| Offline suite | GREEN | **774 bats tests / 23 suites**, plus offline python at umask 0077 AND 0022 (egress: layout/model/req/approve/migrate/verb; drvps-top: feed 291 / publisher / viewer / config / acquire) and offline sh (egress wiring + lock + render-noop; drvps-top unit/once/crossframe/hardening/setup; firewalld DR-2; image-bake guards) all green; shellcheck 0 errors (documented per-file suppressions: SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
+| Offline suite | GREEN | **784 bats tests / 23 suites**, plus offline python at umask 0077 AND 0022 (egress: layout/model/req/approve/migrate/verb; drvps-top: feed 291 / publisher / viewer / config / acquire) and offline sh (egress wiring + lock + render-noop; drvps-top unit/once/crossframe/hardening/setup; firewalld DR-2; image-bake guards) all green; shellcheck 0 errors (documented per-file suppressions: SC2163/SC2012 dr-vps-setup, SC2034 dr_vps_domain.sh + tools/drvps-top, SC2016 dr_vps_snapshot.sh + dr_vps_image.sh); python ast clean |
 
 **0.2.0 live-deploy smoke (bare-metal Fedora 44, 2026-07-12) -- all PASS:** clean-install upgrade
 from 0.1.0; goldens rebuilt (fedora44, ubuntu22/24/26, centos9); basic agent loop
@@ -39,15 +39,16 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
 
 ## Trust model and load-bearing boundaries (current, by design)
 
-- **Owner-scoped VM plane (S1a) -- CANONICAL statement of the isolation model** (USAGE SS11 and
+- **Owner-scoped VM plane (S1a) -- CANONICAL statement of the isolation model** (USAGE §11 and
   the ORCHESTRATOR/AGENT guides defer here): every VM MUTATION and guest-content verb on the
   agent path -- create/destroy/recreate/exec, detached jobs (exec-detach/-status/-output/-errors),
   push/pull/console-dump, snapshot (incl. the SOURCE-VM check) and use -- is scoped to the
   requesting account. The ingress accepter stamps the client's OS uid UNFORGEABLY from
   SO_PEERCRED; the watcher refuses an unstamped owner-scoped request (fail closed); and the
   dr-vps layer re-asserts ownership (a foreign or operator-owned VM resolves to not-found -- no
-  existence leak; the offline suites REQUIRE the rejection). Metadata READS stay rig-global by
-  design (`list`/`status`/`inspect`/`wait`: VM ids/names are non-secrets; guest content and
+  existence leak; the offline suites REQUIRE the rejection). The READS stay rig-global by
+  design (`list`/`status`/`inspect`/`wait`: VM ids/names are non-secrets; note `wait` probes a
+  VM's SSH readiness -- it reaches the guest yet is not owner-filtered; guest content and
   lifecycle are what is protected), the direct operator CLI (no `--owner`) is admin, and the
   preempt path is same-owner-only. At the NETWORK/hypervisor layer the rig remains ONE
   confinement domain (one sim subnet, L2-isolated ports; per-tenant nets = DR-6). Result payloads
@@ -92,6 +93,15 @@ the per-account quota refuses the 4th at 3/3, fail-closed E_CAP). No leaked VMs.
 
 ## Deferred / open (tracked)
 
+- **Post-S5 dev-side follow-ups** (2026-07-17 review passes; each its own change): owner-scoping
+  the global reads (`wait` included) and auditing the guest exec command line; installer
+  persistence for `DR_VPS_RESULT_PRIVATE=0` (a hand-edited env line survives neither re-setup nor
+  `--reapply-egress`; an ACL-less spool cannot complete a documented install without a unit
+  drop-in); results/ stray temp-file GC; make-pack exclusion of untracked files; a results-dir
+  fsync on result publish; client reqid entropy; headroom between `wait`'s in-child deadline and
+  the supervisor kill; the accepter `.reqid.tmp` age-sweep race; optional doctor surfacing of the
+  result-ACL probe; watcher publish-path consolidation; bounding the golden-fetch curl (https-only
+  proto pinning + a size cap); a per-tier drift guard for the CONCEPT whitelist.
 - **Installer path-hardening pass** (pre-existing): confine `DR_VPS_NET_STATE` to a fixed
   root-owned /run namespace; reject `DR_VPS_SYS_STATE`/`DR_VPS_SPOOL_BASE` under /run.
 - **S6 identity contract sign-off**: host-key preservation is OUT of scope (machine-id is the

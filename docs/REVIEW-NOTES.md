@@ -28,6 +28,19 @@ into the prompt (ask the reviewer NOT to re-flag these) and point it at the "Sti
   findings that are mostly intentional (SC2016 deferred-eval in `eval`/SSH command strings). This is tracked
   debt; every shell file still gets `bash -n`, and the shipped `bin/`/`src/`/`tools/` bash is shellcheck-clean.
 
+## Accepted: development-process residue in the published git history
+
+A public-readiness audit of the full pushed history (2026-07-17) found **no secrets, credentials,
+personal data, key material, or reachable-infrastructure identifiers** in any commit. Commits from
+before the pre-release scrub (and the scrub commit's own message) do retain internal
+development-process references -- a development-machine nickname, reviewer attributions, and
+process labels. This is ACCEPTED as-is: the exposed items are process trivia consistent with the
+project's openly documented external-review method, and rewriting published history would break
+every public clone and all recorded commit references. The in-tree residue gate keeps the CHECKOUT
+clean going forward (its patterns are deliberately literal -- a transparent gate was preferred over
+an obfuscated one); commit MESSAGES sit outside that gate, so keep them free of the same residue
+classes by habit.
+
 ## Still worth reviewing -- focus here
 
 - `tests/dogfood/nested-selftest.sh`: do the egress and drvps-top assertions actually exercise the real code

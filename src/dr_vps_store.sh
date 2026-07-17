@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS vms(
                                                        -- k=v lines; set_contract validates); legacy NULL
   owner_uid   TEXT,                                    -- S0 (service plane): client OS uid from SO_PEERCRED at
                                                        -- ingress; NULL = direct operator (admin), SAME convention
-                                                       -- as snapshots.owner_uid. UNREAD until S1a enforces it.
+                                                       -- as snapshots.owner_uid. S1a owner-scoping + the S5
+                                                       -- result ACL read and enforce it.
   class       TEXT NOT NULL DEFAULT 'throwaway',       -- S0 (service plane): throwaway = default reaped VM;
                                                        -- service = long-lived (S1b). NOT NULL + a literal default
                                                        -- (owner_uid instead stays NULL = operator): class carries no

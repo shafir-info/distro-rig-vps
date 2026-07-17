@@ -2,7 +2,8 @@
 # rigctl -- the AGENT-side client for the Phase-2 control loop. The agent (unprivileged, in the
 # drvpsctl group) runs ONLY this: it SUBMITS one validated request over the drvps ingress SOCKET
 # (it has NO filesystem write to the spool), then bounded-waits on the result the drvps watcher
-# writes into the group-readable results/ dir. No sudo, no KVM. See CONCEPT.md (agent control loop).
+# publishes under results/ (dir 2750 group-LISTABLE; the result FILE is 0600 + a per-owner ACL by
+# default -- group-readable only in legacy DR_VPS_RESULT_PRIVATE=0). No sudo, no KVM. See CONCEPT.md.
 set -uo pipefail
 # shellcheck disable=SC1091
 [ -r /etc/distro-rig-vps/env ] && . /etc/distro-rig-vps/env
@@ -15,8 +16,9 @@ ck_idem() {
   case "$1" in ''|*[!A-Za-z0-9_.-]*) die "--idem key must be 1-64 chars of [A-Za-z0-9_.-] (got '$1')";; esac
   [ "${#1}" -le 64 ] || die "--idem key must be 1-64 chars of [A-Za-z0-9_.-] (too long: ${#1})"
 }
-# results/ is the agent-readable half of the spool (2750, drvpsctl group-read); requests/ is now
-# drvps-only, so probe results/ for a basic "installed + in the group?" sanity check.
+# results/ is the agent-facing half of the spool (2750 group-LISTABLE; each result file is
+# owner-ACL private by default); requests/ is drvps-only, so probe results/ for a basic
+# "installed + in the group?" sanity check.
 [ -d "$SPOOL/results" ] || die "no spool at $SPOOL (is the rig installed + are you in the drvpsctl group?)"
 
 verb="${1:-}"; shift || true

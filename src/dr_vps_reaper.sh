@@ -82,6 +82,18 @@ _dr_vps_egress_reap() {
   fi
 }
 
+# Strict base-10 guard for the GC/age knobs: find silently no-ops on a malformed value (its rc is
+# swallowed by `|| true`) -- and an empty-means-old age-gate would INVERT into reaping in-flight
+# work. Fall back to the default and leave an audit line instead.
+_dr_vps_reap_knob() {  # <env-name> <default>
+  local v; eval "v=\"\${$1:-}\""
+  case "$v" in
+    '') printf '%s' "$2" ;;
+    *[!0-9]*) _dr_vps_reap_audit "$1" reap-bad-knob; printf '%s' "$2" ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 # One sweep: destroy every expired VM, gate-checked. Idempotent + safe to interleave.
 dr_vps_reaper_sweep() {
   local id expired
@@ -126,7 +138,7 @@ dr_vps_reaper_sweep() {
       fi
     fi
   done
-  # M21: GC old result + claimed markers -- the agent (results group-read-only) can't prune them,
+  # M21: GC old result + claimed markers -- the agent (NO write on results/) can't prune them,
   # so the spool would grow unbounded on the Restart=always loop. Runs under the reaper work-lock.
   # NOTE (intentional bound): the `.claimed` marker is also the at-most-once REPLAY tombstone, so
   # replay protection is bounded by this retention (DR_VPS_RESULT_TTL_MIN / DR_VPS_RESULT_MAX_FILES) --
@@ -138,11 +150,12 @@ dr_vps_reaper_sweep() {
   # guarantee is ever needed (see README known-limitations); not warranted for the single-agent rig.
   local rdir="${DR_VPS_SPOOL_DIR:-/var/spool/distro-rig-vps}/results"
   if [ -d "$rdir" ]; then
+    local _rttl; _rttl=$(_dr_vps_reap_knob DR_VPS_RESULT_TTL_MIN 1440)
     find "$rdir" -maxdepth 1 -type f \( -name '*.json' -o -name '*.claimed' \) \
-      -mmin "+${DR_VPS_RESULT_TTL_MIN:-1440}" -delete 2>/dev/null || true
+      -mmin "+${_rttl}" -delete 2>/dev/null || true
     # Also a COUNT cap (not just the 24h TTL): a high request throughput could accumulate millions of
     # result files within the TTL window. Delete the OLDEST beyond DR_VPS_RESULT_MAX_FILES.
-    local cap="${DR_VPS_RESULT_MAX_FILES:-20000}" n
+    local n cap; cap=$(_dr_vps_reap_knob DR_VPS_RESULT_MAX_FILES 20000)
     n=$(find "$rdir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)
     if [ "$n" -gt "$cap" ]; then
       # Delete the OLDEST results beyond the cap AS PAIRS -- each pruned <reqid>.json together with its
@@ -168,8 +181,9 @@ dr_vps_reaper_sweep() {
   if [ -d "$idir" ]; then
     # TTL sweep covers hidden '.<key>.XXXXXX' mkstemp temps too (belt-and-suspenders: the watcher
     # unlinks them on failure, but a SIGKILL mid-write can still strand one and nothing else looks here).
+    local _ittl; _ittl=$(_dr_vps_reap_knob DR_VPS_IDEM_TTL_MIN 1440)
     find "$idir" -mindepth 2 -maxdepth 2 -type f \( -name '*.json' -o -name '.*' \) \
-      -mmin "+${DR_VPS_IDEM_TTL_MIN:-1440}" -delete 2>/dev/null || true
+      -mmin "+${_ittl}" -delete 2>/dev/null || true
     find "$idir" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
   fi
   # Reap ORPHANED build/digest temps in DR_VPS_TMP_DIR. golden.XXXXXX.raw (per
@@ -181,8 +195,9 @@ dr_vps_reaper_sweep() {
   if [ -d "$tdir" ]; then
     # + snapval.*.qcow2 = SNAPSHOT validation-boot disposable overlays (age-gated so an in-flight one -- which
     # lives only seconds -- is never pulled; a leaked one from a destroy-failed validation is reaped).
+    local _tttl; _tttl=$(_dr_vps_reap_knob DR_VPS_TMP_TTL_MIN 120)
     find "$tdir" -maxdepth 1 -type f \( -name 'golden.*.raw' -o -name 'bake.*.log' -o -name 'snapval.*.qcow2' \) \
-      -mmin "+${DR_VPS_TMP_TTL_MIN:-120}" -delete 2>/dev/null || true
+      -mmin "+${_tttl}" -delete 2>/dev/null || true
   fi
   # SNAPSHOT temp BUNDLES (.snap.* dirs under DR_VPS_SNAP_DIR) from a SIGKILL'd snapshot op: no other sweep
   # covers SNAP_DIR (snapshot create self-heals only opportunistically). Age-gate; NEVER a final drvps-snap-v1-*
@@ -193,7 +208,7 @@ dr_vps_reaper_sweep() {
     # inside does not bump it). Reap a .snap.* temp bundle only if its NEWEST entry (dir OR any file) is older
     # than the age, i.e. nothing is being written -> never pull a slow >age flatten out from under qemu-img
 
-    local _d _age="${DR_VPS_TMP_TTL_MIN:-120}"
+    local _d _age; _age=$(_dr_vps_reap_knob DR_VPS_TMP_TTL_MIN 120)
     for _d in "$sdir"/.snap.*/; do
       [ -d "$_d" ] || continue
       [ -n "$(find "$_d" -mmin "-${_age}" -print -quit 2>/dev/null)" ] || rm -rf "$_d" 2>/dev/null || true
@@ -203,7 +218,7 @@ dr_vps_reaper_sweep() {
   # reap/destroy). Reap a socket ONLY if its master is DEAD (-O check fails) AND it is older than ControlPersist +
   # grace, so a live/busy VM (master answers) or a just-started master is never pulled. OFF-guarded.
   if [ "${DR_VPS_SSH_MUX:-0}" = 1 ] && [ -d "${DR_VPS_CTRL_DIR:-}" ]; then
-    local _s _grace=$(( ${DR_VPS_SSH_MUX_PERSIST:-300} / 60 + 2 ))   # minutes
+    local _s _p _grace; _p=$(_dr_vps_reap_knob DR_VPS_SSH_MUX_PERSIST 300); _grace=$(( _p / 60 + 2 ))   # minutes
     for _s in "${DR_VPS_CTRL_DIR}"/*.sock; do
       [ -S "$_s" ] || continue
       [ -n "$(find "$_s" -mmin "-${_grace}" -print -quit 2>/dev/null)" ] && continue                 # too young -> keep

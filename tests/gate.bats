@@ -98,7 +98,9 @@ _mkvm() {  # <id> <uuid>
   _mkvm vmEQ 16161616-1111-1111-1111-111111111111
   sed -i "s#<seclabel type='dynamic' model='selinux' relabel='yes'/>#<seclabel type='none'/>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmEQ;   [ "$status" -ne 0 ]   # live form
+  [[ "$output" == *"disables QEMU confinement"* ]]           # the SPECIFIC clause fired, not a sibling sweep
   run dr_vps_gate_vm closedshape vmEQ; [ "$status" -ne 0 ]   # inactive form -- same shared sweep, same refusal
+  [[ "$output" == *"disables QEMU confinement"* ]]
 }
 
 @test "gate closedshape: the ACTUAL rendered DEFINED XML passes (render+gate compat -- render output is safe to boot)" {
@@ -173,18 +175,21 @@ _mkvm() {  # <id> <uuid>
   # add a SECOND interface on the default (NAT) net -> egress bypass -> must refuse
   sed -i "s:</devices>:<interface type='network'><source network='default'/></interface></devices>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vm7; [ "$status" -eq 24 ]
+  [[ "$output" == *"not EXCLUSIVELY on"* ]]                  # the only-simnet clause fired, not a sibling sweep
 }
 
 @test "gate: guestexec refuses a non-network (bridge) interface" {
   _mkvm vm8 88888888-8888-8888-8888-888888888888
   sed -i "s:</devices>:<interface type='bridge'><source bridge='br0'/></interface></devices>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vm8; [ "$status" -eq 24 ]
+  [[ "$output" == *"not EXCLUSIVELY on"* ]]
 }
 
 @test "gate: guestexec refuses a <hostdev> PCI passthrough (egress bypass class)" {
   _mkvm vm9 99999999-9999-9999-9999-999999999999
   sed -i "s:</devices>:<hostdev mode='subsystem' type='pci'/></devices>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vm9; [ "$status" -eq 24 ]
+  [[ "$output" == *"non-allowlisted"* ]]
 }
 
 @test "gate: guestexec refuses an EXTRA secondary disk (closed storage shape)" {
@@ -319,15 +324,18 @@ _add_canon_log() {  # <id>
   _add_canon_log vmc2b                                             # legit serial+console mirror
   sed -i "s#</console>#<log file='/tmp/guest-evil.log'/></console>#" "$FV_XML"   # + a 3rd, host-path log
   run dr_vps_gate_vm guestexec vmc2b; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]   # the hostref sweep catches it first (defense-in-depth)
 }
 
 @test "gate STEP5: the console mirror with a WRONG @file (not EXPECTED) is refused (24)" {
   _mkvm vmc2c c2c00000-0000-0000-0000-000000000000
   _console_dir
-  # serial has the canonical log, but the console 'mirror' points somewhere else -> nbadlog catches it
+  # serial has the canonical log, but the console 'mirror' points somewhere else -> a non-EXPECTED
+  # host path, refused by the host-ref sweep (which runs before the log-shape counters)
   sed -i "s#<target port='0'/></serial>#<target port='0'/><log file='${DR_VPS_CONSOLE_LOG_DIR}/vmc2c.log'/></serial>#" "$FV_XML"
   sed -i "s#</console>#<log file='${DR_VPS_CONSOLE_LOG_DIR}/vmEVIL.log'/></console>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmc2c; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]
 }
 
 @test "gate STEP5: a <log> with NO @file on the serial is refused (24)" {
@@ -335,15 +343,19 @@ _add_canon_log() {  # <id>
   _console_dir
   sed -i "s#<target port='0'/></serial>#<target port='0'/><log/></serial>#" "$FV_XML"   # <log> without @file
   run dr_vps_gate_vm guestexec vmc7; [ "$status" -eq 24 ]
+  [[ "$output" == *"non-canonical console <log>"* ]]
 }
 
 @test "gate STEP5: an EXTRA pty serial with <log file=EXPECTED> (beyond serial0+mirror) is refused (24)" {
   _mkvm vmc8 c8000000-0000-0000-0000-000000000000
-  exp=$(_add_canon_log vmc8)                              # legit serial0 + its console mirror (2 logs @EXPECTED)
-  # inject a SECOND pty serial (port 1) ALSO logging to EXPECTED -> 3 logs; nlog != 1+nmirror -> refuse the
-  # fixed-path multiplicity (a shape libvirt never emits; two virtlogd producers aliasing the one console file)
+  _add_canon_log vmc8                                     # legit serial0 + its console mirror (2 logs @EXPECTED)
+  exp="$DR_VPS_CONSOLE_LOG_DIR/vmc8.log"
+  # inject a SECOND pty serial (port 1) ALSO logging to EXPECTED -> 3 logs. Every @file is EXPECTED and
+  # so exempt from the host-ref sweep; the refusal must come from the log-shape multiplicity conjunct
+  # (nlog != 1+nmirror -- a shape libvirt never emits; two virtlogd producers aliasing one console file).
   sed -i "s#</console>#</console><serial type='pty'><target port='1'/><log file='${exp}'/></serial>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmc8; [ "$status" -eq 24 ]
+  [[ "$output" == *"non-canonical console <log>"* ]]
 }
 
 @test "gate STEP5: a WRONG @file (not EXPECTED) on the serial log is refused (24)" {
@@ -351,6 +363,7 @@ _add_canon_log() {  # <id>
   _console_dir
   sed -i "s#<target port='0'/></serial>#<target port='0'/><log file='${DR_VPS_CONSOLE_LOG_DIR}/vmOTHER.log'/></serial>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmc3; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]
 }
 
 @test "gate STEP5: a <log> on a NON-serial device (console, not serial) is refused (24)" {
@@ -358,13 +371,16 @@ _add_canon_log() {  # <id>
   _console_dir
   sed -i "s#</console>#<log file='${DR_VPS_CONSOLE_LOG_DIR}/vmc4.log'/></console>#" "$FV_XML"   # log on console only
   run dr_vps_gate_vm guestexec vmc4; [ "$status" -eq 24 ]
+  [[ "$output" == *"non-canonical console <log>"* ]]
 }
 
 @test "gate STEP5: a CROSS-TARGET spoof (2 serial targets split the attrs) is refused (24)" {
   _mkvm vmc5 c5000000-0000-0000-0000-000000000000
-  exp=$(_add_canon_log vmc5)
+  _add_canon_log vmc5
   sed -i "s#<target port='0'/><log#<target type='isa-serial'/><target port='0'/><log#" "$FV_XML"  # 2 targets
   run dr_vps_gate_vm guestexec vmc5; [ "$status" -eq 24 ]
+  # both @file refs stay EXPECTED-exempt; the split target zeroes the canonical-serial count
+  [[ "$output" == *"non-canonical console <log>"* ]]
 }
 
 @test "gate STEP5: EXPECTED referenced on a DISK source (exemption is node-scoped, not too broad) refused (24)" {
@@ -373,6 +389,7 @@ _add_canon_log() {  # <id>
   # attach a 2nd disk whose source is EXPECTED -- the node-scoped @file exemption must NOT cover a disk source
   sed -i "s#</devices>#<disk type='file' device='disk'><source file='${DR_VPS_CONSOLE_LOG_DIR}/vmc6.log'/><target dev='vdb' bus='virtio'/></disk></devices>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmc6; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]   # a disk source is never exempt
 }
 
 @test "gate STEP5: a QUOTE in the console path fails CLOSED (XPath compile-fail, no gate bypass)" {
@@ -385,9 +402,12 @@ _add_canon_log() {  # <id>
 
 @test "gate STEP5: EXPECTED is a SYMLINK on disk -> refused (post-create swap of the exempt path) (24)" {
   _mkvm vmc8 c8000000-0000-0000-0000-000000000000
-  exp=$(_add_canon_log vmc8)
+  _add_canon_log vmc8
+  exp="$DR_VPS_CONSOLE_LOG_DIR/vmc8.log"
   ln -s /etc/passwd "$exp"                            # the exempt path is a symlink on disk
   run dr_vps_gate_vm guestexec vmc8; [ "$status" -eq 24 ]
+  # the XML is canonical (string-level exempt everywhere); only the dedicated on-disk leaf check can catch this
+  [[ "$output" == *"console log path is a SYMLINK"* ]]
 }
 
 @test "gate STEP5: live dumpxml swapped to <log file=/etc/shadow> is refused (24)" {
@@ -395,6 +415,7 @@ _add_canon_log() {  # <id>
   _console_dir
   sed -i "s#<target port='0'/></serial>#<target port='0'/><log file='/etc/shadow'/></serial>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmc9; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]
 }
 
 @test "gate STEP5: a SYMLINKED console log DIR (relocated log root) is refused even with canonical XML (24)" {
@@ -404,6 +425,15 @@ _add_canon_log() {  # <id>
   exp="$DR_VPS_CONSOLE_LOG_DIR/vmcd.log"
   sed -i "s#<target port='0'/></serial>#<target port='0'/><log file='${exp}'/></serial>#" "$FV_XML"
   run dr_vps_gate_vm guestexec vmcd; [ "$status" -eq 24 ]   # convergence r1: dir-symlink defense-in-depth
+  [[ "$output" == *"console log DIR is a SYMLINK"* ]]
+}
+
+@test "gate STEP5: console-dir DRIFT -- the gate resolves EXPECTED from ITS OWN env, logs under any other dir are host refs (24)" {
+  _mkvm vmce ce000000-0000-0000-0000-000000000000
+  _add_canon_log vmce                                  # canonical logs under the CURRENT console dir
+  export DR_VPS_CONSOLE_LOG_DIR="$BATS_TEST_TMPDIR/elsewhere"; mkdir -p "$DR_VPS_CONSOLE_LOG_DIR"
+  run dr_vps_gate_vm guestexec vmce; [ "$status" -eq 24 ]
+  [[ "$output" == *"references a host path/connection beyond overlay+seed"* ]]
 }
 
 @test "gate STEP6: the RENDERER's serial shape (isa-serial target + canonical log) is ACCEPTED" {
@@ -484,18 +514,21 @@ _add_canon_log() {  # <id>
   _mkvm vmsl 5ec0ab00-0000-0000-0000-000000000000
   sed -i "s:<seclabel type='dynamic' model='selinux' relabel='yes'/>:<seclabel type='none'/>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vmsl; [ "$status" -eq 24 ]
+  [[ "$output" == *"disables QEMU confinement"* ]]
 }
 
 @test "gate: guestexec refuses <cpu mode='host-passthrough'> (bare host CPU) -> 24" {
   _mkvm vmcpu c9000000-0000-0000-0000-000000000000
   sed -i "s:<cpu mode='host-model'/>:<cpu mode='host-passthrough'/>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vmcpu; [ "$status" -eq 24 ]
+  [[ "$output" == *"passes through the host CPU"* ]]
 }
 
 @test "gate: guestexec refuses a non-template top-level <sysinfo> (host data injection) -> 24" {
   _mkvm vmsi 51900000-0000-0000-0000-000000000000
   sed -i "s:<devices>:<sysinfo type='smbios'><system><entry name='serial'>HOST</entry></system></sysinfo><devices>:" "$FV_XML"
   run dr_vps_gate_vm guestexec vmsi; [ "$status" -eq 24 ]
+  [[ "$output" == *"non-template top-level /domain element"* ]]
 }
 
 @test "gate: guestexec refuses a <watchdog action='dump'> (guest-triggerable host write) -> 24" {

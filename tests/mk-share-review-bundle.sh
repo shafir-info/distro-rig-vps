@@ -7,7 +7,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${1:-$HOME/tmp}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-WORK="$OUTDIR/wh-drvps-top-share-$STAMP"
+WORK="$OUTDIR/drvps-top-share-$STAMP"
 TAR="$WORK.tar.gz"
 
 # numbered-name -> repo-relative source (order = what the reviewer reads first)

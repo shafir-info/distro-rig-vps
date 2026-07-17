@@ -1,6 +1,6 @@
 # distro-rig-vps -- service orchestrator guide
 
-**Status: DRAFT v0.5 (2026-07-11) -- a PROPOSED contract.** Rows marked SHIPPED work today exactly as
+**Status: v0.6 (2026-07-17).** Rows marked SHIPPED work today exactly as
 written. Rows marked BUILT are implemented and offline-tested with FINAL syntax/shapes, but not yet
 deployed to the rig (and, where noted, gated behind an operator policy that ships OFF). Rows marked
 PROPOSED are the agreed target you may build against, but flag syntax/field names can still shift until
@@ -14,13 +14,13 @@ need drvps internals, and nothing here depends on them.
 | Throwaway VM provisioning (full `rigctl` verb set) | SHIPPED |
 | Result envelope + exit-code contract (below) | SHIPPED |
 | Timeout/INDETERMINATE reconcile rules (interim) | SHIPPED |
-| Service-class VMs (`--class service`, no auto-reap, quota) | BUILT (pending rig deploy) |
-| Owner-scoping of VM operations (see Identity) | BUILT (pending rig deploy) |
+| Service-class VMs (`--class service`, no auto-reap, quota) | SHIPPED |
+| Owner-scoping of VM operations (see Identity) | SHIPPED |
 | Per-VM egress profiles (`--egress <profile>`) | PROPOSED |
 | Stable guest IP (survives `recreate`) + `inspect` field | PROPOSED |
 | Guest->host registered service ports (callbacks) | PROPOSED |
-| Idempotency keys (`--idem <key>` on mutations) | BUILT (pending rig deploy; syntax + response shape FINAL) |
-| Private per-account result store | DEFAULT (cross-uid deny live-verified on the project harness; `dr-vps doctor` re-probes ACL support per host) |
+| Idempotency keys (`--idem <key>` on mutations) | SHIPPED (syntax + response shape FINAL) |
+| Private per-account result store | SHIPPED (default-on; cross-uid deny live-verified on the project harness; the watcher's launcher re-probes ACL support at every start, fail-closed) |
 | Same-user secrets-restore for service VMs (`--restore-secrets`) | BUILT (GATED: ships OFF; operator opt-in after live verify) |
 
 ## Identity and access
@@ -33,13 +33,13 @@ under this one account; drvps never sees your internal process structure.
   are account-scoped. Another account's attempt to destroy/recreate/exec/push/pull/console-dump/
   snapshot/use YOUR VM -- or to read your jobs or snapshots -- resolves to **not-found** (no
   existence leak), and vice versa.
-- Rig-global by design: listing/metadata reads (`list`/`status`/`inspect`) show every account's VMs.
+- Rig-global by design: the reads (`list`/`status`/`inspect`/`wait`) act on every account's VMs
+  (`wait` probes a VM's SSH readiness -- it reaches the guest yet is not owner-filtered).
   Treat VM ids and names as visible to co-tenants (non-secrets); it is the guest CONTENT and
   lifecycle that are protected. Network-layer isolation between guests is L2 port isolation on ONE
   shared subnet, not per-tenant networks.
 
-Access is two-layered (both required; the service-group + quota layer is BUILT pending rig deploy,
-per-capability registration ships with each capability):
+Access is two-layered (both required; per-capability registration ships with each capability):
 1. **Group** -- your account joins the base rig group (all provisioning) plus a higher service group that
    unlocks the ABILITY to request service-class VMs and opt into egress/ports.
 2. **Registration** -- each concrete capability (a named egress profile, a callback port, your service-VM
@@ -106,7 +106,7 @@ later verb (`exec`, `push`, `snapshot`, `destroy`, ...) takes the id, NOT the na
 The client waits `RIGCTL_TIMEOUT` seconds (default 360; lifecycle ops can legitimately run ~15 min, so
 raise it or poll). Exit 17's stderr says whether processing had *begun* -- but BOTH variants are
 indeterminate for mutations. Reconcile by type: lifecycle via `list`/`status`, snapshots via `snap-ls`,
-exec/push by checking the effect in-guest. `--idem` (BUILT, pending deploy) SHRINKS this dance -- it makes the common
+exec/push by checking the effect in-guest. `--idem` SHRINKS this dance -- it makes the common
 ambiguous cases safe to retry -- but does NOT remove it: an execute-before-record crash still resolves to
 INDETERMINATE and needs reconcile-by-type. Keep the reconcile path in your retry wrapper; idem-keys layer
 on top of it, they do not replace it.
@@ -213,7 +213,8 @@ rigctl create ... --idem <key>      # also: use, recreate, destroy, snapshot, sn
 Result payloads are private to the issuing account. Each result file (and its claimed marker) is
 written `0600` owned by the driver, with a POSIX ACL granting ONLY your account read -- a co-tenant in
 the shared spool group cannot read your `exec`/`pull` output. This needs the spool filesystem mounted
-with `acl` support (the watcher's launcher and `dr-vps doctor` verify it, fail-closed). No
+with `acl` support (the watcher's launcher verifies it at every start, fail-closed; `dr-vps doctor`
+deliberately does NOT check ACLs -- spot-check with `getfacl` on a fresh result). No
 orchestrator-side change. A rig may run the legacy group-readable opt-out (`DR_VPS_RESULT_PRIVATE=0`);
 confirm with the operator.
 
@@ -269,7 +270,7 @@ rigctl snapshot "$tid" --notes "driver vX.Y pre-login"    # snapshot BEFORE any 
 rigctl destroy "$tid"
 
 # per channel (snap id from snap-ls). NOTE: `--egress` is PROPOSED (S3) -- omit it until that ships,
-# or the client dies with "unknown flag". `--class service` is BUILT-pending-deploy; `--idem` is final.
+# or the client dies with "unknown flag". `--class service` and `--idem` are SHIPPED (final syntax).
 out=$(rigctl use ch-<id> --from-snap <tpl-snap> --class service --idem create-<id>-<epoch>)   # (+ --egress <profile> once S3 ships)
 vmid=$(printf '%s' "$out" | jq -r 'select(.status=="ok" and .exit_code==0).stdout' | tr -d '[:space:]')
 rigctl wait "$vmid"

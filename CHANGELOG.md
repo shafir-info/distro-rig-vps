@@ -128,9 +128,8 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   symlink. Marker `SCHEMA` 1 -> 2 (deliberate format bump); a RED-first test deterministically
   simulates the inode reuse. The immutable-birthtime upgrade that would also survive an external
   mtime change is parked (see Deferred). Copy-mode installs (the default) are unaffected.
-- **Residue guard tightened.** The `advisor <LABEL>` residue pattern now requires the label
-  punctuation (`[-:]`), so it matches only real review labels, not ordinary prose ("advisor MUST
-  review ..."). Kept byte-identical between `tests/release-gate.sh` and the CI residue step.
+- **Internal-residue release guard tightened** (pattern precision against prose false-positives;
+  kept byte-identical between `tests/release-gate.sh` and the CI residue step).
 
 ### Changed
 
@@ -139,13 +138,72 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   identity (no runtime path/command seam — a root CLI must not take a path-or-command door).
 - `VERSION` → 0.3.0.
 
+### Fixed (S5 result-privacy verification + docs reconcile, 2026-07-17 — full-project review follow-ups)
+
+- **Acceptance S5 step rewritten to a deterministic proof** (`tests/acceptance/live-rigctl.sh`):
+  sources `/etc/distro-rig-vps/env` (same resolution as `bin/rigctl`, so custom-spool rigs stop
+  silently SKIPping), locates THIS run's own result by reqid, and asserts the positive named-owner
+  grant + no stray named entries. A group-readable result now FAILS unless
+  `DR_VPS_RESULT_PRIVATE=0` is actually configured — previously it was blessed as the "legacy
+  opt-out" without reading the config, i.e. the exact regression (stale pre-S5 watcher, launcher
+  bypass, env drift) the step exists to catch would have passed acceptance. getfacl output is
+  rc-checked (no misdiagnosed "other-readable" on empty capture), a missing results dir is a FAIL
+  (the earlier verbs proved the rig works), and the PASS banner carries the S5 verdict. Also fixed:
+  `console-dump` is called directly — on genuine success rigctl prints the decoded dump, not the
+  JSON envelope, so the old jq-parse would have false-failed a healthy rig on its first live run;
+  the same class sat in `rc()` itself (its in-band progress echo polluted every captured envelope,
+  false-failing the FIRST step of any live run) — progress now goes to stderr, the created VM is
+  destroyed on abort, the S5 privacy verdict resolves the configured mode from an explicit caller
+  export or the env FILE (never the merged session environment, which a stale export would
+  poison), the ACL mask is asserted alongside the named grant, and getfacl failures carry their
+  own error text.
+- **Offline S5 suite hardened (PASS 15 → 47)** (`tests/drvps-write-result-test.py`): numeric
+  getfacl (a host mapping uid 4001 to a name no longer false-fails), one shared exact-entry-set
+  helper applied to result AND claimed marker, a planted default-ACL positive control proving the
+  `--set`-vs-`-m` stray sweep can actually fire, both fail-closed setfacl flavors (nonzero exit and
+  unrunnable binary) with the loud-stderr contract ASSERTED (it was muted) and `mark_claimed`'s
+  tombstone verdict pinned True. New `DRVPS_REQUIRE_ACL=1` knob turns every S5 SKIP into a failure;
+  CI sets it (the job installs `acl` deliberately) and RELEASING.md's commands carry it, so an
+  environment regression can no longer silently skip the whole property under a green gate. The
+  fail-closed seam honors the check= contract (dropping `check=True` in the product goes red), the
+  ACL probe reads back its entry like the launcher's and doctor's probes, and the default-ACL
+  positive control proves its premise observably and covers the claimed marker too.
+- **Gate refusals now assert WHICH clause fired.** 18 previously status-only refuse-cases in
+  `tests/gate.bats` (extra NIC, bridge iface, hostdev, seclabel-none ×2, host-passthrough CPU,
+  sysinfo, and the wrong-console-log family) assert the refusal reason: the wrong-@file log cases are caught by the host-ref sweep (which runs
+  first), while the log-multiplicity conjunct, the cross-target shape, and the on-disk
+  leaf-symlink check each carry their own dedicated firing proof, and a deliberate
+  console-dir-drift case pins the host-ref arm explicitly. New two-way drift guard in `tests/agent-guide.bats` (with its own positive control):
+  CONCEPT §6's "Fixed verb whitelist" bullet vs the watcher's real `VM_VERBS`/`GLOBAL_VERBS`.
+- **Reaper GC knobs validated (loud fallback).** A malformed `DR_VPS_*_TTL_MIN`/`_MAX_FILES`/
+  `_SSH_MUX_PERSIST` value silently no-opped every find-based sweep (rc eaten by `|| true`) —
+  and inverted the snap-bundle age-gate's empty-means-old polarity into reaping IN-FLIGHT
+  bundles. The knobs now pass a strict base-10 guard that falls back to the default and writes a
+  `reap-bad-knob` audit line (unit-tested end-to-end). The golden-image fetch is
+  redirect-bounded (`--max-redirs 5`).
+- **Docs: S5 privacy claims reconciled everywhere (one class, one sweep).** CONCEPT §6 (flow line +
+  trust-model paragraph), README (security-model + limitations bullets), and the `bin/rigctl`,
+  `bin/dr-vps-setup`, reaper and store comment headers all still said "the agent group-READs its
+  result" — the legacy mode — contradicting §8's per-owner-ACL default; all now state the ACL model
+  with the `DR_VPS_RESULT_PRIVATE=0` opt-out. CONCEPT §6's verb whitelist listed 10 of the real 23
+  agent verbs — rewritten from the code tables (drift-tested, above); §5 adds the `inspect`
+  no-pre-gate rationale; §8 adds the 0640-with-mask display note (also as a comment at
+  `write_result`'s fchmod) + the owner-unknown fail-closed edge; §10 no longer misdescribes
+  CHANGELOG. ORCHESTRATOR-GUIDE (docs/ + handout mirror) no longer claims `dr-vps doctor` verifies
+  ACL support — it deliberately does not; the launcher probe does (the watcher's degrade message
+  and `_apply_owner_acl` docstring said the same and are fixed). INSTALL-RUNBOOK accepts
+  cloud-localds OR genisoimage; README requirements gain `acl`; UPDATE-RUNBOOK gains the
+  pre-S5-upgrade gotcha (launcher fail-close at the restart step + the pre-update 0640 results tail
+  until reaper GC); USAGE documents `use` + points at the drift-tested AGENT-GUIDE for the full
+  verb set; STATUS's shellcheck-suppression list includes tools/drvps-top.
+
 ### Tests
 
 - New offline suites: drvps-top feed contract / publisher / viewer / config / acquire (real sqlite +
   canned virsh e2e), operator-TUI hardening, drvps-top installer wiring, firewalld DR-2 (mock seam),
   and egress shell-wiring (store-free admit-gate + reaper-wiring, replacing the retired v1 store-seam
   tests); plus the shared-caps and write_result unit suites from the consistency review. The full
-  offline gate stays green (774 bats + python at umask 0077 and 0022 + shellcheck + ast).
+  offline gate stays green (784 bats + python at umask 0077 and 0022 + shellcheck + ast).
 - **The nested dogfood was executed on a live nested host (2026-07-16, agent-driven over rigctl on a
   fresh fedora44 L1).** `tests/dogfood/nested-selftest.sh` stages root-owned under
   `/opt` with the nested renumber baked in (`DR_VPS_BRIDGE_IP=10.199.0.1` + fleet `cache_cidr` patch
@@ -165,7 +223,7 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   workflow, and a production-path check that `approve` reads the installer-persisted render inputs
   (no test_root seam), all verified against a REAL squid; plus the split-UID v2-store DAC boundary.
 
-### Deferred (operator/live — tracked in STATUS.md)
+### Deferred (tracked in STATUS.md)
 
 - A verbatim OPERATOR run of the nested tier (`tests/release-gate.sh --live`) on the rig host — the
   2026-07-16 execution of the same bar was agent-driven step-by-step over rigctl — and the
@@ -176,6 +234,17 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   correctly-labeled no-op there).
 - Egress-splice: the squid-capability gate + audit line and the release-gate integration harness
   (egress-splice tasks 1.8 / 1.10) land with that on-host run.
+- From the 2026-07-17 full-project review passes (dev-side, each its own change): owner-scoping the global
+  reads (`wait` included) and recording the guest exec command in the audit line; installer
+  persistence for `DR_VPS_RESULT_PRIVATE=0` (today a hand-edited env line survives neither
+  re-setup nor `--reapply-egress`, and an ACL-less spool cannot complete a documented install);
+  results/ stray temp-file GC; make-pack excluding untracked working-tree files; a results-dir
+  fsync on `write_result` publish (parity with `mark_claimed`); client reqid entropy from
+  /dev/urandom; headroom between `wait`'s in-child deadline and the supervisor kill timeout; the
+  accepter `.reqid.tmp` age-sweep race; optional doctor surfacing of the result-ACL probe; watcher
+  publish-path consolidation (refactor); bounding the golden-fetch curl (https-only proto pinning +
+  a size cap); a per-tier drift guard for the CONCEPT whitelist (membership is guarded today, the
+  guestexec/lifecycle tier assignment is not).
 
 ## [0.2.0] — first public release (2026-07-12)
 

@@ -64,7 +64,12 @@ jobs:
           set -e
           useradd -m ci
           chown -R ci: .
-          runuser -u ci -- bash tests/release-gate.sh
+          # DRVPS_REQUIRE_ACL=1: this job installs the acl package DELIBERATELY so the S5
+          # result-privacy assertions run for real -- without the knob every S5 check is
+          # skip-gated (non-ACL fs -> loud SKIP -> py gate reduces it to PASS), so an
+          # environment regression here would silently stop testing the property while CI
+          # stays green. The knob turns that silent skip into a CI failure.
+          runuser -u ci -- env DRVPS_REQUIRE_ACL=1 bash tests/release-gate.sh
 
       - name: No internal review residue (forbidden patterns)
         run: |
@@ -76,4 +81,4 @@ jobs:
           # (2) lowercase bare provider tokens (public product names ChatGPT/Grok are allowed)
           ! grep -rnE '\bgpt\b|\bgrok\b' --exclude-dir=.git --exclude-dir=.github --exclude=release-gate.sh . || { echo "forbidden provider shorthand found"; exit 1; }
           # (3) internal review-label classes in names/comments
-          ! grep -rnE 'finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\bCOR-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)[-:]' --exclude-dir=.git --exclude-dir=.github --exclude=release-gate.sh . || { echo "forbidden review label found"; exit 1; }
+          ! grep -rnE 'finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\b(ARC|COR|SEC|OPS|TST|DOC|IMP|PUB)-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)[-:]' --exclude-dir=.git --exclude-dir=.github --exclude=release-gate.sh . || { echo "forbidden review label found"; exit 1; }

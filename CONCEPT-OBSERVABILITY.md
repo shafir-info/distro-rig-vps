@@ -1,10 +1,10 @@
 # CONCEPT — drvps observability + SSH-reliability (BUNDLED)
 
-Status: CONCEPT, externally converged. BUNDLED (console capture IN scope). Single-agent trust domain
-unchanged. NO schema/ownership/trust-model change. Touches the guestexec GATE (security core) -> dedicated
-race/tamper angle in code convergence. r2 confirmed NO gate bypass in the structural live-XML rule + A/B/C
-correct; this revision folds the 5 r2 majors (virtlogd proof + aggregate bound, API/config contract,
-fresh-inode prepare, lifecycle GC, runtime fail-closed assertion).
+Status: SHIPPED — console-log observability is LIVE (see STATUS.md). BUNDLED (console capture IN
+scope). Single-agent trust domain unchanged; NO schema/ownership/trust-model change. It touches the
+guestexec GATE (security core), so the structural live-XML rule carried a dedicated race/tamper
+review and was confirmed bypass-free, with every review finding folded in (review record:
+CHANGELOG.md).
 
 ## 1. Problem (evidence, 2026-07-06)
 Golden acceptance: centos9 booted `running` but never SSH-ready in 365s (agent can't see guest IP or boot

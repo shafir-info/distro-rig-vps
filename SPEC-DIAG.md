@@ -3,7 +3,7 @@
 Purpose: post-run analysis of the observability RUNTIME acts that offline/seamed tests cannot see (gate
 accept/refuse reasoning, admission math, console_assert results, prepare/gc actions, console-dump served
 bytes, inspect probe decisions, ready-reason) — the exact live-path decisions that the "converged but not
-proven-live" gap makes hard to diagnose. Approved via brainstorming 2026-07-06.
+proven-live" gap makes hard to diagnose. Design locked 2026-07-06.
 
 ## Design (locked)
 - **Enable**: env flag `DR_VPS_DIAG` (default UNSET -> OFF). Only-by-flag, NOT permanent: with it unset,
@@ -37,7 +37,7 @@ proven-live" gap makes hard to diagnose. Approved via brainstorming 2026-07-06.
 - **Cost when OFF**: every diag arg is a cheap variable expansion (no forks); the one arg needing `stat`
   (console-dump) is guarded by `[ -z "$DR_VPS_DIAG" ] ||`. So DR_VPS_DIAG unset = truly zero cost.
 
-## Trust trade-off (deliberate; flagged for the reconverge)
+## Trust trade-off (deliberate)
 The diag makes the gate/admission/assert INTERNAL reasoning agent-readable (drvpsctl, not world). Judged
 acceptable: metadata-only; the agent already sees refusal reasons + can derive its own console path; scoped
 to the trust group (not world); flag-gated OFF by default. It is NOT an audit/authorization surface -- the

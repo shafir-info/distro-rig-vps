@@ -1,9 +1,9 @@
 # INSTALL-RUNBOOK -- first-time install of distro-rig-vps
 
-Fresh install on a Linux KVM host. To update an existing install instead, use UPDATE-RUNBOOK.md. The first
-live install on a real host informed this runbook; it is the
-distilled, repeatable procedure. The "Roles and assumptions" and "File modes" sections in UPDATE-RUNBOOK.md
-apply here too and are not repeated.
+Fresh install on a Linux KVM host. To update an existing install instead, use UPDATE-RUNBOOK.md.
+The first live install on a real host informed this runbook; it is the distilled, repeatable
+procedure. The "Roles and assumptions" and "File modes" sections in UPDATE-RUNBOOK.md apply here
+too and are not repeated.
 
 ## Roles
 
@@ -17,8 +17,10 @@ Baseline: independent operator + agent home umask 0077, but it works even if not
 
 ## Prerequisites (host)
 
-- Linux with KVM (`/dev/kvm`), libvirt + `virtlogd`, and the tools `nft`, `qemu-img`, `cloud-localds`,
-  `xmllint`, `squid`. SELinux enforcing is supported (and expected).
+- Linux with KVM (`/dev/kvm`), libvirt + `virtlogd`, and the tools `nft`, `qemu-img`, a NoCloud
+  seed builder (`cloud-localds` OR `genisoimage` -- genisoimage is the packaged mandatory dep, so
+  el9 hosts without a cloud-utils package are covered), `xmllint`, `squid`. SELinux enforcing is
+  supported (and expected).
 - `dr-vps-setup` installs missing OS packages, so a clean host mainly needs KVM + libvirt + a package manager
   it recognises (dnf/apt). It will NOT create OS accounts without `--yes`.
 - **Subnet-colliding hosts (e.g. a nested rig guest that itself sits on 10.123.0.0/24):** set
@@ -37,7 +39,10 @@ Baseline: independent operator + agent home umask 0077, but it works even if not
   results no agent can read. This is enforced at the WATCHER boundary, NOT the generic VM-create gate (a
   direct operator `dr-vps create` is unaffected). ext4/xfs enable ACLs by default. For a trusted
   single-tenant rig (or a spool fs without ACL support) set `DR_VPS_RESULT_PRIVATE=0` to keep the legacy
-  `0640` group-readable results (co-tenant-trusting).
+  `0640` group-readable results (co-tenant-trusting). NOTE: setup does not yet persist that line --
+  `dr-vps-setup` rewrites `/etc/distro-rig-vps/env` on every run, so re-add it after any re-run, or use
+  a systemd drop-in (`Environment=DR_VPS_RESULT_PRIVATE=0` on drvps-rigctl.service), which survives
+  re-runs (tracked in CHANGELOG Deferred).
 
 ## Ubuntu 26.04 (apt family) specifics -- READ THIS if the target is Ubuntu/Debian
 

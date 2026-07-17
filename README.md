@@ -32,7 +32,7 @@ workload where "docker is not a real machine" bites.
 
 ## Status
 The core rig, the agent control loop, the guest-exec gate, the egress fence + cache, and snapshots
-with owner-scoping are **live-validated on real KVM**; the offline suite is **774 bats tests across
+with owner-scoping are **live-validated on real KVM**; the offline suite is **784 bats tests across
 23 suites**, green. Some features ship **gated off** pending operator decisions. The authoritative
 per-subsystem table (LIVE / seam-tested / GATED), the trust-model boundaries, and every known
 limitation live in [STATUS.md](STATUS.md) — read it before relying on a specific guarantee.
@@ -49,7 +49,7 @@ limitation live in [STATUS.md](STATUS.md) — read it before relying on a specif
 ```
 qemu-kvm  libvirt  virt-install  virt-customize (guestfs-tools)  qemu-img
 cloud-image-utils (cloud-localds)  genisoimage  nftables  squid  openssl
-xmllint (libxml2)  jq  sqlite3  flock  inotify-tools  python3  bash (4.4+)  ssh
+xmllint (libxml2)  jq  sqlite3  flock  inotify-tools  acl (setfacl/getfacl)  python3  bash (4.4+)  ssh
 ```
 For the test suite: `bats` and `shellcheck`.
 
@@ -155,14 +155,17 @@ only touches nft/non-HTTPS allowlisting leaves goldens unaffected.
 
 ## Security model (brief)
 - **SINGLE-AGENT trust domain (deployment contract).** `drvpsctl` is ONE trust domain: add exactly
-  **one** agent principal to it. The rig does **not** isolate between `drvpsctl` members — any member
-  can `list` and act (`exec`/`destroy`/…) on **every** rig VM. Result payloads default to a
-  **private result store** (each result `0600` + a POSIX ACL granting only the requesting account;
-  `DR_VPS_RESULT_PRIVATE=0` is the legacy group-readable opt-out for a single-tenant rig or a spool
-  fs without ACLs). This is by design (see `CONCEPT.md` §6/§8): all rig VMs are the single
-  agent's disposable playground; goldens are operator-only and gate-protected. Do **not** place
-  mutually-distrusting agents in `drvpsctl` expecting per-agent isolation — that would need per-agent
-  authorization (peer-uid ownership + owner-filtered verbs), which is out of Phase-2 scope.
+  **one** agent principal to it. Within that group the request layer is owner-scoped (S1a — the
+  canonical statement lives in [STATUS.md](STATUS.md) "Trust model"): every VM mutation and
+  guest-content verb (`create`/`destroy`/`recreate`/`exec`, detached jobs, `push`/`pull`/
+  `console-dump`, `snapshot`/`use`) acts only on the requester's own VMs, and result payloads
+  default to a **private result store** (each result `0600` + a POSIX ACL granting only the
+  requesting account; `DR_VPS_RESULT_PRIVATE=0` is the legacy group-readable opt-out for a
+  single-tenant rig or a spool fs without ACLs). What stays global: the reads
+  (`list`/`status`/`inspect`/`wait`/`distros`/`version`) are not peer-filtered, and the rig remains
+  one confinement domain (see `CONCEPT.md` §6/§8); goldens are operator-only and gate-protected.
+  Do **not** place mutually-distrusting agents in `drvpsctl` expecting full per-agent isolation —
+  owner-filtering of **every** verb is out of Phase-2 scope.
 - The agent's only host capability is submitting a validated request over the drvps ingress
   socket (`drvps-rigsubmit`, `SocketGroup=drvpsctl`). It has **no filesystem write to the spool**:
   `requests/` is `drvps`-only `0700`, so it can never plant a poison entry a never-root watcher
@@ -191,9 +194,11 @@ only touches nft/non-HTTPS allowlisting leaves goldens unaffected.
 ## Known limitations / deferrals (honest)
 Every limitation, trust boundary, and deferral is maintained in **one place**:
 [STATUS.md](STATUS.md). Headline items to know before installing:
-- **One rig = one agent trust domain.** `drvpsctl` members are not isolated from each other
-  at the VM plane (owner-scoping isolates snapshots/actions; results are per-owner-ACL private by
-  default, group-readable only under the legacy `DR_VPS_RESULT_PRIVATE=0` opt-out).
+- **One rig = one agent trust domain.** Owner-scoping (S1a) binds each member's VMs, snapshots,
+  actions, and result payloads to the requesting account (results per-owner-ACL private by
+  default, group-readable only under the legacy `DR_VPS_RESULT_PRIVATE=0` opt-out), but the read
+  verbs stay unfiltered and the rig is ONE confinement domain — never co-tenant
+  mutually-distrusting agents.
 - **firewalld hosts are configured automatically (DR-2):** firewalld's REJECT outranks the rig's
   nft ACCEPT for guest->cache traffic, so on a firewalld-active host the package cache would be
   unreachable from guests. The installer's `step_firewalld` adds the scoped rich rules + persists
@@ -244,7 +249,7 @@ src/drvps_rigctl.py  the python watcher (privilege gateway: decide() + event loo
 src/drvps_rigsubmit.py  the ingress accepter (the ONLY agent write path into the spool)
 etc/recipes/         per-distro golden recipes (family-keyed)
 etc/fleet.json       egress inventory + mirror/splice allowlist (config)
-tests/               seamed suite (774 tests / 23 suites) + acceptance/ + dogfood/ + container e2e
+tests/               seamed suite (23 suites; count in STATUS.md) + acceptance/ + dogfood/ + container e2e
 tools/               drvps-top feed/publish/view + egress model/req/member/layout + maintainer utils
 .github/workflows/   CI (offline suite + shellcheck, no KVM needed)
 docs/                runbooks, agent/orchestrator guides, concept docs, provenance

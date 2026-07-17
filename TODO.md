@@ -64,8 +64,8 @@ first-time consumer hit exactly this). Either resolve name->id inside the id-tak
 error ("'<name>' is a label; use its id drvps-vm-..."). Add a bats case either way.
 
 ## Installer: tested upgrade helper (`dr-vps-setup --upgrade`)
-The manual redeploy is a 15-step ordeal and unsafe as written (moving live /opt aside before
-verifying the staged tree once broke /opt mid-deploy). The helper must: (a) extract the pack to
+The manual redeploy is long (8 numbered steps + rollback). It is verify-before-delete throughout,
+but hand-run; a tested helper would collapse it to one command. The helper must: (a) extract the pack to
 staging, (b) VERIFY key files exist BEFORE touching live /opt, (c) atomically swap (root:root
 0755 + restorecon), (d) run `dr-vps-setup` (with `--adopt-simnet`/`--force-squid` when
 appropriate), (e) RESTART `drvps-rigctl` (enable --now does not restart a running watcher),

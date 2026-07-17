@@ -85,9 +85,9 @@ SOCKET to a `drvps`-owned (unprivileged, never-root) watcher that executes it ag
 whitelist. Maximum freedom *inside* the disposable box (run anything in the guest, reset it), zero
 host reach. **Lesson:** the clean way to give an untrusted actor power over privileged ops is a
 mediated, whitelisted gateway — not adding the actor to a privileged group. (The gateway's INGRESS
-matters too — see lesson 11 for why the original group-shared spool dir had to go.)
+matters too — see lesson 10 for why the original group-shared spool dir had to go.)
 
-## 11. A never-root daemon cannot reclaim everything an untrusted writer can plant — take away the write
+## 10. A never-root daemon cannot reclaim everything an untrusted writer can plant — take away the write
 The original ingress was a group-writable spool dir the agent wrote request files into. A reviewer
 proved the fatal class: the agent `mkdir`s a `x.json/` directory, fills it, `chmod 000`s it — and a
 never-root watcher can neither traverse nor chmod what it doesn't own, so the poison is
@@ -98,7 +98,7 @@ untrusted principal can create filesystem objects in a directory a never-root se
 you have a design bug, not a hardening gap — remove the untrusted write path entirely (socket/pipe
 ingress) instead of enumerating poison shapes.
 
-## 10. Surface deferrals where the operator looks — and name the accumulating-unvalidated-surface risk
+## 11. Surface deferrals where the operator looks — and name the accumulating-unvalidated-surface risk
 Phase 2, the cache/SSL-bump, and the non-Fedora distros are all built and seam-tested but **never
 run on real KVM** — and each unvalidated layer stacked on the last compounds the first-contact risk.
 That, plus the dynamic-ownership dependency and the Alpine `apk`-via-`exec` caveat, are stated in the

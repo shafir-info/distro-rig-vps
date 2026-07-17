@@ -45,7 +45,9 @@ review does not re-litigate them.
 
 ## Cut a release
 
-1. `tests/release-gate.sh --container` on your dev box -> `RELEASE-GATE: PASS`.
+1. `DRVPS_REQUIRE_ACL=1 tests/release-gate.sh --container` on your dev box -> `RELEASE-GATE: PASS`
+   (the knob turns the S5 result-privacy SKIPs into failures; CI sets the same knob, so a local
+   PASS without it can hide an S5 skip a push would then fail on).
 2. `tests/release-gate.sh --live` on a KVM host (the gate exports DRVPS_LIVE=1 for the nested run). Collect
    its log; every `PASS` line should be present and no `FAIL`.
 3. Bump `VERSION`; add a `CHANGELOG.md` section (features + a "deferred" list of known gaps); reconcile

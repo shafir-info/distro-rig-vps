@@ -188,7 +188,11 @@ rigctl snapshot <id> [--keep-secrets] [--notes STR]   # UNPRIVILEGED: freeze ins
 rigctl snap-ls                                # list snapshots
 rigctl snap-show <snap-id|name>               # render a snapshot's .md
 rigctl snap-rm <snap-id|name>                 # UNPRIVILEGED delete (refcount-gated)
+rigctl use <name> --from-snap <snap-id>       # clone a NEW VM from YOUR OWN snapshot (owner-scoped; §11)
 ```
+
+(Abridged. The drift-tested full agent verb reference -- incl. `inspect`, `distros`, `version`,
+`exec-detach`/`exec-status`/`exec-output`/`exec-errors`, and `egress` -- is `docs/AGENT-GUIDE.md`.)
 
 Each call prints the watcher's JSON result envelope, EXCEPT `pull`: on success it decodes the
 size-capped base64 transfer and writes the guest file's **raw bytes** to stdout (binary-safe, like
@@ -300,8 +304,9 @@ Removes the network, nft rules, systemd units, spool, and state, and destroys on
 - **Owner-scoped VM plane (request layer).** VM **mutations and guest-content** verbs over the agent
   socket -- `create`/`destroy`/`recreate`/`exec` (incl. detached jobs), `push`/`pull`/`console-dump`,
   `snapshot` (source-VM checked) and `use` -- are scoped to the requesting account via `SO_PEERCRED`:
-  another account's VM resolves to **not-found**. Metadata reads (`list`/`status`/`inspect`) stay
-  rig-global by design -- treat VM ids/names as visible to co-tenants (non-secrets). At the
+  another account's VM resolves to **not-found**. The reads (`list`/`status`/`inspect`/`wait`) stay
+  rig-global by design -- treat VM ids/names as visible to co-tenants (non-secrets; `wait` probes
+  SSH readiness, reaching the guest without owner-filtering). At the
   network/hypervisor layer the rig remains **one** confinement domain (CONCEPT §6/§8; shared subnet,
   L2-isolated ports -- see §7): do **not** host mutually-hostile workloads expecting network-level
   tenant isolation. (Result PAYLOADS are per-owner-ACL private by default -- see the boundary note

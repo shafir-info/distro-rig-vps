@@ -2024,7 +2024,8 @@ step_spool() {                     # Phase-2: the agent control-loop spool + the
   # chown out-of-tree). Modes: sp 0750 (agent group-traverses to reach results/); requests 0700
   # drvps-ONLY (the agent has NO filesystem write to the spool -- it submits via the drvps-rigsubmit
   # ingress socket, so it can never plant a poison dir a never-root watcher couldn't reclaim);
-  # processing 0700 watcher-private; results 2750 setgid (agent group-READS its result envelope).
+  # processing 0700 watcher-private; results 2750 setgid (group-LISTABLE; each result FILE is 0600
+  # + a per-owner ACL by default -- legacy DR_VPS_RESULT_PRIVATE=0 = group-readable envelopes).
   _safe_mkdir_owned "$sp"            "$DR_VPS_SERVICE_USER" "$DR_VPS_CTL_GROUP"    0750
   _safe_mkdir_owned "$sp/requests"   "$DR_VPS_SERVICE_USER" "$DR_VPS_SERVICE_USER" 0700
   _safe_mkdir_owned "$sp/processing" "$DR_VPS_SERVICE_USER" "$DR_VPS_SERVICE_USER" 0700
