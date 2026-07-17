@@ -14,8 +14,8 @@ details appear only as illustrations.
 history — its development records, the deploy/consumer retrospective, and this repo's own
 `LESSONS-LEARNED.md` and CONCEPT docs.
 
-**Status.** Curated for later promotion into the host memory / domain-pack system — not yet folded
-in.
+**Status.** A living, project-independent reference — refined as the codebase and its lessons
+evolve.
 
 ---
 
@@ -571,6 +571,5 @@ in.
 
 ---
 
-*Curated 2026-07-16 from this project's build, review, and live-verification history and this
-repo's `LESSONS-LEARNED.md`. Companion to the project-specific retro; destined for later promotion
-into the host memory / domain-pack system.*
+*Distilled from this project's build, review, and live-verification history and this repo's
+`LESSONS-LEARNED.md`. Companion to the project-specific retro.*

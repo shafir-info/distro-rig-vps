@@ -111,6 +111,27 @@ published values (the shipped pins had drifted — Ubuntu's cloud-image URLs are
   statement): VM mutations + guest content are owner-scoped per SO_PEERCRED NOW; the old "any member
   can act on every rig VM / per-VM ownership is v2" prose is gone from STATUS/USAGE/ORCHESTRATOR-GUIDE.
 
+### Fixed (CI/container portability + code review)
+
+- **Nested-dogfood reaping check is container-portable.** `tests/drvps-top-hardening.sh`'s
+  process-group-kill check treats a killed grandchild that is a zombie (state Z) as dead, not only
+  one fully reaped: where PID 1 does not reap orphans (a container/sandbox with no init) a SIGKILL'd
+  process lingers as an unreaped zombie instead of vanishing, so `! kill -0` alone was too strict.
+- **Release gate surfaces failing bats output.** The `bats (all *.bats)` loop no longer discards
+  each suite's output; on failure it prints the failing test's `not ok`/diagnostic TAP lines. It
+  feature-detects `--print-output-on-failure` (bats >= 1.5) and falls back to plain `bats` on older
+  versions, so the gate stays portable.
+- **`drvps-skill-install` link marker binds `(dev, ino, mtime_ns)`.** Inode NUMBERS are reused by
+  filesystems (tmpfs/overlayfs), so binding a `--link` provenance marker to `(dev, ino)` alone let
+  an ORPHANED marker match a user's later symlink at the same path once the freed inode was reused --
+  the tool could then classify a foreign symlink as ours. mtime discriminates a freshly created
+  symlink. Marker `SCHEMA` 1 -> 2 (deliberate format bump); a RED-first test deterministically
+  simulates the inode reuse. The immutable-birthtime upgrade that would also survive an external
+  mtime change is parked (see Deferred). Copy-mode installs (the default) are unaffected.
+- **Residue guard tightened.** The `advisor <LABEL>` residue pattern now requires the label
+  punctuation (`[-:]`), so it matches only real review labels, not ordinary prose ("advisor MUST
+  review ..."). Kept byte-identical between `tests/release-gate.sh` and the CI residue step.
+
 ### Changed
 
 - Egress request store migrated to the seam-free v2 layout (`drvps-egress-migrate`, an operator-run
@@ -217,6 +238,12 @@ preserved). Clean-room provenance audit: docs/PROVENANCE.md.
 
 - **Installer path-hardening pass** (pre-existing, operator-deferred): confine `DR_VPS_NET_STATE`
   to a fixed root-owned /run namespace; reject `DR_VPS_SYS_STATE`/`DR_VPS_SPOOL_BASE` under /run.
+- **`drvps-skill-install` link identity -> immutable birthtime** (design fork): the `--link` marker
+  binds `(dev, ino, mtime_ns)`. mtime is the best portable discriminator (Python 3.6+), but it is
+  mutable (an external `touch -h` disowns our own link -- a SAFE, non-destructive failure) and only
+  sub-second on modern filesystems (a whole-second-mtime FS can collide under same-second inode
+  reuse). The robust fix is the immutable birthtime (statx STX_BTIME); parked until the tool can
+  require Python 3.12+ / a btime-capable FS. Copy-mode installs (the default) are unaffected.
 - **S6 identity contract sign-off**: ssh-host-key preservation is out of scope by design
   (machine-id is the preserved device identity; keys regenerate per new cloud-init instance-id).
   Needs explicit operator confirmation; if ever required, the restore seed would preserve the
