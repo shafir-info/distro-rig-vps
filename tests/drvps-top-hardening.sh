@@ -47,13 +47,23 @@ DR_SQLITE="$SFAIL" acquire_top >/dev/null 2>&1 || true
 ok "never-empty: failed store read -> SRC_DB=down" '[ "$SRC_DB" = down ]'
 DR_SQLITE=sqlite3
 
-# MAJOR-3: run_bounded kills the WHOLE group -- a TERM-ignoring grandchild that outlives its parent is reaped
+# MAJOR-3: run_bounded kills the WHOLE group -- a TERM-ignoring grandchild that outlives its parent
+# must not SURVIVE. "Not surviving" = the pid is gone OR a zombie: the group-kill delivered SIGKILL,
+# but where PID 1 does not reap orphans (a container/sandbox with no init) the corpse lingers unreaped
+# as a zombie (state Z) instead of vanishing. A zombie is dead; requiring FULL reaping would falsely
+# fail wherever nothing reaps orphans. On a real host (systemd/init reaps) the pid is simply gone.
+_gc_dead() {                                           # $1=pid ; true if gone OR a zombie (not live)
+  [ "$1" = 0 ] && return 0
+  kill -0 "$1" 2>/dev/null || return 0                 # gone -> dead
+  local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0   # /proc entry gone -> dead
+  s="${s##*) }"; [ "${s%% *}" = Z ]                    # state (field after ") ") is Z -> zombie/dead
+}
 GC="$T/gc.pid"; STUB="$T/stub"
 printf '#!/usr/bin/env bash\n( trap "" TERM; exec sleep 30 ) &\necho $! > %s\nsleep 30\n' "$GC" > "$STUB"; chmod +x "$STUB"
 run_bounded 1 bash "$STUB" >/dev/null 2>&1
 sleep 3                                               # allow the escalated group KILL to land
 gcpid="$(cat "$GC" 2>/dev/null || echo 0)"
-ok "process-group kill: TERM-ignoring grandchild reaped" '[ "$gcpid" = 0 ] || ! kill -0 "$gcpid" 2>/dev/null'
+ok "process-group kill: TERM-ignoring grandchild does not survive (gone or zombie)" '_gc_dead "$gcpid"'
 
 echo "-------------------------------------------"
 echo "drvps-top hardening: $([ $fail = 0 ] && echo PASS || echo FAIL)"

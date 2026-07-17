@@ -87,7 +87,7 @@ run1 "every tests/*test*.py is in OFFLINE_PY" bash -c '
   [ -z "$bad" ] || { echo "UNLISTED python test (add to OFFLINE_PY):$bad"; exit 1; }'
 
 echo "-- bats (all suites) --"
-run1 "bats (all *.bats)" bash -c 'rc=0; for f in tests/*.bats; do bats "$f" >/dev/null 2>&1 || { echo "not-ok: $f"; rc=1; }; done; exit $rc'
+run1 "bats (all *.bats)" bash -c 'POF=; bats --help 2>&1 | grep -q -- --print-output-on-failure && POF=--print-output-on-failure; rc=0; for f in tests/*.bats; do out="$(bats $POF "$f" 2>&1)" || { echo "not-ok: $f"; printf "%s\n" "$out" | grep -E "^(not ok|#)" | sed "s/^/    | /"; rc=1; }; done; exit $rc'
 
 echo "-- offline python (both umask 0077 and 0022) --"
 for b in $OFFLINE_PY; do
@@ -130,7 +130,7 @@ run1 "residue gate (handle + provider shorthand + review-label class)" bash -c '
   X="--exclude-dir=.git --exclude-dir=.github --exclude=release-gate.sh"
   ! grep -rniE "winhelm" $X . &&
   ! grep -rnE "\bgpt\b|\bgrok\b" $X . &&
-  ! grep -rnE "finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\bCOR-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)" $X .'
+  ! grep -rnE "finding r?[0-9]+:|CODE review r[0-9]|FIX-r[0-9]|R[0-9]-N[0-9]|[A-Z][0-9]*-MUST-[0-9]|\b[A-Z]-N[0-9]\b|review #[0-9]|review-final|round-[0-9]+ review|winhelm conv r[0-9]|whole-drvps r[0-9]|6angle|ARCH r[0-9] f[0-9]|\bCOR-[0-9]+\b|\bMOCK-[0-9]\b|\br[0-9]+ [MBf][0-9]+\b|\(advisor\)|advisor (MAJOR|MINOR|MUST|NIT|BLOCK|CRIT)[-:]" $X .'
 
 echo "================ TIER 2: CONTAINER e2e (disposable rootless podman) ================"
 if [ "$WANT_CONTAINER" = 1 ]; then
